@@ -98,6 +98,8 @@ IGW:       igw-0599736bc51a9ac5c
 | FleetShell-IPSec-LVS-b | `subnet-071e009038ce73f87` | 172.16.48.32/27 | eu-west-2b | PUBLIC | rtb-public |
 | FleetShell-IPSec-LVS-mgmt-a | _pending_ | 172.16.48.64/28 | eu-west-2a | PRIVATE | rtb-private |
 | FleetShell-IPSec-LVS-mgmt-b | _pending_ | 172.16.48.80/28 | eu-west-2b | PRIVATE | rtb-private |
+| FleetShell-IPSec-ReturnGW-mgmt-a | _pending_ | 172.16.51.64/28 | eu-west-2a | PRIVATE | rtb-private |
+| FleetShell-IPSec-ReturnGW-mgmt-b | _pending_ | 172.16.51.96/28 | eu-west-2b | PRIVATE | rtb-private |
 | FleetShell-IPSec-VPN-a | `subnet-05a86c0fe6eec7b10` | 172.16.49.0/24 | eu-west-2a | PRIVATE | rtb-vpn |
 | FleetShell-IPSec-VPN-b | `subnet-0ab2ba73e9b587e2e` | 172.16.50.0/24 | eu-west-2b | PRIVATE | rtb-vpn |
 | FleetShell-IPSec-ReturnGW-a | `subnet-017d5b3a6331e26a7` | 172.16.51.0/27 | eu-west-2a | PRIVATE | rtb-private |
@@ -123,7 +125,7 @@ management traffic for the LVS nodes on dedicated second NICs (eth1).
 | FleetShell-IPSec-rtb-vpn | `rtb-01c3275faa537fcc1` | _added by ipsecpulse/notify-master.sh_ | VPN-a, VPN-b |
 | FleetShell-IPSec-rtb-private | `rtb-0540e3736995912c5` | `0.0.0.0/0 → nat-0fb75bf0679751582` | ReturnGW-a, ReturnGW-b, Management, LVS-mgmt-a*, LVS-mgmt-b* |
 
-\* LVS-mgmt subnets associated once created.
+\* LVS-mgmt and ReturnGW-mgmt subnets associated once created.
 
 ### Security Groups
 
@@ -442,6 +444,11 @@ FRR config:
 Minimal Alpine AMI:
 - `frr` (BGP only), `keepalived` (VIP for backend default gateway), `iproute2`,
   `prometheus-node-exporter`
+- Two NICs: eth0 (ReturnGW-a/b subnet) for BGP + data forwarding; eth1
+  (ReturnGW-mgmt-a/b subnet) for VRRP heartbeat + SSH. Same rationale as LVS:
+  a spurious Return GW failover drops return traffic for all customers
+  simultaneously, so heartbeat must be isolated from data-plane RX pressure.
+- keepalived VRRP configured on eth1 (unicast between the two nodes)
 - Sysctl: `net.ipv4.ip_forward=1`, large FIB tuning for 600k routes
 - No custom Rust binaries needed
 
@@ -549,28 +556,55 @@ Implement in this sequence:
 All prior steps (subnets, EIPs, route tables, security groups, NAT GW, RDS,
 route table associations) have been executed. Results are in `infrastructure/`.
 
-### Pending: LVS management/heartbeat subnets
+### Pending: management/heartbeat subnets (LVS and Return GW)
 
-These two small subnets carry eth1 VRRP heartbeat + SSH for the LVS nodes.
-They are associated with `rtb-private` (NAT GW for outbound).
+Both the LVS nodes and the Return GW nodes use a two-NIC layout:
+- **eth0** — data-plane NIC (existing public/private subnet)
+- **eth1** — management NIC (new subnet below) — VRRP heartbeat + SSH only
+
+Rationale for both node types: VRRP heartbeat packets (84 bytes, proto 112)
+must not compete with data-plane traffic on the same RX ring. A spurious
+failover on either pair drops all customer traffic. The Return GW VIP is the
+default gateway for all backend servers, making its heartbeat equally critical
+to protect. All six subnets below are associated with `rtb-private` (NAT GW
+for outbound). Execute all six creates first, then all four associations.
 
 ```bash
-# LVS management — AZ-a (eth1 for LVS-a node)
+# ── LVS management — eth1 for LVS nodes ──────────────────────────────────
+
+# AZ-a (eth1 for LVS-a node)
 aws ec2 create-subnet \
   --vpc-id vpc-0595e17ce290fb050 \
   --cidr-block 172.16.48.64/28 \
   --availability-zone eu-west-2a \
   --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-LVS-mgmt-a}]'
 
-# LVS management — AZ-b (eth1 for LVS-b node)
+# AZ-b (eth1 for LVS-b node)
 aws ec2 create-subnet \
   --vpc-id vpc-0595e17ce290fb050 \
   --cidr-block 172.16.48.80/28 \
   --availability-zone eu-west-2b \
   --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-LVS-mgmt-b}]'
 
-# Associate both with rtb-private
+# ── Return GW management — eth1 for Return GW nodes ──────────────────────
+
+# AZ-a (eth1 for ReturnGW-a node)
+aws ec2 create-subnet \
+  --vpc-id vpc-0595e17ce290fb050 \
+  --cidr-block 172.16.51.64/28 \
+  --availability-zone eu-west-2a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-ReturnGW-mgmt-a}]'
+
+# AZ-b (eth1 for ReturnGW-b node)
+aws ec2 create-subnet \
+  --vpc-id vpc-0595e17ce290fb050 \
+  --cidr-block 172.16.51.96/28 \
+  --availability-zone eu-west-2b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-ReturnGW-mgmt-b}]'
+
+# ── Associate all four new subnets with rtb-private ───────────────────────
 # (substitute subnet IDs from the create-subnet output above)
+
 aws ec2 associate-route-table \
   --route-table-id rtb-0540e3736995912c5 \
   --subnet-id <subnet-LVS-mgmt-a>
@@ -578,10 +612,18 @@ aws ec2 associate-route-table \
 aws ec2 associate-route-table \
   --route-table-id rtb-0540e3736995912c5 \
   --subnet-id <subnet-LVS-mgmt-b>
+
+aws ec2 associate-route-table \
+  --route-table-id rtb-0540e3736995912c5 \
+  --subnet-id <subnet-ReturnGW-mgmt-a>
+
+aws ec2 associate-route-table \
+  --route-table-id rtb-0540e3736995912c5 \
+  --subnet-id <subnet-ReturnGW-mgmt-b>
 ```
 
 After execution, update the subnet table in this file with the new subnet IDs
-and remove the `_pending_` markers.
+and remove all `_pending_` markers.
 
 ### Deferred: rtb-vpn default route
 
