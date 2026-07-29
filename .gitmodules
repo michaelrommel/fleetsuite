@@ -1,0 +1,3 @@
+[submodule "vendor/aerosuite"]
+	path = vendor/aerosuite
+	url = git@github.com:michaelrommel/aerosuite.git

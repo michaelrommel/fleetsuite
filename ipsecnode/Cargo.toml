@@ -1,0 +1,26 @@
+[package]
+name        = "ipsecnode"
+version     = "0.1.0"
+edition     = "2021"
+publish     = false
+
+[[bin]]
+name = "ipsecnode"
+path = "src/main.rs"
+
+[dependencies]
+# Shared crates from the aerosuite submodule
+aerocore         = { path = "../vendor/aerosuite/aerocore" }
+
+anyhow           = { workspace = true }
+clap             = { workspace = true }
+chrono           = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+redis            = { workspace = true }
+tokio-postgres   = { workspace = true }
+axum             = { workspace = true }
+thiserror        = { workspace = true }
