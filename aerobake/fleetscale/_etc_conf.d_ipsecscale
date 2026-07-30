@@ -1,0 +1,6 @@
+# Configuration for /etc/init.d/ipsecscale
+# Populated when ipsecscale is implemented.
+
+: ${REGION:="eu-west-2"}
+: ${RUST_LOG:="info"}
+: ${LOGFILE:="/var/log/ipsecscale.log"}

@@ -1,0 +1,226 @@
+#!/sbin/openrc-run
+
+extra_started_commands="reload"
+description_reload="Reload keepalived configuration (SIGHUP)"
+
+: ${cfgfile:="/etc/keepalived/keepalived.conf"}
+
+command="/usr/sbin/keepalived"
+command_args="
+	--dont-fork
+	--use-file=$cfgfile
+	${command_args:-}"
+command_background="yes"
+pidfile="/run/$RC_SVCNAME.pid"
+
+required_files="$cfgfile"
+
+depend() {
+	use logger
+	need net
+}
+
+# ── IMDS helpers ──────────────────────────────────────────────────────────────
+
+# Fetch an IMDSv2 session token into the caller-supplied variable.
+# Usage: fetch_imds_token TOKEN_VAR
+fetch_imds_token() {
+	local _var="$1"
+	local _token
+	_token=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+		-H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+	if [ -z "$_token" ]; then
+		eerror "Failed to fetch IMDSv2 token"
+		return 1
+	fi
+	eval "${_var}=\"\${_token}\""
+}
+
+# Fetch a single instance tag via IMDSv2 into the caller-supplied variable.
+# Requires "Instance tags in metadata" enabled in the launch template.
+# Usage: fetch_imds_tag TOKEN TAG_KEY RESULT_VAR
+fetch_imds_tag() {
+	local _token="$1" _key="$2" _var="$3"
+	local _value
+	_value=$(curl -sf -H "X-aws-ec2-metadata-token: $_token" \
+		"http://169.254.169.254/latest/meta-data/tags/instance/$_key")
+	if [ -z "$_value" ]; then
+		eerror "IMDS tag '$_key' not found — is InstanceMetadataTags enabled?"
+		return 1
+	fi
+	eval "${_var}=\"\${_value}\""
+}
+
+# ── Lifecycle hooks ───────────────────────────────────────────────────────────
+
+start_pre() {
+	local TOKEN ROLE PEER_MGMT_IP
+
+	# ── 1. IMDS: role and peer management IP ─────────────────────────────
+	fetch_imds_token TOKEN || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-lb-role"         ROLE         || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-lb-peer-mgmt-ip" PEER_MGMT_IP || return 1
+
+	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP"
+
+	# ── 2. Attach management ENI (eth1) ──────────────────────────────────
+	# aeroplug finds the pre-created ENI by tag and writes its primary IP to
+	# /run/eth1-ip for use in the ip-addr step below.
+	# Retry loop: on a restart the ENI may still be transitioning from
+	# 'detaching' to 'available' at the AWS level (async detach in stop_post).
+	# aeroplug only finds ENIs with status='available', so we back off and retry.
+	local attach_attempt
+	for attach_attempt in 1 2 3 4 5 6; do
+		aeroplug eni \
+			--tag    "ipsec-lb-mgmt=$ROLE" \
+			--attach \
+			--device-index 1 \
+			--write-ip-file /run/eth1-ip \
+			--region "${REGION}" && break
+		if [ "$attach_attempt" -eq 6 ]; then
+			eerror "Failed to attach management ENI after 6 attempts (30 s)"
+			eend 1
+			return 1
+		fi
+		ewarn "Attach attempt $attach_attempt failed; retrying in 5 s..."
+		sleep 5
+	done
+
+	local ETH1_IP
+	ETH1_IP=$(cat /run/eth1-ip 2>/dev/null)
+	if [ -z "$ETH1_IP" ]; then
+		eerror "aeroplug did not write eth1 IP to /run/eth1-ip"
+		return 1
+	fi
+
+	# ── 3. Wait for eth1 to appear in sysfs ──────────────────────────────
+	einfo "Waiting for eth1 to appear..."
+	local waited=0
+	while [ ! -d /sys/class/net/eth1 ]; do
+		sleep 1
+		waited=$((waited + 1))
+		if [ "$waited" -ge 60 ]; then
+			eerror "eth1 did not appear after 60 s"
+			return 1
+		fi
+	done
+
+	# ── 4. Bring up eth1 and assign IP ───────────────────────────────────
+	ip link set eth1 up
+
+	# Fetch the subnet CIDR for eth1 from IMDS now that the MAC is readable.
+	local ETH1_MAC ETH1_CIDR ETH1_PREFIX
+	ETH1_MAC=$(cat /sys/class/net/eth1/address)
+	ETH1_CIDR=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+		"http://169.254.169.254/latest/meta-data/network/interfaces/macs/$ETH1_MAC/subnet-ipv4-cidr-block")
+	if [ -z "$ETH1_CIDR" ]; then
+		eerror "Failed to read eth1 subnet CIDR from IMDS"
+		return 1
+	fi
+	ETH1_PREFIX="${ETH1_CIDR##*/}"
+
+	ip addr add "$ETH1_IP/$ETH1_PREFIX" dev eth1
+	einfo "eth1 up: $ETH1_IP/$ETH1_PREFIX"
+
+	# Compute eth1 gateway (VPC router = subnet base address + 1).
+	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
+	ETH1_NET="${ETH1_CIDR%/*}"
+	ETH1_LAST="${ETH1_NET##*.}"
+	ETH1_BASE="${ETH1_NET%.*}"
+	ETH1_GW="${ETH1_BASE}.$((ETH1_LAST + 1))"
+
+	# Route to peer management /28 via eth1 gateway.
+	# The two mgmt ENIs live in different /28 subnets; without this the kernel
+	# ARPs for the peer directly on eth1 and gets no reply (cross-subnet ARP
+	# is never answered by the VPC fabric).
+	# Derive the peer /28 by rounding the last octet of PEER_MGMT_IP down to
+	# the nearest multiple of 16 (/28 = 16 addresses).
+	local PEER_LAST PEER_BASE PEER_NET_LAST PEER_SUBNET
+	PEER_LAST="${PEER_MGMT_IP##*.}"
+	PEER_BASE="${PEER_MGMT_IP%.*}"
+	PEER_NET_LAST=$(( (PEER_LAST / 16) * 16 ))
+	PEER_SUBNET="${PEER_BASE}.${PEER_NET_LAST}/28"
+	ip route add "$PEER_SUBNET" via "$ETH1_GW" dev eth1
+	einfo "Route: $PEER_SUBNET via $ETH1_GW dev eth1"
+
+	# ── 5. Policy routing: SSH reply path via eth1 ────────────────────────
+	# Source-based rule: replies from ETH1_IP always egress via eth1.
+	# Without this the main routing table would send replies via eth0.
+	#ip route add table 101 "$ETH1_CIDR"  dev eth1 src "$ETH1_IP"
+	#ip route add table 101 default        via "$ETH1_GW" dev eth1
+	#ip rule  add from "$ETH1_IP/32"       lookup 101 prio 100
+	#einfo "Policy routing table 101: $ETH1_CIDR via $ETH1_GW src $ETH1_IP"
+
+	# ── 6. Give the CT entry and peer time to stabilise ───────────────────
+	# The VRRP dead interval is down_timer_adverts × advert_int = 3 s.
+	# Sleeping 5 s ensures both nodes have had time to exchange at least one
+	# heartbeat before keepalived performs the initial election.
+	sleep 5
+
+	# ── 7. Run ipsecpulse (config generator) ─────────────────────────────
+	# ipsecpulse reads NIC layout from IMDS (eth0 + the newly-attached eth1),
+	# fetches VPN ASG instances, and renders all keepalived/nftables files.
+	ebegin "Running ipsecpulse"
+	ipsecpulse --auth-pass "${VRRP_PASS}" --region "${REGION}"
+	eend $? || return 1
+
+	# ── 8. Prime VRRP proto 112 connection tracking ───────────────────────
+	# At cold boot the AWS stateful SG has no inbound entry for proto 112
+	# from the peer.  Without a prior outbound packet the peer's VRRP
+	# advertisements are dropped and this node spuriously elects itself MASTER.
+	# Sending one raw VRRP packet creates the CT entry before keepalived starts.
+	einfo "Priming proto 112 CT toward $PEER_MGMT_IP..."
+	printf '\x21\x01\x32\x01\x01\x01\x42\x45\xc0\xa8\x01\x01\x63\x30\x66\x57\x6d\x2c\x71\x59' \
+		| socat - "IP4-DATAGRAM:${PEER_MGMT_IP}:112,ip-ttl=255" 2>/dev/null || true
+
+	# ── 9. Reload nftables nat table with ipsecpulse-generated rules ──────────
+	# nftables loaded the placeholder ipsec-nat.nft at boot before ipsecpulse
+	# ran.  Flush the old nat table and reload with the generated rules.
+	# The filter table is left untouched.
+	ebegin "Reloading nftables nat table"
+	nft flush table ip nat && nft -f /etc/nftables.d/ipsec-nat.nft
+	eend $?
+
+	# Ensure the generated notify scripts are executable.
+	chmod 755 /etc/keepalived/notify-master.sh \
+	          /etc/keepalived/notify-backup.sh
+}
+
+stop_post() {
+	# ── Remove eth1 IP and policy routing ────────────────────────────────
+	local INSIDE_IP
+	INSIDE_IP=$(ip -4 addr show eth1 2>/dev/null | awk '/inet / { print $2 }')
+
+	if [ -n "$INSIDE_IP" ]; then
+		local BARE_IP="${INSIDE_IP%/*}"
+		ip rule  del from "$BARE_IP/32" lookup 101 prio 100 2>/dev/null || true
+		ip route flush table 101 2>/dev/null || true
+		ip addr  del "$INSIDE_IP" dev eth1 2>/dev/null || true
+	fi
+
+	# ── Bring eth1 down ───────────────────────────────────────────────────
+	if [ -d /sys/class/net/eth1 ]; then
+		ip link set eth1 down 2>/dev/null || true
+	fi
+
+	# ── Detach the management ENI ─────────────────────────────────────────
+	local TOKEN ROLE
+	fetch_imds_token TOKEN || return 0   # best-effort; don't fail stop_post
+
+	if fetch_imds_tag "$TOKEN" "ipsec-lb-role" ROLE 2>/dev/null; then
+		ebegin "Detaching management ENI (ipsec-lb-mgmt=$ROLE)"
+		aeroplug eni \
+			--tag    "ipsec-lb-mgmt=$ROLE" \
+			--detach \
+			--region "${REGION}"
+		eend $?
+	fi
+}
+
+# ── Custom commands ───────────────────────────────────────────────────────────
+
+reload() {
+	ebegin "Reloading keepalived configuration"
+	start-stop-daemon --pidfile "$pidfile" --signal HUP
+	eend $?
+}

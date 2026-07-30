@@ -1,0 +1,18 @@
+alias ll='ls -la'
+alias vim=vi
+alias less='less -R'
+alias vs='ipvsadm -l -n'
+alias wvs='watch -n 2 -- ipvsadm -l -n'
+alias nl='nload -m -a 9 -t 1000 -u h eth0 eth1'
+be() {
+  echo 0 > /etc/keepalived/weights/backend-172.16.32.$((20 + ${1:-0})).weight
+}
+bd() {
+  echo "-1" > /etc/keepalived/weights/backend-172.16.32.$((20 + ${1:-0})).weight
+}
+bx() {
+  echo "-2147483648" > /etc/keepalived/weights/backend-172.16.32.$((20 + ${1:-0})).weight
+}
+bxall() {
+  for i in $(seq 0 19); do bx $i; done
+}

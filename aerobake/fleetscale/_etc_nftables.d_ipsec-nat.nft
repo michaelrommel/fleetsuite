@@ -1,0 +1,11 @@
+# ipsec-nat.nft placeholder file to be updated by ipsecpulse (boot) and ipsecscale (pool changes)
+
+table ip nat {
+        chain PREROUTING {
+                type nat hook prerouting priority dstnat; policy accept;
+        }
+
+        chain POSTROUTING {
+                type nat hook postrouting priority srcnat; policy accept;
+        }
+}

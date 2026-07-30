@@ -1,0 +1,48 @@
+#!/sbin/openrc-run
+
+description="ipsecscale — VPN concentrator autoscaling daemon (IPSec LVS nodes)"
+
+# ipsecscale is started and stopped by keepalived's notify scripts, not by
+# OpenRC directly.  This service definition exists so that:
+#   rc-service ipsecscale start / stop
+# works from within the generated notify-master.sh and notify-backup.sh.
+#
+# OpenRC dependency: keepalived must already be running (and thus ipsecpulse
+# must have completed) before ipsecscale can be started.
+
+: ${IPSECSCALE_BINARY:="/usr/local/bin/ipsecscale"}
+: ${REGION:="eu-west-2"}
+: ${RUST_LOG:="info"}
+: ${LOGFILE:="/var/log/ipsecscale.log"}
+
+pidfile="/var/run/ipsecscale.pid"
+
+depend() {
+	need keepalived
+}
+
+start_pre() {
+	checkpath --file --owner root:root --mode 0640 "${LOGFILE}"
+}
+
+start() {
+	ebegin "Starting ipsecscale"
+	supervise-daemon ${RC_SVCNAME} --start       \
+		--pidfile  "${pidfile}"                  \
+		--stdout   "${LOGFILE}"                  \
+		--stderr   "${LOGFILE}"                  \
+		--respawn-delay  5                       \
+		--respawn-period 60                      \
+		--env "RUST_LOG=${RUST_LOG}"             \
+		-- "${IPSECSCALE_BINARY}"                \
+			--region "${REGION}"
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping ipsecscale"
+	supervise-daemon ${RC_SVCNAME} --stop  \
+		--pidfile "${pidfile}"             \
+		--retry   "TERM/10/KILL/5"
+	eend $?
+}

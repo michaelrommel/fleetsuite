@@ -1,0 +1,16 @@
+# Configuration for /etc/init.d/keepalived (fleetscale — IPSec LVS nodes)
+
+# Path of the keepalived configuration file.
+# cfgfile="/etc/keepalived/keepalived.conf"
+
+# Additional command-line options passed to keepalived.
+# -S local3 routes keepalived's own syslog output to facility local3.
+command_args="-S local3"
+
+# AWS region — read by ipsecpulse and aeroplug.
+export REGION="eu-west-2"
+
+# VRRP authentication password.  Must be identical on both LVS nodes.
+# Keep this in sync with the value in the EC2 launch template or set it
+# via an AWS SSM parameter fetched at boot.
+export VRRP_PASS="changeme"
