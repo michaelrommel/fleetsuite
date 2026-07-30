@@ -279,7 +279,7 @@ build {
     ]
   }
 
-  # ── 11. ipsecscale — stub init.d (started by notify scripts, not at boot) ───
+  # ── 11. ipsecscale — runs always; reads /run/ipsec-role to detect master/backup ─────
   provisioner "file" {
     source      = "./_etc_init.d_ipsecscale"
     destination = "/tmp/_etc_init.d_ipsecscale"
@@ -294,7 +294,8 @@ build {
       "sudo mv /tmp/_etc_conf.d_ipsecscale /etc/conf.d/ipsecscale",
       "sudo chown root:root /etc/init.d/ipsecscale /etc/conf.d/ipsecscale",
       "sudo chmod +x /etc/init.d/ipsecscale",
-      # NOT added to the default runlevel — started only by notify-master.sh.
+      "sudo rc-update add ipsecscale default",
+      # Reads /run/ipsec-role each cycle; started at boot, never stopped by keepalived.
     ]
   }
 

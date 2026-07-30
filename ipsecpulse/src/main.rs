@@ -19,8 +19,8 @@
 //!
 //! Two subcommands are invoked by keepalived at runtime:
 //!
-//!   notify-master  — associate EIP to eth0, update rtb-vpn, start ipsecscale
-//!   notify-backup  — stop ipsecscale
+//!   notify-master  — associate EIP to eth0, update rtb-vpn, write role file ("master")
+//!   notify-backup  — write role file ("backup")
 //!
 //!
 //! Required EC2 instance tags (set on the ASG with PropagateAtLaunch=true):
@@ -39,7 +39,6 @@ use std::{
 	fs,
 	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
-	process::Command,
 };
 
 use aerocore::{
@@ -111,6 +110,12 @@ struct Cli {
 	/// Path for the runtime state file (written at boot, read by notify subcommands).
 	#[arg(long, default_value = "/run/ipsecpulse.state", global = true)]
 	state_file: PathBuf,
+
+	/// Path for the role file written by notify subcommands ("master\n" or "backup\n").
+	/// ipsecscale reads this each cycle to determine whether to act as master or backup.
+	/// Pre-created in the keepalived init.d start_pre with keepalived_script ownership.
+	#[arg(long, default_value = "/run/ipsec-role", global = true)]
+	role_file: PathBuf,
 
 	#[command(subcommand)]
 	command: Option<SubCmd>,
@@ -293,7 +298,8 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 		vpn_ips:         vpn_ips.clone(),
 	};
 	let state_json = serde_json::to_string_pretty(&state)?;
-	write_file(&cli.state_file, &state_json, 0o600)?;
+	// 0o644 so keepalived_script (which runs the notify scripts) can read it.
+	write_file(&cli.state_file, &state_json, 0o644)?;
 	println!("  State      → {}", cli.state_file.display());
 
 	// ── 6. Render and write config files ──────────────────────────────────
@@ -340,12 +346,9 @@ async fn run_notify_master(cli: &Cli) -> Result<()> {
 	).await?;
 	println!("  ✓ rtb-vpn default route updated.");
 
-	// Start ipsecscale (non-fatal during testing when ipsecscale is not yet installed).
-	let rc = Command::new("rc-service").args(["ipsecscale", "start"]).status();
-	match rc {
-		Ok(s) if s.success() => println!("  ✓ ipsecscale started."),
-		_                    => println!("  Warning: rc-service ipsecscale start failed (non-fatal)."),
-	}
+	// Write role file — ipsecscale runs always and reads this each cycle.
+	write_file(&cli.role_file, "master\n", 0o644)?;
+	println!("  ✓ Role file written: master → {}", cli.role_file.display());
 
 	println!("✅ ipsecpulse notify-master complete.");
 	Ok(())
@@ -353,13 +356,10 @@ async fn run_notify_master(cli: &Cli) -> Result<()> {
 
 // ── NotifyBackup ──────────────────────────────────────────────────────────────
 
-async fn run_notify_backup(_cli: &Cli) -> Result<()> {
-	println!("ipsecpulse notify-backup: stopping ipsecscale ...");
-	let rc = Command::new("rc-service").args(["ipsecscale", "stop"]).status();
-	match rc {
-		Ok(s) if s.success() => println!("  ✓ ipsecscale stopped."),
-		_                    => println!("  Warning: rc-service ipsecscale stop failed (non-fatal)."),
-	}
+async fn run_notify_backup(cli: &Cli) -> Result<()> {
+	println!("ipsecpulse notify-backup: writing role file ...");
+	write_file(&cli.role_file, "backup\n", 0o644)?;
+	println!("  ✓ Role file written: backup → {}", cli.role_file.display());
 	println!("✅ ipsecpulse notify-backup complete.");
 	Ok(())
 }
@@ -638,8 +638,8 @@ fn render_notify_master(cli: &Cli, state: &State) -> String {
 # DO NOT EDIT MANUALLY — re-run ipsecpulse to regenerate.
 #
 # Called by keepalived when VI_IPSEC transitions to MASTER.
-# Associates the EIP to eth0, updates rtb-vpn, and starts ipsecscale.
-# Full ipsecpulse output is appended to /var/log/ipsecpulse.log.
+# Associates the EIP to eth0, updates rtb-vpn, writes the role file.
+# Full ipsecpulse output is appended to /run/ipsecpulse-notify.log.
 
 set -u
 TYPE="${{1:-?}}" NAME="${{2:-?}}" STATE="${{3:-?}}"
@@ -650,17 +650,20 @@ logger -p local3.info -t ipsecpulse-notify \
 # With set -e, a non-zero exit would terminate the script before rc=$? is reached,
 # swallowing both the error output and the FAILED log message.
 set +e
-{binary} notify-master --region {region} --state-file {state_file} \
-    >> /var/log/ipsecpulse.log 2>&1
+{binary} notify-master --region {region} --state-file {state_file} --role-file {role_file} \
+    > /run/ipsecpulse-notify.log 2>&1
 rc=$?
 set -e
+# Forward all ipsecpulse output to syslog (local3 → /var/log/keepalived/keepalived.log).
+# Raw log also available at /run/ipsecpulse-notify.log for direct inspection.
+logger -p local3.info -t ipsecpulse-out < /run/ipsecpulse-notify.log
 
 if [ $rc -eq 0 ]; then
     logger -p local3.info -t ipsecpulse-notify \
         "notify-master[${{TYPE}}/${{NAME}}]: complete"
 else
     logger -p local3.err -t ipsecpulse-notify \
-        "notify-master[${{TYPE}}/${{NAME}}]: FAILED (exit $rc) — see /var/log/ipsecpulse.log"
+        "notify-master[${{TYPE}}/${{NAME}}]: FAILED (exit $rc) — see /run/ipsecpulse-notify.log"
     exit 1
 fi
 "#,
@@ -669,6 +672,7 @@ fi
 		binary      = binary.display(),
 		region      = cli.region,
 		state_file  = cli.state_file.display(),
+		role_file   = cli.role_file.display(),
 	)
 }
 
@@ -685,7 +689,7 @@ fn render_notify_backup(cli: &Cli, state: &State) -> String {
 # DO NOT EDIT MANUALLY — re-run ipsecpulse to regenerate.
 #
 # Called by keepalived when VI_IPSEC transitions to BACKUP.
-# Stops ipsecscale; the new MASTER will claim the EIP and route.
+# Writes the role file; ipsecscale sees backup and idles.
 
 set -u
 TYPE="${{1:-?}}" NAME="${{2:-?}}" STATE="${{3:-?}}"
@@ -693,16 +697,17 @@ logger -p local3.info -t ipsecpulse-notify \
     "notify-backup[${{TYPE}}/${{NAME}}]: running on {instance_id}"
 
 set +e
-{binary} notify-backup --state-file {state_file} >> /var/log/ipsecpulse.log 2>&1
+{binary} notify-backup --state-file {state_file} --role-file {role_file} > /run/ipsecpulse-notify.log 2>&1
 rc=$?
 set -e
+logger -p local3.info -t ipsecpulse-out < /run/ipsecpulse-notify.log
 
 if [ $rc -eq 0 ]; then
     logger -p local3.info -t ipsecpulse-notify \
         "notify-backup[${{TYPE}}/${{NAME}}]: complete"
 else
     logger -p local3.err -t ipsecpulse-notify \
-        "notify-backup[${{TYPE}}/${{NAME}}]: FAILED (exit $rc) — see /var/log/ipsecpulse.log"
+        "notify-backup[${{TYPE}}/${{NAME}}]: FAILED (exit $rc) — see /run/ipsecpulse-notify.log"
     exit 1
 fi
 "#,
@@ -710,6 +715,7 @@ fi
 		ts          = ts,
 		binary      = binary.display(),
 		state_file  = cli.state_file.display(),
+		role_file   = cli.role_file.display(),
 	)
 }
 

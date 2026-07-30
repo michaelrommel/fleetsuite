@@ -181,6 +181,14 @@ start_pre() {
 	nft flush table ip nat && nft -f /etc/nftables.d/ipsec-nat.nft
 	eend $?
 
+	# Pre-create files that the notify scripts need to write.
+	# keepalived runs notify scripts as keepalived_script (due to enable_script_security).
+	# /run is tmpfs — these must be created fresh on every boot in start_pre.
+	# keepalived_script's primary group is nogroup (gid 65533) — not a self-named group.
+	touch /run/ipsecpulse-notify.log /run/ipsec-role
+	chown keepalived_script:nogroup \
+	      /run/ipsecpulse-notify.log /run/ipsec-role
+
 	# Ensure the generated notify scripts are executable.
 	chmod 755 /etc/keepalived/notify-master.sh \
 	          /etc/keepalived/notify-backup.sh
