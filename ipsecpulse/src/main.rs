@@ -123,7 +123,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SubCmd {
-	/// Associate the EIP to eth0, update rtb-vpn, start ipsecscale.
+	/// Associate the management EIP to this node's eth0 primary IP.
+	/// Called once in keepalived start_pre before aeroplug runs, to establish
+	/// permanent outbound internet access independent of the customer EIP.
+	AssociateMgmtEip,
+	/// Associate the EIP to eth0, update rtb-vpn, write role file.
 	/// Called by the generated /etc/keepalived/notify-master.sh.
 	NotifyMaster,
 
@@ -176,9 +180,15 @@ struct State {
 	region: String,
 	/// ENI ID of eth0 (data-plane NIC).
 	eth0_eni_id: String,
-	/// Primary private IP of eth0 — used as SNAT source in nftables.
-	/// The EIP is associated to this IP on MASTER transition.
+	/// Primary private IP of eth0 — used for identity only; has the
+	/// auto-assigned ephemeral public IP that provides permanent outbound access.
 	eth0_primary_ip: String,
+	/// Fixed secondary private IP of eth0 — the stable IP that the customer-
+	/// facing EIP always points to on the current VRRP master.
+	/// Used as EIP association target and nftables SNAT source.
+	/// Assigned to the ENI at boot by aeroplug (keepalived start_pre step 2)
+	/// and read from the ipsec-vip-inside IMDS instance tag.
+	eth0_secondary_ip: String,
 	/// Primary private IP of eth1 (management NIC).
 	eth1_ip: String,
 	/// Subnet prefix length for eth1, e.g. 28.
@@ -210,9 +220,10 @@ struct IfaceInfo {
 async fn main() -> Result<()> {
 	let cli = Cli::parse();
 	match &cli.command {
-		None                       => run_boot(&cli).await,
-		Some(SubCmd::NotifyMaster) => run_notify_master(&cli).await,
-		Some(SubCmd::NotifyBackup) => run_notify_backup(&cli).await,
+		None                            => run_boot(&cli).await,
+		Some(SubCmd::AssociateMgmtEip)  => run_associate_mgmt_eip(&cli).await,
+		Some(SubCmd::NotifyMaster)      => run_notify_master(&cli).await,
+		Some(SubCmd::NotifyBackup)      => run_notify_backup(&cli).await,
 	}
 }
 
@@ -230,11 +241,12 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 	println!("  Instance   : {instance_id}");
 
 	// ── 2. Required instance tags ─────────────────────────────────────────
-	let role_str     = fetch_imds_tag(&token, "ipsec-lb-role").await?;
-	let eip_alloc_id = fetch_imds_tag(&token, "ipsec-vip-outside").await?;
-	let peer_mgmt_ip = fetch_imds_tag(&token, "ipsec-lb-peer-mgmt-ip").await?;
-	let vpn_asg_name = fetch_imds_tag(&token, "ipsec-vpn-asg").await?;
-	let rtb_vpn_id   = fetch_imds_tag(&token, "ipsec-rtb-vpn").await?;
+	let role_str        = fetch_imds_tag(&token, "ipsec-lb-role").await?;
+	let eip_alloc_id    = fetch_imds_tag(&token, "ipsec-vip-outside").await?;
+	let peer_mgmt_ip    = fetch_imds_tag(&token, "ipsec-lb-peer-mgmt-ip").await?;
+	let vpn_asg_name    = fetch_imds_tag(&token, "ipsec-vpn-asg").await?;
+	let rtb_vpn_id      = fetch_imds_tag(&token, "ipsec-rtb-vpn").await?;
+	let eth0_secondary_ip = fetch_imds_tag(&token, "ipsec-vip-inside").await?;
 
 	let role = match role_str.as_str() {
 		"master" => Role::Master,
@@ -246,6 +258,7 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 	};
 	println!("  Role       : {role}");
 	println!("  EIP alloc  : {eip_alloc_id}");
+	println!("  VIP inside : {eth0_secondary_ip}  (fixed secondary; EIP target + SNAT source)");
 	println!("  Peer eth1  : {peer_mgmt_ip}");
 	println!("  VPN ASG    : {vpn_asg_name}");
 	println!("  rtb-vpn    : {rtb_vpn_id}");
@@ -287,9 +300,10 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 		instance_id:     instance_id.clone(),
 		role:            role_str.clone(),
 		region:          cli.region.clone(),
-		eth0_eni_id:     eth0.eni_id.clone(),
-		eth0_primary_ip: eth0.primary_ip.clone(),
-		eth1_ip:         eth1.primary_ip.clone(),
+		eth0_eni_id:        eth0.eni_id.clone(),
+		eth0_primary_ip:    eth0.primary_ip.clone(),
+		eth0_secondary_ip:  eth0_secondary_ip.clone(),
+		eth1_ip:            eth1.primary_ip.clone(),
 		eth1_prefix,
 		peer_mgmt_ip:    peer_mgmt_ip.clone(),
 		eip_alloc_id:    eip_alloc_id.clone(),
@@ -319,6 +333,39 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 	Ok(())
 }
 
+// ── AssociateMgmtEip ─────────────────────────────────────────────────────────
+
+/// Associate the pre-allocated management EIP to this node's eth0 primary IP.
+///
+/// Called early in keepalived start_pre, before aeroplug or anything else that
+/// needs outbound internet.  Uses the auto-assigned public IP (from the LT's
+/// AssociatePublicIpAddress=true) for this one API call; the management EIP
+/// then permanently replaces it, surviving all customer EIP movements.
+///
+/// Safe to call on restart: AllowReassociation=true makes it a no-op when
+/// the EIP is already on this ENI and primary IP.
+async fn run_associate_mgmt_eip(cli: &Cli) -> Result<()> {
+	println!("ipsecpulse associate-mgmt-eip: starting ...");
+
+	let token  = fetch_imds_token().await?;
+	let alloc_id = fetch_imds_tag(&token, "ipsec-mgmt-eip").await?;
+	println!("  Mgmt EIP alloc : {alloc_id}");
+
+	let ifaces = fetch_all_interfaces(&token).await?;
+	let eth0 = ifaces.iter().find(|(dev, _)| *dev == 0)
+		.map(|(_, info)| info)
+		.context("Device 0 (eth0) not found in IMDS interface list")?;
+	println!("  eth0           : {}  ({})", eth0.primary_ip, eth0.eni_id);
+
+	let creds = fetch_imds_credentials().await?;
+
+	associate_eip(&cli.region, &creds, &alloc_id, &eth0.eni_id, &eth0.primary_ip).await?;
+	println!("  ✓ Management EIP {alloc_id} -> {} ({})", eth0.primary_ip, eth0.eni_id);
+
+	println!("✅ ipsecpulse associate-mgmt-eip complete.");
+	Ok(())
+}
+
 // ── NotifyMaster ─────────────────────────────────────────────────────────────
 
 async fn run_notify_master(cli: &Cli) -> Result<()> {
@@ -327,12 +374,16 @@ async fn run_notify_master(cli: &Cli) -> Result<()> {
 	let state = load_state(&cli.state_file)?;
 	let creds = fetch_imds_credentials().await?;
 
-	// Associate the EIP to this node's eth0 ENI.
+	// Associate the EIP to this node's fixed secondary IP on eth0.
 	println!(
-		"  EIP {} → ENI {} ({})",
-		state.eip_alloc_id, state.eth0_eni_id, state.eth0_primary_ip,
+		"  EIP {} → ENI {} (secondary {})",
+		state.eip_alloc_id, state.eth0_eni_id, state.eth0_secondary_ip,
 	);
-	associate_eip(&state.region, &creds, &state.eip_alloc_id, &state.eth0_eni_id).await?;
+	associate_eip(
+		&state.region, &creds,
+		&state.eip_alloc_id, &state.eth0_eni_id,
+		&state.eth0_secondary_ip,
+	).await?;
 	println!("  ✓ EIP associated.");
 
 	// Create or replace the 0.0.0.0/0 route in rtb-vpn.
@@ -454,6 +505,7 @@ async fn associate_eip(
 	creds: &AwsCredentials,
 	alloc_id: &str,
 	eni_id: &str,
+	private_ip: &str,
 ) -> Result<()> {
 	let host = format!("ec2.{region}.amazonaws.com");
 	let xml = aws_query(&host, "ec2", region, creds, &[
@@ -461,6 +513,7 @@ async fn associate_eip(
 		("Version",            "2016-11-15"),
 		("AllocationId",       alloc_id),
 		("NetworkInterfaceId", eni_id),
+		("PrivateIpAddress",   private_ip),
 		("AllowReassociation", "true"),
 	]).await?;
 
@@ -729,7 +782,7 @@ fi
 fn render_nft_nat(state: &State) -> String {
 	let ts      = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 	let n       = state.vpn_ips.len();
-	let snat_ip = &state.eth0_primary_ip;
+	let snat_ip = &state.eth0_secondary_ip;   // fixed secondary — stable across EIP movements
 	let mut out = String::new();
 
 	out.push_str(&format!(

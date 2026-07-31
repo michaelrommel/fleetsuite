@@ -60,10 +60,33 @@ start_pre() {
 	fetch_imds_token TOKEN || return 1
 	fetch_imds_tag "$TOKEN" "ipsec-lb-role"         ROLE         || return 1
 	fetch_imds_tag "$TOKEN" "ipsec-lb-peer-mgmt-ip" PEER_MGMT_IP || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-vip-inside"      VIP_INSIDE   || return 1
 
-	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP"
+	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP  VIP inside: $VIP_INSIDE"
 
-	# ── 2. Attach management ENI (eth1) ──────────────────────────────────
+	# ── 2. Associate management EIP to eth0 primary IP ──────────────────
+	# Permanently associates the pre-allocated management EIP to the primary IP
+	# of eth0.  Uses the auto-assigned public IP (from AssociatePublicIpAddress
+	# in the LT) for this one call; the management EIP then replaces it and
+	# remains associated regardless of where the customer-facing EIP moves.
+	# Safe on restart: AllowReassociation makes it a no-op if already present.
+	ebegin "Associating management EIP to eth0 primary IP"
+	ipsecpulse associate-mgmt-eip --region "${REGION}"
+	eend $? || return 1
+
+	# ── 3. Assign fixed secondary IP to eth0 ────────────────────────────
+	# aeroplug calls AssignPrivateIpAddresses on the primary ENI (auto-detected
+	# from IMDS mac). --allow-reassignment handles a dirty restart where the IP
+	# was already on this ENI from a previous boot cycle.
+	# Then add the address to the OS so the kernel accepts and originates
+	# traffic for it (needed for nftables SNAT and for accepting return packets).
+	ebegin "Assigning secondary IP $VIP_INSIDE to eth0"
+	aeroplug ip --ip "$VIP_INSIDE" --assign --allow-reassignment --region "${REGION}"
+	eend $? || return 1
+	ip addr add "${VIP_INSIDE}/32" dev eth0 2>/dev/null || true
+	einfo "eth0 secondary: $VIP_INSIDE/32"
+
+	# ── 4. Attach management ENI (eth1) ──────────────────────────────────
 	# aeroplug finds the pre-created ENI by tag and writes its primary IP to
 	# /run/eth1-ip for use in the ip-addr step below.
 	# Retry loop: on a restart the ENI may still be transitioning from
@@ -93,7 +116,7 @@ start_pre() {
 		return 1
 	fi
 
-	# ── 3. Wait for eth1 to appear in sysfs ──────────────────────────────
+	# ── 5. Wait for eth1 to appear in sysfs ──────────────────────────────
 	einfo "Waiting for eth1 to appear..."
 	local waited=0
 	while [ ! -d /sys/class/net/eth1 ]; do
@@ -105,7 +128,7 @@ start_pre() {
 		fi
 	done
 
-	# ── 4. Bring up eth1 and assign IP ───────────────────────────────────
+	# ── 6. Bring up eth1 and assign IP ───────────────────────────────────
 	ip link set eth1 up
 
 	# Fetch the subnet CIDR for eth1 from IMDS now that the MAC is readable.
@@ -143,7 +166,7 @@ start_pre() {
 	ip route add "$PEER_SUBNET" via "$ETH1_GW" dev eth1
 	einfo "Route: $PEER_SUBNET via $ETH1_GW dev eth1"
 
-	# ── 5. Policy routing: SSH reply path via eth1 ────────────────────────
+	# ── 7. Policy routing: SSH reply path via eth1 ────────────────────────
 	# Source-based rule: replies from ETH1_IP always egress via eth1.
 	# Without this the main routing table would send replies via eth0.
 	#ip route add table 101 "$ETH1_CIDR"  dev eth1 src "$ETH1_IP"
@@ -151,20 +174,20 @@ start_pre() {
 	#ip rule  add from "$ETH1_IP/32"       lookup 101 prio 100
 	#einfo "Policy routing table 101: $ETH1_CIDR via $ETH1_GW src $ETH1_IP"
 
-	# ── 6. Give the CT entry and peer time to stabilise ───────────────────
+	# ── 8. Give the CT entry and peer time to stabilise ───────────────────
 	# The VRRP dead interval is down_timer_adverts × advert_int = 3 s.
 	# Sleeping 5 s ensures both nodes have had time to exchange at least one
 	# heartbeat before keepalived performs the initial election.
 	sleep 5
 
-	# ── 7. Run ipsecpulse (config generator) ─────────────────────────────
+	# ── 9. Run ipsecpulse (config generator) ─────────────────────────────
 	# ipsecpulse reads NIC layout from IMDS (eth0 + the newly-attached eth1),
 	# fetches VPN ASG instances, and renders all keepalived/nftables files.
 	ebegin "Running ipsecpulse"
 	ipsecpulse --auth-pass "${VRRP_PASS}" --region "${REGION}"
 	eend $? || return 1
 
-	# ── 8. Prime VRRP proto 112 connection tracking ───────────────────────
+	# ── 10. Prime VRRP proto 112 connection tracking ───────────────────────
 	# At cold boot the AWS stateful SG has no inbound entry for proto 112
 	# from the peer.  Without a prior outbound packet the peer's VRRP
 	# advertisements are dropped and this node spuriously elects itself MASTER.
@@ -173,7 +196,7 @@ start_pre() {
 	printf '\x21\x01\x32\x01\x01\x01\x42\x45\xc0\xa8\x01\x01\x63\x30\x66\x57\x6d\x2c\x71\x59' \
 		| socat - "IP4-DATAGRAM:${PEER_MGMT_IP}:112,ip-ttl=255" 2>/dev/null || true
 
-	# ── 9. Reload nftables nat table with ipsecpulse-generated rules ──────────
+	# ── 11. Reload nftables nat table with ipsecpulse-generated rules ──────────
 	# nftables loaded the placeholder ipsec-nat.nft at boot before ipsecpulse
 	# ran.  Flush the old nat table and reload with the generated rules.
 	# The filter table is left untouched.
@@ -195,6 +218,40 @@ start_pre() {
 }
 
 stop_post() {
+	# Fetch token first — used by all steps below.
+	local TOKEN
+	fetch_imds_token TOKEN || return 0   # best-effort; don't fail stop_post
+
+	# ── Return VIP to reservation ENI ───────────────────────────────────
+	# Guard: check IMDS to confirm we still hold VIP_INSIDE on our eth0 ENI
+	# before issuing the return.  If a replacement instance has already claimed
+	# the IP via its start_pre (using --allow-reassignment), IMDS will no longer
+	# show it on our ENI and we must NOT steal it back.
+	# TOCTOU risk is negligible: start_pre takes tens of seconds to reach the
+	# IP-assign step — far longer than this check-then-act gap.
+	local VIP_INSIDE RESERVATION_ENI
+	if fetch_imds_tag "$TOKEN" "ipsec-vip-inside"           VIP_INSIDE      2>/dev/null && \
+	   fetch_imds_tag "$TOKEN" "ipsec-vip-reservation-eni" RESERVATION_ENI 2>/dev/null; then
+		local ETH0_MAC ETH0_IPS
+		ETH0_MAC=$(cat /sys/class/net/eth0/address 2>/dev/null || true)
+		ETH0_IPS=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+			"http://169.254.169.254/latest/meta-data/network/interfaces/macs/$ETH0_MAC/local-ipv4s" \
+			2>/dev/null || true)
+		ip addr del "${VIP_INSIDE}/32" dev eth0 2>/dev/null || true
+		if echo "$ETH0_IPS" | grep -qF "$VIP_INSIDE"; then
+			ebegin "Returning $VIP_INSIDE to reservation ENI $RESERVATION_ENI"
+			aeroplug ip \
+				--ip                "$VIP_INSIDE" \
+				--eni               "$RESERVATION_ENI" \
+				--assign \
+				--allow-reassignment \
+				--region            "${REGION}" || true
+			eend $?
+		else
+			einfo "VIP $VIP_INSIDE no longer on this instance — replacement already holds it, skipping return"
+		fi
+	fi
+
 	# ── Remove eth1 IP and policy routing ────────────────────────────────
 	local INSIDE_IP
 	INSIDE_IP=$(ip -4 addr show eth1 2>/dev/null | awk '/inet / { print $2 }')
@@ -212,9 +269,7 @@ stop_post() {
 	fi
 
 	# ── Detach the management ENI ─────────────────────────────────────────
-	local TOKEN ROLE
-	fetch_imds_token TOKEN || return 0   # best-effort; don't fail stop_post
-
+	local ROLE
 	if fetch_imds_tag "$TOKEN" "ipsec-lb-role" ROLE 2>/dev/null; then
 		ebegin "Detaching management ENI (ipsec-lb-mgmt=$ROLE)"
 		aeroplug eni \

@@ -1,4 +1,4 @@
-# FleetSuite — Agent Bootstrap Document
+# FleetSuite -- Agent Bootstrap Document
 
 This file summarises the architecture, decisions, and outstanding tasks for the
 `fleetsuite` project. Read it in full before making any changes. It is the
@@ -24,23 +24,23 @@ The two projects are **separately maintainable** but intentionally aligned.
 
 ```
 fleetsuite/
-  AGENTS.md                   ← this file
-  Cargo.toml                  ← Rust workspace (ipsecpulse, ipsecscale, ipsecnode)
-  .gitmodules                 ← declares vendor/aerosuite submodule
+  AGENTS.md                   <- this file
+  Cargo.toml                  <- Rust workspace (ipsecpulse, ipsecscale, ipsecnode)
+  .gitmodules                 <- declares vendor/aerosuite submodule
   vendor/
-    aerosuite/                ← git submodule → git@github.com:michaelrommel/aerosuite.git
+    aerosuite/                <- git submodule -> git@github.com:michaelrommel/aerosuite.git
                                   aerocore and aeroplug are consumed from here via
                                   path dependencies; they are NOT workspace members
                                   (nested workspaces are not supported by Cargo)
-  ipsecpulse/                 ← NEW binary (adapted from aerosuite/aeropulse)
-  ipsecscale/                 ← NEW binary (ASG orchestration daemon — runs on LVS)
-  ipsecnode/                  ← NEW binary (per-node tunnel lifecycle daemon — runs on VPN nodes)
+  ipsecpulse/                 <- binary: boot-time config generator (LVS nodes) -- IMPLEMENTED
+  ipsecscale/                 <- binary: ASG orchestration daemon (LVS nodes)   -- STUB
+  ipsecnode/                  <- binary: per-node tunnel lifecycle (VPN nodes)   -- STUB
 
   aerobake/
-    fleetscale/               ← IPSec LB AMI   (Alpine, adapted from aeroscale/)
-    fleetsec/                 ← VPN concentrator AMI  (Ubuntu 24.04, new)
-    fleetroute/               ← Return-path GW AMI    (Alpine, new)
-  infrastructure/             ← AWS CLI scripts + their output
+    fleetscale/               <- IPSec LB AMI   (Alpine) -- IMPLEMENTED, TESTED
+    fleetsec/                 <- VPN concentrator AMI (Ubuntu 24.04) -- TODO
+    fleetroute/               <- Return-path GW AMI (Alpine) -- TODO
+  infrastructure/             <- AWS CLI scripts + their output
 ```
 
 ### Working with the aerosuite submodule
@@ -64,8 +64,8 @@ git commit -m "chore: bump aerosuite submodule to <short-sha>"
 its dependencies. When built from outside the aerosuite workspace, Cargo
 resolves those keys against the *referencing* workspace root (fleetsuite's
 `Cargo.toml`). Therefore fleetsuite's `[workspace.dependencies]` must declare
-every dep that aerocore uses — including `sha2`, `hmac`, `hex`,
-`serde_urlencoded` — at versions matching aerosuite exactly. If aerosuite adds
+every dep that aerocore uses -- including `sha2`, `hmac`, `hex`,
+`serde_urlencoded` -- at versions matching aerosuite exactly. If aerosuite adds
 new workspace deps to aerocore in the future, add the same entry to fleetsuite's
 `Cargo.toml` as part of the submodule bump commit.
 
@@ -106,26 +106,34 @@ IGW:       igw-0599736bc51a9ac5c
 | FleetShell-IPSec-ReturnGW-b | `subnet-082703ab573f0f4e9` | 172.16.51.32/27 | eu-west-2b | PRIVATE | rtb-private |
 | FleetShell-IPSec-Management | `subnet-02387719b5b2c3352` | 172.16.52.0/24 | eu-west-2a | PRIVATE | rtb-private |
 
-The two `LVS-mgmt-*` subnets are a **pending** infrastructure action — see
-Infrastructure Commands below. They carry the VRRP heartbeat and SSH
-management traffic for the LVS nodes on dedicated second NICs (eth1).
+All four mgmt subnets (LVS-mgmt-a/b, ReturnGW-mgmt-a/b) are created and
+associated with rtb-private.
 
 ### EIPs
 
-| Name | Alloc ID | Public IP |
-|---|---|---|
-| FleetShell-IPSec-VIP | `eipalloc-095ac59bb763cd2ce` | **3.11.124.22** (customer-facing) |
-| FleetShell-IPSec-NatGW | `eipalloc-0ac2fb2dd51415b30` | 35.177.240.42 |
+| Name | Alloc ID | Public IP | Notes |
+|---|---|---|---|
+| FleetShell-IPSec-VIP | `eipalloc-095ac59bb763cd2ce` | **3.11.124.22** | Customer-facing; moves to VRRP master's secondary IP on failover |
+| FleetShell-IPSec-NatGW | `eipalloc-0ac2fb2dd51415b30` | 35.177.240.42 | NAT Gateway |
+| FleetShell-IPSec-mgmt-master | see ASG tag `ipsec-mgmt-eip` on `fleetipsec-lvs-master` | - | Permanent management EIP for master node primary IP |
+| FleetShell-IPSec-mgmt-backup | see ASG tag `ipsec-mgmt-eip` on `fleetipsec-lvs-backup` | - | Permanent management EIP for backup node primary IP |
+
+Management EIP allocation IDs are stored as the `ipsec-mgmt-eip` ASG tag
+(PropagateAtLaunch=true). Discover them with:
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names fleetipsec-lvs-master fleetipsec-lvs-backup \
+  --query 'AutoScalingGroups[*].{ASG:AutoScalingGroupName,MgmtEIP:Tags[?Key==`ipsec-mgmt-eip`]|[0].Value}' \
+  --region eu-west-2
+```
 
 ### Route Tables
 
 | Name | ID | Default route | Associations |
 |---|---|---|---|
-| FleetShell-IPSec-rtb-public | `rtb-0ca8eab40e09c76ae` | `0.0.0.0/0 → igw-0599736bc51a9ac5c` | LVS-a, LVS-b |
-| FleetShell-IPSec-rtb-vpn | `rtb-01c3275faa537fcc1` | _added by ipsecpulse/notify-master.sh_ | VPN-a, VPN-b |
-| FleetShell-IPSec-rtb-private | `rtb-0540e3736995912c5` | `0.0.0.0/0 → nat-0fb75bf0679751582` | ReturnGW-a, ReturnGW-b, Management, LVS-mgmt-a*, LVS-mgmt-b* |
-
-\* LVS-mgmt and ReturnGW-mgmt subnets associated once created.
+| FleetShell-IPSec-rtb-public | `rtb-0ca8eab40e09c76ae` | `0.0.0.0/0 -> igw-0599736bc51a9ac5c` | LVS-a, LVS-b |
+| FleetShell-IPSec-rtb-vpn | `rtb-01c3275faa537fcc1` | set by ipsecpulse notify-master | VPN-a, VPN-b |
+| FleetShell-IPSec-rtb-private | `rtb-0540e3736995912c5` | `0.0.0.0/0 -> nat-0fb75bf0679751582` | ReturnGW-a/b, Management, LVS-mgmt-a/b, ReturnGW-mgmt-a/b |
 
 ### Security Groups
 
@@ -141,42 +149,42 @@ management traffic for the LVS nodes on dedicated second NICs (eth1).
 | Resource | ID | Notes |
 |---|---|---|
 | NAT Gateway | `nat-0fb75bf0679751582` | In LVS-a subnet |
-| RDS PostgreSQL | `fleetshell-ipsec-strongswan` | Engine: PostgreSQL 18.4 (16.3 was unavailable); Multi-AZ; db.t4g.medium |
+| RDS PostgreSQL | `fleetshell-ipsec-strongswan` | Engine: PostgreSQL 18.4; Multi-AZ; db.t4g.medium |
 | RDS subnet group | `fleetshell-ipsec-rds` | Management (AZ-a) + ReturnGW-b (AZ-b) |
 
 ---
 
-## Architecture — Full Stack
+## Architecture -- Full Stack
 
 ```
                        Floating EIP  3.11.124.22  (one IP, all customers)
-                             │
-                    ┌────────▼────────┐
-                    │   LVS pair      │  Alpine Linux
-                    │   keepalived    │  c6in.4xlarge × 2
-                    │   nftables      │  active/standby
-                    │   ipsecpulse    │  AZ-a primary, AZ-b standby
-                    │   ipsecscale    │  runs on master only
-                    └────────┬────────┘
-                             │  DNAT: jhash(src_ip) % N
-                             │  handles: UDP 500, UDP 4500, proto 50 (raw ESP)
-                    ┌────────▼────────────────────┐
-                    │  VPN Concentrators (ASG)     │  Ubuntu 24.04
-                    │  StrongSwan  IKEv1 + IKEv2   │  c6in.4xlarge
-                    │  VPP         data plane       │  3–N instances
-                    │  FRR         BGP /32 routes   │  AZ-a + AZ-b
-                    │  ipsecnode   per-node daemon  │
-                    └────────┬────────────────────┘
-                             │  BGP (up to 600k /32 host routes)
-                    ┌────────▼────────┐
-                    │  Return GW pair │  Alpine Linux
-                    │  FRR BGP        │  c6in.2xlarge × 2
-                    │  keepalived VIP │  active/standby
-                    └────────┬────────┘
-                             │  default gateway for backend servers
-                    ┌────────▼────────┐
-                    │  Backend servers│  any OS
-                    └─────────────────┘
+                             |        targets the VRRP master's secondary IP
+                    +--------v--------+
+                    |   LVS pair      |  Alpine Linux
+                    |   keepalived    |  c6in.xlarge x 2  (dev: xlarge; prod: 4xlarge)
+                    |   nftables      |  active/standby
+                    |   ipsecpulse    |  AZ-a primary, AZ-b standby
+                    |   ipsecscale    |  runs on master only
+                    +--------+--------+
+                             |  DNAT: jhash(src_ip) % N
+                             |  handles: UDP 500, UDP 4500, proto 50 (raw ESP)
+                    +--------v----------------------------+
+                    |  VPN Concentrators (ASG)            |  Ubuntu 24.04
+                    |  StrongSwan  IKEv1 + IKEv2          |  c6in.4xlarge
+                    |  VPP         data plane             |  3-N instances
+                    |  FRR         BGP /32 routes         |  AZ-a + AZ-b
+                    |  ipsecnode   per-node daemon        |
+                    +--------+----------------------------+
+                             |  BGP (up to 600k /32 host routes)
+                    +--------v--------+
+                    |  Return GW pair |  Alpine Linux
+                    |  FRR BGP        |  c6in.2xlarge x 2
+                    |  keepalived VIP |  active/standby
+                    +--------+--------+
+                             |  default gateway for backend servers
+                    +--------v--------+
+                    |  Backend servers|  any OS
+                    +-----------------+
 ```
 
 ### Supporting infrastructure
@@ -195,23 +203,24 @@ management traffic for the LVS nodes on dedicated second NICs (eth1).
 
 AWS NLB does not support IP protocol 50 (raw ESP). AWS GWLB supports proto 50
 but hashes UDP flows (5-tuple) and ESP flows (3-tuple) differently, meaning
-IKE and ESP from the same customer can land on different VPN concentrators —
+IKE and ESP from the same customer can land on different VPN concentrators --
 breaking the IPSec SA. A large fraction of the installed customer base cannot
 be forced to use NAT-T (UDP 4500 encapsulation), so raw ESP must be handled.
 
 LVS with nftables `jhash ip saddr` hashes on source IP only, giving identical
 routing decisions for UDP 500, UDP 4500, and proto 50 from the same customer.
 
-### 2. Two NICs on LVS nodes — data plane and management/heartbeat separated
+### 2. Two NICs on LVS nodes -- data plane and management/heartbeat separated
 
 Each LVS node has two ENIs:
 
-- **eth0** — public subnet (LVS-a or LVS-b). Carries all customer ESP/IKE
-  traffic. The EIP is associated to the primary private IP of this ENI on
-  the master node. Each LVS node has a different primary IP (AZ-a: 172.16.48.x,
-  AZ-b: 172.16.48.3x); the EIP re-associates on failover.
-- **eth1** — management subnet (LVS-mgmt-a or LVS-mgmt-b, PRIVATE). Carries
-  VRRP unicast heartbeat and SSH only.
+- **eth0** -- public subnet (LVS-a or LVS-b). Carries all customer ESP/IKE
+  traffic. Has two private IPs: a dynamically assigned primary IP and a fixed
+  secondary IP (172.16.48.10 for master, 172.16.48.40 for backup). The
+  customer-facing EIP targets the secondary IP on the VRRP master. A permanent
+  management EIP on the primary IP provides stable outbound internet access.
+- **eth1** -- management subnet (LVS-mgmt-a or LVS-mgmt-b, PRIVATE). Carries
+  VRRP unicast heartbeat and SSH only. Attached at boot by aeroplug.
 
 Rationale: at 25,000 tunnels with IKE keepalives and DPD traffic, eth0 can
 sustain high PPS bursts. VRRP packets (84 bytes each) competing on the same
@@ -222,63 +231,53 @@ failover. A dedicated eth1 gives:
   to a control-plane core, keeping heartbeat latency stable under load.
 - SSH remains responsive even when eth0 is under heavy load.
 
-This is different from aeroftp (which needed three NICs: public, IPVS-backend
-GW, and VXLAN sync). Here eth1 serves only heartbeat + management — no VXLAN,
-no IPVS backend subnet requirement.
-
 ### 3. No VXLAN / no IPVS connection sync on the LVS nodes
 
 The IPSec LB uses **stateless** nftables DNAT: `jhash(src_ip) % N` is a
 pure function with no per-connection memory. Any node computes the same
 answer, so the new master routes identically to the old one with no sync.
 IPSec session state lives on the VPN concentrators, not on the LB.
-IPSec DPD tolerates the ~5–10 s EIP re-association window.
+IPSec DPD tolerates the ~5-10 s EIP re-association window.
 
 ### 4. Single NIC on LVS nodes for data plane (no eth2 VXLAN)
 
 aeroftp needs eth2 for VXLAN connection-state sync because IPVS tracks
 per-connection state and that state must survive failover. No such requirement
-exists here — see decision #3 above.
+exists here -- see decision #3 above.
 
-### 5. ipsecscale runs on the LVS master, not on VPN concentrators
+### 5. ipsecscale runs always on both LVS nodes; detects role via a file
 
-The autoscaling daemon follows the same pattern as aeroscale in aeroftp: it
-runs exclusively on whichever LVS node currently holds the master role.
-Keepalived's `notify-master.sh` starts ipsecscale; `notify-backup.sh` stops
-it. This gives a single active decision-maker for ASG scale-in/out without
-any distributed consensus mechanism.
+ipsecscale reads `/run/ipsec-role` -- a plain-text file containing `master` or
+`backup` -- written by the keepalived notify scripts on every VRRP state
+transition. It is added to the default runlevel; the notify scripts never
+start or stop it.
 
-ipsecscale on the LVS master is responsible for:
-- Monitoring VPN concentrator health (via CloudWatch / direct health probe).
-- Deciding when to add or remove VPN concentrator instances from the ASG.
-- Updating the nftables backend pool when the VPN instance list changes.
-- Updating the `rtb-vpn` default route (`0.0.0.0/0 → eth0 ENI of master LVS`)
-  when LVS failover occurs or the VPN pool changes.
+**Role file details:**
+- Path: `/run/ipsec-role` (tmpfs -- re-created on every boot)
+- Content: `master\n` or `backup\n`
+- Ownership: `keepalived_script:nogroup` (gid 65533)
+- Written by: `ipsecpulse notify-master` / `ipsecpulse notify-backup`
+- Permissions: `0o644`
+- Pre-created in keepalived `start_pre` before keepalived itself starts
 
 ### 6. ipsecnode is a separate per-node daemon on VPN concentrators
 
-Each VPN concentrator runs `ipsecnode` independently. It handles node-local
-concerns that have nothing to do with fleet-level scaling:
-- StrongSwan vici event subscription (tunnel up/down → provision/deprovision).
-- VPP VRF creation + static 1:1 NAT entry management.
-- FRR /32 host route management (redistributed into BGP).
-- ASG `EC2_INSTANCE_TERMINATING` lifecycle hook handling (graceful drain).
-- Prometheus `/metrics` (port 9090) and `/health` endpoints.
+Each VPN concentrator runs `ipsecnode` independently without any leader
+election. It handles node-local concerns: StrongSwan vici events, VPP VRF
+and NAT entry management, FRR /32 route management, ASG lifecycle hooks,
+and Prometheus metrics/health endpoints.
 
 ### 7. IKEv1 support with `rightid=%any`
 
-A large fraction of the installed customer base runs older CPE firmware that
-places the CPE's inside interface IP in the IKE identity payload, and many
-customers share the same identity value. StrongSwan is configured with
-`rightid=%any` to ignore the identity and look up the PSK by **peer IP address**
-(which is unique per customer in the non-CGN case). PSKs are in the RDS
-PostgreSQL database via the StrongSwan SQL plugin.
+StrongSwan is configured with `rightid=%any` to ignore the IKE identity and
+look up the PSK by **peer IP address**. PSKs are in the RDS PostgreSQL database
+via the StrongSwan SQL plugin.
 
 ### 8. Per-tunnel VRF + static 1:1 NAT on VPN concentrators
 
 Every customer tunnel is isolated in its own Linux VRF within VPP. The
-existing mapping database (customer device internal IP → unique globally
-routable IP) is loaded as **static 1:1 NAT entries** in VPP at tunnel-up time.
+existing mapping database (customer device internal IP -> unique globally
+routable IP) is loaded as static 1:1 NAT entries in VPP at tunnel-up time.
 Return traffic: each unique IP has a `/32` host route advertised via FRR BGP
 to the Return GW pair (up to 600,000 entries).
 
@@ -290,284 +289,237 @@ apk and building from source is impractical.
 ### 10. Shared MemoryDB (Valkey) cluster
 
 The existing `dev-valkey-aeroftp` cluster is reused with key prefix
-`fleetipsec:`. The VPN concentrator SG (`sg-04dcc0342150eb53b`) has been added
-to the MemoryDB cluster. Valkey stores half-open IKE SA state (TTL 30 s) as a
-safety net for the rare case where IKE_SA_INIT and IKE_AUTH arrive at different
-VPN nodes during a hash boundary event.
+`fleetipsec:`. The VPN concentrator SG has been added to the MemoryDB cluster.
+Valkey stores half-open IKE SA state (TTL 30 s) as a safety net for the rare
+case where IKE_SA_INIT and IKE_AUTH arrive at different VPN nodes during a
+hash boundary event.
 
-### 11. Genuine cross-AZ design — each HA node owns its AZ end-to-end
+### 11. Genuine cross-AZ design -- each HA node owns its AZ end-to-end
 
-Every component is pinned to its own AZ for both its data-plane NIC (eth0)
-and its management/heartbeat NIC (eth1):
+Every component is pinned to its own AZ for both eth0 and eth1:
 
 - LVS master: eth0 in LVS-a (AZ-a), eth1 in LVS-mgmt-a (AZ-a)
 - LVS backup: eth0 in LVS-b (AZ-b), eth1 in LVS-mgmt-b (AZ-b)
 - Return GW master: eth0 in ReturnGW-a (AZ-a), eth1 in ReturnGW-mgmt-a (AZ-a)
 - Return GW backup: eth0 in ReturnGW-b (AZ-b), eth1 in ReturnGW-mgmt-b (AZ-b)
 
-This differs deliberately from the aeroftp design, where both LB nodes' inside
-and sync ENIs share a single AZ-b subnet. That made aeroftp implicitly
-single-AZ for its control plane.
+VRRP unicast between 172.16.48.68 (AZ-a) and 172.16.48.84 (AZ-b) is plain IP
+(proto 112); VPC inter-subnet L3 routing handles it automatically.
 
-Consequences:
+**Customer-facing EIP and management EIPs:** the LVS nodes are in PUBLIC
+subnets routed via the IGW. Each node needs two public IP associations on eth0:
 
-**VRRP unicast works cross-AZ without any special plumbing.** Proto 112 packets
-between 172.16.48.68 (AZ-a) and 172.16.48.84 (AZ-b) are ordinary VPC inter-
-subnet L3 traffic; no EIP, no overlay, no floating IP is required for the
-heartbeat path.
+- **Management EIP** (permanent, on primary IP): provides stable outbound
+  internet access for EC2 API calls (aeroplug, ipsecpulse, ipsecscale)
+  regardless of VRRP role. Associated to the primary IP early in `start_pre`
+  (step 2) via `ipsecpulse associate-mgmt-eip`. Survives all customer EIP
+  movements. When an instance is terminated, the ENI is deleted and AWS
+  automatically returns the EIP to the unassociated pool; the next instance's
+  `start_pre` re-associates it to the new primary IP.
 
-**An AZ failure takes out exactly one node end-to-end.** If AZ-a fails, the
-master LVS node loses both eth0 and eth1 simultaneously; the backup detects
-heartbeat loss on its own (AZ-b) eth1 and transitions to MASTER cleanly.
-The converse holds for AZ-b failure.
+- **Customer-facing EIP** (floating, on secondary IP): `3.11.124.22` targets
+  the VRRP master's fixed secondary IP (172.16.48.10 or 172.16.48.40). Moved
+  by `ipsecpulse notify-master` on every VRRP master transition.
 
-**No additional EIPs are needed.** EIPs are regional, not AZ-scoped. The
-single customer-facing EIP (`eipalloc-095ac59bb763cd2ce`, 3.11.124.22)
-re-associates to whichever node becomes MASTER via `ec2:AssociateAddress`
-regardless of AZ. The same applies to any future Return GW EIP if the
-route-table VIP approach (Decision #11 open question) is not chosen.
+**Critical AWS behaviour discovered in testing:** associating ANY EIP to an
+instance -- even to a secondary private IP -- causes AWS to silently release
+the auto-assigned public IP that was on the primary IP. This means
+`AssociatePublicIpAddress: true` in the Launch Template cannot be relied upon
+for permanent outbound access once the customer EIP has been associated. The
+dedicated management EIP on the primary IP is the only reliable solution.
 
-**`ipsec-vip-inside` (floating secondary private IP) is incompatible with
-cross-AZ** and is dropped from the design. `AssignPrivateIpAddresses` is
-subnet-scoped; a secondary IP from the LVS-a /27 cannot be assigned to the
-LVS-b /27 ENI. The SNAT source IP in nftables is instead derived from
-`/latest/meta-data/local-ipv4` at boot (the master's current eth0 primary IP)
-and written into `/etc/nftables.d/ipsec-nat.nft` by ipsecpulse.
+**Fixed secondary IP numbering convention:** same offset (+10) from the base
+of each LVS /27 subnet, making it immediately readable in the AWS console:
 
-**Return GW VIP** faces the same subnet-scoping constraint (ReturnGW-a and
-ReturnGW-b eth0 ENIs are in different /27 subnets). The route-table approach
-is the correct solution: `0.0.0.0/0 → <master-ReturnGW-eth0-ENI>` in the
-backend servers' route table, updated on failover. See open question in the
-Pending Infrastructure section.
+- Master (172.16.48.0/27): secondary IP = **172.16.48.10**
+- Backup (172.16.48.32/27): secondary IP = **172.16.48.40**
+
+If the customer EIP points to .10, the master is active. If it points to .40,
+the backup has promoted. If neither, failover is in progress.
+
+**VIP reservation ENIs** prevent AWS DHCP from accidentally assigning .10 or
+.40 as primary IPs to new instances. Each is a free-standing ENI that holds
+.10 / .40 as a secondary IP permanently. `start_pre` steals the IP onto eth0
+atomically with `--allow-reassignment`. `stop_post` returns it atomically to
+the reservation ENI -- but only after confirming via IMDS that this instance
+still holds the IP (TOCTOU guard prevents stealing it back from a replacement
+instance that may have already claimed it).
+
+**Return GW VIP** is not a floating IP -- the route-table approach is used
+instead (see open questions).
 
 ---
 
 ## Binaries
 
-### Shared from aerosuite — via git submodule at `vendor/aerosuite`
-
-These are consumed as path dependencies, **not** modified. If a change is
-needed, make it in aerosuite, push, then bump the submodule pin in fleetsuite.
+### Shared from aerosuite -- via git submodule at `vendor/aerosuite`
 
 | Crate | Path | Purpose |
 |---|---|---|
-| `aerocore` | `vendor/aerosuite/aerocore` | AWS API, IMDS, credential helpers |
-| `aeroplug` | `vendor/aerosuite/aeroplug` | ENI attach/detach; secondary IP assign/unassign |
+| `aerocore` | `vendor/aerosuite/aerocore` | AWS API, IMDS, SigV4, credential helpers |
+| `aeroplug` | `vendor/aerosuite/aeroplug` | ENI attach/detach (`aeroplug eni`); secondary IP assign/unassign (`aeroplug ip`) |
 
-### New binaries
+### `ipsecpulse` -- boot-time config generator (LVS nodes) -- IMPLEMENTED
 
-#### `ipsecpulse` — boot-time config generator (LVS nodes)
+Single binary with four modes:
 
-Adapt from `aerosuite/aeropulse`. Runs at instance boot before keepalived
-starts. Queries EC2 API and generates:
+| Mode | Invocation | Purpose |
+|---|---|---|
+| boot | `ipsecpulse` (no subcommand) | Reads IMDS, builds State, renders all config files |
+| associate-mgmt-eip | `ipsecpulse associate-mgmt-eip` | Associates permanent management EIP to eth0 primary IP |
+| notify-master | `ipsecpulse notify-master` | Associates customer EIP to secondary IP, updates rtb-vpn, writes role file |
+| notify-backup | `ipsecpulse notify-backup` | Writes role file only |
 
-- `/etc/keepalived/vrrp.conf` — unicast VRRP on **eth1** (management NIC)
-- `/etc/keepalived/notify-master.sh` — calls `aws ec2 associate-address` to
-  move the EIP to this node's eth0 ENI (primary IP); writes the primary IP
-  into `/etc/nftables.d/ipsec-nat.nft` as the SNAT source; reloads nftables;
-  then updates `rtb-vpn` (`0.0.0.0/0 → eth0 ENI ID`) via EC2 API; then starts
-  `ipsecscale`
-- `/etc/keepalived/notify-backup.sh` — stops `ipsecscale`; no-op otherwise
-- `/etc/nftables.d/ipsec-dnat.nft` — jhash DNAT rules with current VPN node
-  list fetched from the ASG
+**Boot run** (called from keepalived `start_pre` step 9):
+1. IMDSv2 token + instance-id
+2. Read 6 IMDS tags: `ipsec-lb-role`, `ipsec-vip-outside`, `ipsec-vip-inside`,
+   `ipsec-lb-peer-mgmt-ip`, `ipsec-vpn-asg`, `ipsec-rtb-vpn`
+3. Read NIC layout from IMDS (eth0 + eth1, already attached by this point)
+4. Fetch VPN concentrator IPs from ASG via `DescribeInstances`
+5. Serialise State to `/run/ipsecpulse.state` (0o644)
+6. Render and write:
+   - `/etc/keepalived/vrrp.conf` (unicast VRRP on eth1, no virtual_ipaddress)
+   - `/etc/keepalived/notify-master.sh`
+   - `/etc/keepalived/notify-backup.sh`
+   - `/etc/nftables.d/ipsec-nat.nft` (DNAT + SNAT, SNAT source = secondary IP)
 
-EC2 instance tags required:
+**State struct** (persisted to `/run/ipsecpulse.state`, read by notify subcommands):
 ```
-ipsec-lb-role       "master" | "backup"
-ipsec-lb-cluster    shared value for both LB nodes (e.g. "fleetipsec-lb")
-ipsec-vip-outside   EIP allocation ID  (eipalloc-095ac59bb763cd2ce)
-ipsec-lb-peer-mgmt-ip  peer's eth1 fixed IP for VRRP unicast
-                        master ASG: 172.16.48.84 (lvs-mgmt-b)
-                        backup ASG: 172.16.48.68 (lvs-mgmt-a)
-ipsec-vpn-asg       name of the VPN concentrator ASG
-ipsec-rtb-vpn       route table ID for VPN subnets  (rtb-01c3275faa537fcc1)
-```
-Note: `ipsec-vip-inside` (floating secondary private IP) has been removed from
-the design. Secondary private IPs are subnet-scoped and cannot migrate between
-LVS-a (172.16.48.0/27) and LVS-b (172.16.48.32/27). The EIP is associated
-directly to the master's eth0 primary IP; the SNAT source is derived from
-IMDS `local-ipv4` at boot. See Architecture Decision #11.
-
-#### `ipsecscale` — autoscaling daemon (LVS master only)
-
-Long-running daemon on whichever LVS node currently holds the master role.
-Started/stopped by keepalived notify scripts (see ipsecpulse above).
-Analogous to `aeroscale` in aeroftp.
-
-Responsibilities:
-1. **Backend pool management** — polls ASG and VPN health endpoints; updates
-   nftables with the current healthy VPN node list; rewrites
-   `/etc/nftables.d/ipsec-nat.nft` and reloads the nat table.
-2. **ASG scaling decisions** — monitors aggregate tunnel count and per-node
-   load; calls EC2 `SetDesiredCapacity` when thresholds are breached.
-3. **rtb-vpn maintenance** — when the master changes (ipsecpulse notify-master
-   already sets the initial route), ipsecscale also updates the route on any
-   subsequent eth0 ENI change (e.g. instance replacement).
-4. **Coordination via Valkey** — key prefix `fleetipsec:scale:`.
-
-**Scale-out sequence (reference for implementation):**
-
-```
-1. ipsecscale detects load threshold exceeded
-2. SetDesiredCapacity(N+1) on fleetipsec-vpn ASG
-3. New VPN concentrator boots; ipsecnode starts; /health returns 200
-4. ipsecscale polls until new instance is InService AND health probe passes
-5. Regenerate /etc/nftables.d/ipsec-nat.nft with N+1 backends; reload nat table:
-     nft flush table ip nat
-     nft -f /etc/nftables.d/ipsec-nat.nft
-   (flush + reload only the nat table — filter table is unaffected)
-6. New IKE negotiations distribute across N+1 backends
-   Existing ESP SAs continue via conntrack — no disruption
+instance_id        EC2 instance ID
+role               "master" | "backup"
+region             AWS region
+eth0_eni_id        ENI ID of eth0
+eth0_primary_ip    primary private IP of eth0 (dynamic, managed by AWS)
+eth0_secondary_ip  fixed secondary IP of eth0 (from ipsec-vip-inside tag)
+                   used as customer EIP target and nftables SNAT source
+eth1_ip            primary IP of eth1 (management NIC)
+eth1_prefix        subnet prefix length of eth1 subnet
+peer_mgmt_ip       peer node's eth1 fixed IP (for VRRP unicast)
+eip_alloc_id       customer-facing EIP allocation ID
+rtb_vpn_id         route table ID for VPN subnets
+vpn_asg_name       VPN concentrator ASG name
+vpn_ips            private IPs of running VPN concentrators (sorted)
 ```
 
-**The rehashing problem:** when the pool grows from N to N+1, the modulo
-changes and approximately 1/(N+1) of all source IPs hash to a different
-backend. Existing tunnels are transparent (conntrack maintains the mapping)
-but tunnels that re-establish (DPD, rekey) will land on a potentially new
-concentrator. At 25,000 tunnels, adding one backend reshuffles ~6 % on next
-re-establishment (~1,500 tunnels briefly reconnecting). This is acceptable;
-mitigate by scaling out before load is critical and enforcing a cooldown after
-each scale event before re-evaluating thresholds.
+**associate-mgmt-eip** (called from keepalived `start_pre` step 2):
+Reads `ipsec-mgmt-eip` tag from IMDS, reads eth0 ENI ID and primary IP from
+IMDS, calls `AssociateAddress` with `AllowReassociation=true`. Safe to call
+on restart (no-op if already associated). This call uses the auto-assigned
+public IP from the LT for outbound access; the management EIP then permanently
+replaces it.
 
-Long-term improvement: replace `mod N` with rendezvous / Maglev hashing so
-that adding a backend only remaps the minimum 1/(N+1) fraction rather than a
-modulo-boundary-dependent set. This is a ipsecscale implementation detail;
-the nftables file format (inline anonymous map) supports it without changes.
+**notify-master** (called by keepalived via generated notify-master.sh):
+Loads State from disk, calls `AssociateAddress` to move the customer EIP to
+`eth0_secondary_ip` (with `PrivateIpAddress` explicitly set), calls
+`ReplaceRoute` / `CreateRoute` to update rtb-vpn, writes `master\n` to
+`/run/ipsec-role`.
 
-**Startup behaviour (critical for failover correctness):** when ipsecscale
-starts on a newly promoted MASTER node, it must **immediately** rediscover the
-current VPN pool via `DescribeInstances` and regenerate `ipsec-nat.nft` before
-entering the monitoring loop. This ensures the new master's nftables reflects
-any pool changes that occurred while it was the backup (scale events are only
-applied to the master's nftables; the backup's file is stale until it promotes).
+**notify-backup** (called by keepalived via generated notify-backup.sh):
+Writes `backup\n` to `/run/ipsec-role`. No AWS API calls.
 
-#### `ipsecnode` — per-node tunnel lifecycle daemon (VPN concentrators)
+**Required EC2 instance tags (set on ASG with PropagateAtLaunch=true):**
 
-Long-running daemon on every VPN concentrator. Handles node-local concerns
-only; runs identically on every node without any leader election.
-
-Responsibilities:
-1. **Tunnel lifecycle** — subscribes to StrongSwan vici events:
-   - `child-updown INSTALLED`: query RDS for customer device mappings →
-     provision VPP VRF + static NAT entries → add FRR /32 routes →
-     write half-open state to Valkey (`fleetipsec:hastate:<peer_ip>`)
-   - `child-updown CLOSED`: reverse all of the above
-2. **ASG lifecycle hooks** — handles `autoscaling:EC2_INSTANCE_TERMINATING`:
-   send StrongSwan DELETE for all SAs, drain VPP, withdraw BGP routes,
-   complete lifecycle hook via EC2 API
-3. **Metrics** — Prometheus `/metrics` on port 9090: active tunnels, VRF
-   count, NAT entry count, BGP route count
-4. **Health** — `/health` for ASG target group / ipsecscale health probes
-
-Environment / config (`/etc/conf.d/ipsecnode`):
 ```
-VALKEY_URL      rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379
-DB_URL          postgres://strongswan:<pass>@<rds-endpoint>:5432/strongswan
-REGION          eu-west-2
-VPN_ASG_NAME    fleetipsec-vpn
-CLOUDWATCH_NS   FleetIPSec
+ipsec-lb-role              "master" | "backup"
+ipsec-vip-outside          eipalloc-095ac59bb763cd2ce  (customer EIP)
+ipsec-vip-inside           172.16.48.10  (master)  | 172.16.48.40  (backup)
+                           Fixed secondary IP on eth0. Customer EIP targets this.
+                           SNAT source in nftables. Assigned to eth0 at boot
+                           by aeroplug (start_pre step 3).
+ipsec-vip-reservation-eni  ENI ID of the VIP reservation ENI for this node.
+                           Holds ipsec-vip-inside as secondary IP when not in
+                           use, preventing AWS DHCP from assigning it as a
+                           primary IP to another instance.
+ipsec-mgmt-eip             Allocation ID of this node's permanent management EIP.
+                           Associated to eth0 primary IP in start_pre step 2.
+ipsec-lb-peer-mgmt-ip      172.16.48.84 (for master) | 172.16.48.68 (for backup)
+                           Peer's eth1 fixed IP for VRRP unicast.
+ipsec-vpn-asg              fleetipsec-vpn
+ipsec-rtb-vpn              rtb-01c3275faa537fcc1
 ```
+
+### `ipsecscale` -- autoscaling daemon (LVS nodes) -- STUB
+
+Long-running daemon on both LVS nodes. Reads `/run/ipsec-role` each cycle;
+only the master acts. Responsibilities: backend pool management, ASG scaling
+decisions, rtb-vpn maintenance, Valkey coordination (`fleetipsec:scale:`).
+
+See the original design notes below for the scale-out sequence and rehashing
+behaviour. Not yet implemented.
+
+### `ipsecnode` -- per-node tunnel lifecycle daemon (VPN nodes) -- STUB
+
+Long-running daemon on every VPN concentrator. Handles: StrongSwan vici
+tunnel up/down events, VPP VRF + NAT entry management, FRR /32 host routes,
+ASG termination lifecycle hooks, Prometheus metrics + health endpoint.
+
+Not yet implemented.
 
 ---
 
 ## Packer AMIs
 
-### `aerobake/fleetscale/` — IPSec LB (Alpine)
+### `aerobake/fleetscale/` -- IPSec LB (Alpine) -- IMPLEMENTED, TESTED
 
-Base: copy of `aerobake/aeroscale/aeroscale.pkr.hcl`, renamed
-`fleetscale.pkr.hcl`.
+**Status:** cold boot, failover, and failback tested successfully in dev.
+Instance type c6in.xlarge for dev (c6in.4xlarge for production).
 
-**NIC layout change vs aeroscale:**
-- eth0: public NIC — data plane, EIP (associated to primary IP on MASTER transition)
-- eth1: management NIC (LVS-mgmt-a/b subnet) — VRRP heartbeat + SSH
+**NIC layout:**
+- eth0: public NIC (LVS-a/b subnet). Two private IPs: dynamic primary +
+  fixed secondary (.10/.40). Management EIP on primary. Customer EIP on
+  secondary when VRRP master.
+- eth1: management NIC (LVS-mgmt-a/b subnet). VRRP heartbeat + SSH only.
+  Attached at boot by aeroplug.
 
-**Remove** from aeroscale skeleton:
-- `ipvsadm` package
-- `_etc_modules-load.d_keepalived.conf` (ip_vs_* modules)
-- `aeroscale` binary and its init.d/conf.d/logrotate
-- eth2 / VXLAN references in nftables and sysctl
+**keepalived init script (`_etc_init.d_keepalived`) -- 11-step start_pre:**
 
-**Replace**:
-- `_etc_nftables_aeroscaler.nft` → `_etc_nftables_fleetscale.nft`
-  (proto 50 + UDP 500 + UDP 4500 jhash DNAT; stateless SNAT for return path)
-- `_etc_sysctl.d_50-aeroscaler.conf` → remove IPVS/FTP tuning, keep
-  forwarding + conntrack; add `nf_conntrack_proto_esp` tuning
-- `_etc_keepalived_keepalived.conf` → VRRP on eth1 (not eth0); remove all
-  virtual_server blocks; keep `include` stubs for vrrp.conf and backends.conf
+1. Read IMDS tags: `ipsec-lb-role`, `ipsec-lb-peer-mgmt-ip`, `ipsec-vip-inside`,
+   `ipsec-vip-reservation-eni`, `ipsec-mgmt-eip`
+2. `ipsecpulse associate-mgmt-eip` -- associates permanent management EIP to
+   eth0 primary IP; uses the LT auto-assigned IP for this one call
+3. `aeroplug ip --assign $VIP_INSIDE --allow-reassignment` -- steals the fixed
+   secondary IP from the reservation ENI onto eth0; then `ip addr add .../32 dev eth0`
+4. `aeroplug eni --tag ipsec-lb-mgmt=$ROLE --attach --device-index 1` -- attach
+   eth1 with retry loop (up to 6 attempts, 5 s apart)
+5. Wait for eth1 to appear in sysfs (up to 60 s)
+6. Bring up eth1: `ip link set eth1 up`, assign IP and prefix from IMDS,
+   add explicit route to peer's /28 via eth1 gateway (VPC router = subnet-base + 1)
+7. Policy routing for eth1 SSH reply path (currently commented out)
+8. Sleep 5 s to allow CT stabilisation before VRRP election
+9. Run `ipsecpulse` (boot mode) -- renders all keepalived/nftables config files
+10. Prime proto 112 conntrack toward peer (prevents spurious master election at cold boot)
+11. Reload nftables nat table: `nft flush table ip nat && nft -f /etc/nftables.d/ipsec-nat.nft`
+    Pre-create `/run/ipsecpulse-notify.log` and `/run/ipsec-role` with correct ownership.
 
-**Add**:
-- `ipsecpulse` binary (built from `fleetsuite/ipsecpulse`)
-- `ipsecscale` binary (built from `fleetsuite/ipsecscale`)
-- `aeroplug` binary (from `vendor/aerosuite/aeroplug`)
-- `_etc_init.d_ipsecpulse` — OpenRC service, runs before keepalived
-- `_etc_init.d_ipsecscale` — OpenRC service, started by notify-master.sh
+**stop_post:**
+1. Fetch IMDS token
+2. IMDS check: confirm this instance still holds `ipsec-vip-inside` on its eth0
+   ENI before returning it. If a replacement instance has already claimed it via
+   start_pre, IMDS will show it gone -- skip the return to avoid stealing from
+   the running replacement (TOCTOU guard).
+3. If still held: `ip addr del .../32 dev eth0` then
+   `aeroplug ip --eni $RESERVATION_ENI --assign --allow-reassignment` to
+   return the IP atomically to the reservation ENI (no pool window).
+4. Remove eth1 IP, bring eth1 down
+5. `aeroplug eni --detach` to release the management ENI
 
-### `aerobake/fleetsec/` — VPN Concentrator (Ubuntu 24.04)
+**NOTE:** the management EIP is NOT disassociated in stop_post. It stays on
+the primary IP permanently while the instance is alive. When the instance is
+terminated, AWS deletes the ENI and automatically returns the EIP to the
+unassociated pool.
 
-New packer script. Key packages:
-```
-strongswan  libcharon-extra-plugins  strongswan-pki
-libstrongswan-extra-plugins  strongswan-plugin-eap-mschapv2
-vpp  vpp-plugin-dpdk  vpp-plugin-nat  vpp-plugin-crypto-openssl
-frr
-prometheus-node-exporter
-ipsecnode   (built from fleetsuite/ipsecnode)
-aeroplug    (built from vendor/aerosuite/aeroplug)
-```
+**Key config files:**
+- `_etc_nftables_fleetscale.nft` -- filter table (INPUT rules for eth0 + eth1)
+- `_etc_nftables.d_ipsec-nat.nft` -- placeholder; overwritten by ipsecpulse at boot
+- `_etc_keepalived_keepalived.conf` -- static; includes generated vrrp.conf
+- `_etc_sysctl.d_50-fleetscale.conf` -- conntrack + forwarding + softirq tuning
+- `_etc_modules-load.d_fleetscale.conf` -- loads `nf_conntrack_proto_esp`
+- `_etc_conf.d_keepalived` -- sets REGION and VRRP_PASS env vars
+- `_etc_init.d_ipsecscale` -- OpenRC init for ipsecscale (stub binary for now)
 
-StrongSwan configuration:
-- `/etc/strongswan.d/charon-sql.conf` — SQL plugin, PostgreSQL DSN
-- `/etc/ipsec.conf` skeleton with `rightid=%any`, `keyexchange=ike`
-- `/etc/strongswan.d/charon.conf` — raise `cookie_threshold` for CGN
+### `aerobake/fleetsec/` -- VPN Concentrator (Ubuntu 24.04) -- TODO
 
-VPP startup config:
-- DPDK on ENA (`dev 0000:xx:xx.x` discovered at boot via sysfs)
-- `nat44` plugin enabled
-- Unix socket for VPP API (used by ipsecnode)
-
-FRR config:
-- BGP router, peering with Return GW nodes
-- `redistribute static` to pick up /32 host routes added by ipsecnode
-
-### `aerobake/fleetroute/` — Return GW (Alpine)
-
-Minimal Alpine AMI:
-- `frr` (BGP only), `keepalived` (VIP for backend default gateway), `iproute2`,
-  `prometheus-node-exporter`
-- Two NICs: eth0 (ReturnGW-a/b subnet) for BGP + data forwarding; eth1
-  (ReturnGW-mgmt-a/b subnet) for VRRP heartbeat + SSH. Same rationale as LVS:
-  a spurious Return GW failover drops return traffic for all customers
-  simultaneously, so heartbeat must be isolated from data-plane RX pressure.
-- keepalived VRRP configured on eth1 (unicast between the two nodes)
-- Sysctl: `net.ipv4.ip_forward=1`, large FIB tuning for 600k routes
-- No custom Rust binaries needed
-
-FRR BGP peers: all VPN concentrators (addresses from ASG at deploy time,
-written into `/etc/frr/frr.conf`).
-
----
-
-## StrongSwan SQL Schema
-
-Database: `strongswan` on RDS instance `fleetshell-ipsec-strongswan`
-(PostgreSQL 18.4).
-
-Core StrongSwan tables (from `/usr/share/doc/strongswan/examples/stroke/sql/sqlite.sql`,
-adapted to PostgreSQL):
-```
-identities          peer identity records
-ike_configs         IKE proposal + addressing (right=%any, local addr)
-peer_configs        per-connection config (rightid=%any, keyexchange=ike)
-child_configs       child SA / traffic selector config
-shared_secrets      PSK per peer IP: (type='PSK', identity=<peer_ip>)
-```
-
-Application tables written by `ipsecnode`:
-```
-tunnel_assignments   (customer_id, vpn_node_ip, vrf_id, created_at)
-device_mappings      (customer_id, internal_ip, unique_ip)
-```
-`device_mappings` is pre-populated from the existing concentrator export.
+### `aerobake/fleetroute/` -- Return GW (Alpine) -- TODO
 
 ---
 
@@ -576,36 +528,28 @@ device_mappings      (customer_id, internal_ip, unique_ip)
 File: `aerobake/fleetscale/_etc_nftables_fleetscale.nft`
 
 ```
-Inbound DNAT (PREROUTING):
-  ip protocol udp  udp dport 500   → jhash ip saddr mod N → VPN node
-  ip protocol udp  udp dport 4500  → jhash ip saddr mod N → VPN node
-  ip protocol 50                   → jhash ip saddr mod N → VPN node
+Inbound DNAT (PREROUTING, generated into ipsec-nat.nft by ipsecpulse):
+  ip protocol 50                   -> jhash ip saddr mod N map {0:vpn1, 1:vpn2, ...}
+  ip protocol udp udp dport 500    -> jhash ip saddr mod N map {0:vpn1, 1:vpn2, ...}
+  ip protocol udp udp dport 4500   -> jhash ip saddr mod N map {0:vpn1, 1:vpn2, ...}
+  Uses inline anonymous maps -- no named map or $VARIABLE in mod position.
 
-Return SNAT (POSTROUTING):
-  oifname "eth0" ip protocol 50  snat to <eth0-primary-ip>
-  oifname "eth0" ip protocol udp snat to <eth0-primary-ip>
-  Stateless — no conntrack dependency.
-  <eth0-primary-ip> = master node's eth0 primary IP, read from IMDS local-ipv4
-  at boot by ipsecpulse and written into /etc/nftables.d/ipsec-nat.nft.
-  The EIP is associated directly to this primary IP on MASTER transition.
-  (A floating secondary private IP cannot cross the LVS-a/LVS-b subnet
-  boundary — see Architecture Decision #11.)
+Return SNAT (POSTROUTING, generated into ipsec-nat.nft by ipsecpulse):
+  oifname "eth0" ip saddr {172.16.49.0/24, 172.16.50.0/24} snat to <secondary-ip>
+  <secondary-ip> = eth0_secondary_ip from State (172.16.48.10 or 172.16.48.40)
+  Stateless -- no conntrack dependency for the SNAT rule itself.
 
-Filter (INPUT on eth0):
+Filter (INPUT on eth0, in fleetscale.nft):
   Allow: icmp, lo, established/related
   Allow: UDP 500, UDP 4500, proto 50 from 0.0.0.0/0
   Reject everything else.
 
-Filter (INPUT on eth1):
+Filter (INPUT on eth1, in fleetscale.nft):
   Allow: TCP 22 from CLI_RemoteAccess SG range
   Allow: proto 112 (VRRP) from peer LVS node
   Allow: icmp, lo, established/related
   Reject everything else.
 ```
-
-The eth0 primary IP and VPN node list are written into
-`/etc/nftables.d/ipsec-nat.nft` by `ipsecpulse` at boot (complete nat table
-with inline anonymous maps; updated by `ipsecscale` when the pool changes).
 
 ---
 
@@ -635,309 +579,143 @@ net.core.wmem_max                = 134217728
 
 ## Build Order
 
-Implement in this sequence:
-
-1. **`ipsecpulse`** — boot-time config generator for LVS nodes
-2. **`aerobake/fleetscale/`** — LVS AMI (Alpine): config files, nftables, 2-NIC keepalived
-3. **`aerobake/fleetroute/`** — Return GW AMI (Alpine): minimal FRR + keepalived
-4. **`ipsecscale`** — LVS autoscaling daemon
-5. **`ipsecnode`** — VPN concentrator per-node daemon
-6. **`aerobake/fleetsec/`** — VPN concentrator AMI (Ubuntu, most complex)
+1. **`ipsecpulse` + `aerobake/fleetscale/`** -- COMPLETE. Cold boot, failover,
+   and failback tested in dev. Remaining work: ipsecscale integration.
+2. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
+   See open questions for boot script approach.
+3. **`ipsecscale`** -- LVS autoscaling daemon.
+4. **`ipsecnode`** -- VPN concentrator per-node daemon.
+5. **`aerobake/fleetsec/`** -- VPN concentrator AMI (Ubuntu, most complex).
 
 ---
 
-## Infrastructure Commands (reference — operator executes)
+## Infrastructure -- Completed Actions
 
-All prior steps (subnets, EIPs, route tables, security groups, NAT GW, RDS,
-route table associations) have been executed. Results are in `infrastructure/`.
+All infrastructure scripts are in `infrastructure/`. Scripts that have been
+executed have their output appended in the file after a `RESULT` marker.
 
-### Pending: management/heartbeat subnets (LVS and Return GW)
+| Script | Status | Notes |
+|---|---|---|
+| `make_subnets.sh` | Done | All subnets created |
+| `make_security_groups.sh` | Done | All SGs created |
+| `make_security_rules.sh` | Done | All SG rules applied |
+| `make_eip_routetables.sh` | Done | EIPs + route tables created |
+| `make_route_associations.sh` | Done | Route table associations |
+| `make_mgmt_subnets.sh` | Done | LVS-mgmt-a/b + ReturnGW-mgmt-a/b created |
+| `make_mgmt_associations.sh` | Done | mgmt subnets associated to rtb-private |
+| `make_NATGW_RDS.sh` | Done | NAT GW + RDS created |
+| `make_iam_lvs.sh` | Done | IAM instance profile |
+| `make_enis_lvs.sh` | Done | Pre-created management ENIs (eth1) |
+| `make_lt_lvs.sh` | Done | Launch Template `fleetipsec-lt-lvs` (lt-097024e3facf45bd3) |
+| `update_lt_lvs_publicip.sh` | Done | LT v2: AssociatePublicIpAddress=true (current default) |
+| `make_asg_lvs.sh` | Done | ASGs `fleetipsec-lvs-master` + `fleetipsec-lvs-backup` |
+| `make_vip_reservation_enis.sh` | Done | VIP reservation ENIs; `ipsec-vip-reservation-eni` ASG tags set |
+| `make_tag_vip_inside.sh` | Done | `ipsec-vip-inside` ASG tags set (.10 and .40) |
+| `make_mgmt_eips.sh` | Done | Management EIPs allocated; `ipsec-mgmt-eip` ASG tags set |
 
-Both the LVS nodes and the Return GW nodes use a two-NIC layout:
-- **eth0** — data-plane NIC (existing public/private subnet)
-- **eth1** — management NIC (new subnet below) — VRRP heartbeat + SSH only
+### Pre-created ENIs (must not be deleted)
 
-Rationale for both node types: VRRP heartbeat packets (84 bytes, proto 112)
-must not compete with data-plane traffic on the same RX ring. A spurious
-failover on either pair drops all customer traffic. The Return GW VIP is the
-default gateway for all backend servers, making its heartbeat equally critical
-to protect. All four subnets below are associated with `rtb-private` (NAT GW
-for outbound). Execute all four creates first, then all four associations.
+| ENI name | ENI ID | Subnet | Fixed IP | Tag | Purpose |
+|---|---|---|---|---|---|
+| `fleetipsec-eni-lvs-mgmt-master` | `eni-0df0c11c6fbc81542` | LVS-mgmt-a (172.16.48.64/28) | 172.16.48.68 | `ipsec-lb-mgmt=master` | eth1 for master LVS node |
+| `fleetipsec-eni-lvs-mgmt-backup` | `eni-0c180dfe894914611` | LVS-mgmt-b (172.16.48.80/28) | 172.16.48.84 | `ipsec-lb-mgmt=backup` | eth1 for backup LVS node |
+| `fleetipsec-eni-vip-master` | see `aws ec2 describe-network-interfaces --filters Name=tag:ipsec-vip-reservation,Values=master` | LVS-a (172.16.48.0/27) | secondary: 172.16.48.10 | `ipsec-vip-reservation=master` | Holds .10 when not on instance |
+| `fleetipsec-eni-vip-backup` | see `aws ec2 describe-network-interfaces --filters Name=tag:ipsec-vip-reservation,Values=backup` | LVS-b (172.16.48.32/27) | secondary: 172.16.48.40 | `ipsec-vip-reservation=backup` | Holds .40 when not on instance |
+| `fleetipsec-eni-returngw-mgmt-master` | (create when needed) | ReturnGW-mgmt-a (172.16.51.64/28) | 172.16.51.68 | `ipsec-gw-mgmt=master` | eth1 for master ReturnGW |
+| `fleetipsec-eni-returngw-mgmt-backup` | (create when needed) | ReturnGW-mgmt-b (172.16.51.96/28) | 172.16.51.100 | `ipsec-gw-mgmt=backup` | eth1 for backup ReturnGW |
 
+### Launch Template
+
+| Name | ID | Current default | Notes |
+|---|---|---|---|
+| `fleetipsec-lt-lvs` | `lt-097024e3facf45bd3` | v2+ (check current) | c6in.xlarge (dev), AssociatePublicIpAddress=true, InstanceMetadataTags=enabled |
+
+When building a new AMI, create a new LT version pointing to it and set as
+default **before** terminating running instances:
 ```bash
-# ── LVS management — eth1 for LVS nodes ──────────────────────────────────
+aws ec2 create-launch-template-version \
+  --launch-template-name fleetipsec-lt-lvs \
+  --source-version '$Latest' \
+  --launch-template-data '{"ImageId":"ami-NEWID"}' \
+  --region eu-west-2
 
-# AZ-a (eth1 for LVS-a node)
-aws ec2 create-subnet \
-  --vpc-id vpc-0595e17ce290fb050 \
-  --cidr-block 172.16.48.64/28 \
-  --availability-zone eu-west-2a \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-LVS-mgmt-a}]'
-
-# AZ-b (eth1 for LVS-b node)
-aws ec2 create-subnet \
-  --vpc-id vpc-0595e17ce290fb050 \
-  --cidr-block 172.16.48.80/28 \
-  --availability-zone eu-west-2b \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-LVS-mgmt-b}]'
-
-# ── Return GW management — eth1 for Return GW nodes ──────────────────────
-
-# AZ-a (eth1 for ReturnGW-a node)
-aws ec2 create-subnet \
-  --vpc-id vpc-0595e17ce290fb050 \
-  --cidr-block 172.16.51.64/28 \
-  --availability-zone eu-west-2a \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-ReturnGW-mgmt-a}]'
-
-# AZ-b (eth1 for ReturnGW-b node)
-aws ec2 create-subnet \
-  --vpc-id vpc-0595e17ce290fb050 \
-  --cidr-block 172.16.51.96/28 \
-  --availability-zone eu-west-2b \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=FleetShell-IPSec-ReturnGW-mgmt-b}]'
-
-# ── Associate all four new subnets with rtb-private ───────────────────────
-
-aws ec2 associate-route-table \
-  --route-table-id rtb-0540e3736995912c5 \
-  --subnet-id subnet-049c91ca98e7d3637
-
-aws ec2 associate-route-table \
-  --route-table-id rtb-0540e3736995912c5 \
-  --subnet-id subnet-07da62f2872b072b7
-
-aws ec2 associate-route-table \
-  --route-table-id rtb-0540e3736995912c5 \
-  --subnet-id subnet-063a83cf5653196c7
-
-aws ec2 associate-route-table \
-  --route-table-id rtb-0540e3736995912c5 \
-  --subnet-id subnet-0ee35e39252ccf95a
+aws ec2 modify-launch-template \
+  --launch-template-name fleetipsec-lt-lvs \
+  --default-version '$Latest' \
+  --region eu-west-2
 ```
 
-### Deferred: rtb-vpn default route
+### ASGs and Instance Tags
 
-The `0.0.0.0/0` route in `rtb-vpn` points to the eth0 ENI of whichever LVS
-node is currently master. It cannot be created until after the first LVS node
-boots and `ipsecpulse` associates the EIP to the master's eth0 primary IP. It is set
-automatically by `ipsecpulse`'s `notify-master.sh` script:
+All LVS instance tags (set on ASG with PropagateAtLaunch=true):
 
+| Tag | `fleetipsec-lvs-master` | `fleetipsec-lvs-backup` | Notes |
+|---|---|---|---|
+| `ipsec-lb-role` | `master` | `backup` | VRRP priority; notify script behaviour |
+| `ipsec-lb-cluster` | `fleetipsec-lb` | `fleetipsec-lb` | Shared cluster label |
+| `ipsec-vip-outside` | `eipalloc-095ac59bb763cd2ce` | `eipalloc-095ac59bb763cd2ce` | Customer EIP |
+| `ipsec-vip-inside` | `172.16.48.10` | `172.16.48.40` | Fixed secondary IP; EIP target + SNAT source |
+| `ipsec-vip-reservation-eni` | ENI ID of `fleetipsec-eni-vip-master` | ENI ID of `fleetipsec-eni-vip-backup` | Reservation ENI holding .10/.40 when not on instance |
+| `ipsec-mgmt-eip` | alloc ID of master mgmt EIP | alloc ID of backup mgmt EIP | Permanent management EIP for primary IP |
+| `ipsec-lb-peer-mgmt-ip` | `172.16.48.84` | `172.16.48.68` | Peer eth1 IP for VRRP unicast |
+| `ipsec-vpn-asg` | `fleetipsec-vpn` | `fleetipsec-vpn` | VPN concentrator ASG |
+| `ipsec-rtb-vpn` | `rtb-01c3275faa537fcc1` | `rtb-01c3275faa537fcc1` | Route table updated on master transition |
+
+---
+
+## Deferred: rtb-vpn default route
+
+Set automatically by `ipsecpulse notify-master` on first master election:
 ```bash
 aws ec2 create-route \
   --route-table-id rtb-01c3275faa537fcc1 \
   --destination-cidr-block 0.0.0.0/0 \
   --network-interface-id <eni-id-of-master-lvs-eth0>
 ```
-
-On subsequent LVS failovers, `ipsecscale` replaces this route with the new
-master's ENI ID using `aws ec2 replace-route`.
-
----
-
-## Pending: Launch Templates, Autoscaling Groups, and Instance Tags
-
-### Pre-created management ENIs (4 — must exist before first boot)
-
-LVS and Return GW nodes each have two NICs. The management NIC (eth1) is in
-a dedicated private subnet for VRRP heartbeat and SSH. Because each ASG is
-single-AZ, its eth0 subnet is already AZ-pinned by the ASG subnet
-configuration. Keeping **one Launch Template per node type** (rather than one
-per AZ) requires eth1 to be attached at boot rather than baked into the LT
-network interface block.
-
-**Established pattern (aeroftp reference):** the aeroftp project uses exactly
-this approach. Its four pre-created ENIs follow a consistent convention:
-
-| aeroftp ENI | ENI ID | Subnet | Fixed IP | Tag |
-|---|---|---|---|---|
-| LB primary inside (eth1) | `eni-0dfcf7192df724525` | AeroFTP-lb-internal (172.16.32.0/26, AZ-b) | 172.16.32.15 | `aeroftp-lb=master` |
-| LB backup inside (eth1) | `eni-01d3d24e8bca6d1c4` | AeroFTP-lb-internal (172.16.32.0/26, AZ-b) | 172.16.32.16 | `aeroftp-lb=backup` |
-| LB master sync (eth2) | `eni-0efb904624f53dd78` | AeroFTP-lb-sync (172.16.32.128/26, AZ-b) | 172.16.32.135 | `aeroftp-lb-sync=master` |
-| LB backup sync (eth2) | `eni-0d51669319c208e0f` | AeroFTP-lb-sync (172.16.32.128/26, AZ-b) | 172.16.32.136 | `aeroftp-lb-sync=backup` |
-
-Key observations:
-- **Both** master and backup ENIs share the **same subnet** — a single
-  control-plane subnet, AZ-b only. AZ isolation of the heartbeat is not a
-  goal; isolating heartbeat traffic from data-plane RX pressure is.
-- **Single tag key, role as value**: `aeroftp-lb=master` / `aeroftp-lb=backup`.
-  At boot, aeropulse calls `aeroplug eni --tag aeroftp-lb=master --attach`
-  (substituting the role it read from its own IMDS tag). No multi-tag
-  conjunction needed.
-- **Fixed consecutive IPs** (.15/.16, .135/.136) are known in advance and
-  stored as instance tags (`keepalived-peer-sync`) on the opposite node so
-  the peer address for VRRP unicast is available from IMDS without an EC2
-  API call.
-
-Apply the same pattern for fleetsuite, **but with one critical difference**: each
-node's management ENI must be in its **own AZ subnet** (not a shared single-AZ
-subnet as aeroftp uses). This is what makes the design genuinely cross-AZ:
-
-- If AZ-a fails: the master LVS node loses both eth0 and eth1. The backup node's
-  eth1 is in AZ-b (still up), it detects heartbeat loss, and transitions to
-  MASTER. ✓
-- If AZ-b fails: the backup node loses both eth0 and eth1. The master's eth1 is
-  in AZ-a (still up) and continues operating as MASTER. ✓
-
-VRRP unicast between 172.16.48.68 (AZ-a) and 172.16.48.84 (AZ-b) is plain IP
-(proto 112). VPC inter-subnet L3 routing handles it automatically — no EIP,
-no floating IP, no tunnel required.
-
-Aeroftp's single-AZ-only management subnets were an accepted limitation;
-fleetsuite's subnet layout (with AZ-specific `*-mgmt-a` and `*-mgmt-b` subnets
-already created) was already designed to avoid this.
-
-| ENI name | Subnet | AZ | Fixed IP | Tag |
-|---|---|---|---|---|
-| `fleetipsec-eni-lvs-mgmt-master` | LVS-mgmt-a `subnet-049c91ca98e7d3637` (172.16.48.64/28) | AZ-a | 172.16.48.68 | `ipsec-lb-mgmt=master` |
-| `fleetipsec-eni-lvs-mgmt-backup` | LVS-mgmt-b `subnet-07da62f2872b072b7` (172.16.48.80/28) | AZ-b | 172.16.48.84 | `ipsec-lb-mgmt=backup` |
-| `fleetipsec-eni-returngw-mgmt-master` | ReturnGW-mgmt-a `subnet-063a83cf5653196c7` (172.16.51.64/28) | AZ-a | 172.16.51.68 | `ipsec-gw-mgmt=master` |
-| `fleetipsec-eni-returngw-mgmt-backup` | ReturnGW-mgmt-b `subnet-0ee35e39252ccf95a` (172.16.51.96/28) | AZ-b | 172.16.51.100 | `ipsec-gw-mgmt=backup` |
-
-At boot, ipsecpulse reads its own `ipsec-lb-role` IMDS tag and calls:
-```
-aeroplug eni --tag ipsec-lb-mgmt=<role> --attach
-```
-
-SG for all four management ENIs: `sg-011b3ebfcfbcca22d` (`CLI_RemoteAccess`)
-plus the relevant node SG (`sg-lvs` or `sg-returngw`) for VRRP proto 112.
+On subsequent failovers, `ipsecscale` replaces this route with the new
+master's ENI ID.
 
 ---
 
-### Launch Templates (3)
+## Open Design Questions
 
-Each LT must have `MetadataOptions → InstanceMetadataTags = enabled` so
-ipsecpulse / ipsecnode can read tags from IMDS at boot.
+### Return GW floating VIP -- cross-subnet problem
 
-Network interfaces in the LT specify **eth0 only**; eth1 is attached at boot
-by the init script (see pre-created management ENIs above). For the VPN
-concentrator LT, only eth0 is ever present; the ASG subnet config spans both
-VPN-a and VPN-b.
+ReturnGW-a and ReturnGW-b eth0 ENIs are in different /27 subnets
+(172.16.51.0/27 and 172.16.51.32/27). A floating secondary IP cannot migrate
+between subnets.
 
-| Name | AMI source | Instance type | eth0 SG(s) | Notes |
-|---|---|---|---|---|
-| `fleetipsec-lt-lvs` | aerobake/fleetscale | c6in.4xlarge | `sg-lvs` + `CLI_RemoteAccess` | eth1 attached at boot from pre-created ENI |
-| `fleetipsec-lt-vpn` | aerobake/fleetsec | c6in.4xlarge | `sg-vpn` + `CLI_RemoteAccess` | single NIC; ASG spans VPN-a + VPN-b |
-| `fleetipsec-lt-returngw` | aerobake/fleetroute | c6in.2xlarge | `sg-returngw` + `CLI_RemoteAccess` | eth1 attached at boot from pre-created ENI |
+**Recommended solution (route-table approach):** add `0.0.0.0/0 -> <master-ReturnGW-eth0-ENI>`
+to the route table used by backend servers. On failover the notify script
+replaces the route's ENI target. No floating IP needed. The `ipsec-gw-vip` tag
+is replaced by `ipsec-gw-rtb` (the route table ID to update). This is
+consistent with how rtb-vpn is managed.
 
-All three LTs must attach an **IAM instance profile** with at minimum:
+### Return GW boot script
 
-- `ec2:DescribeInstances`, `ec2:DescribeNetworkInterfaces`
-- `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses` (aeroplug ip)
-- `ec2:AttachNetworkInterface`, `ec2:DetachNetworkInterface` (aeroplug eni)
-- `ec2:AssociateAddress`, `ec2:DisassociateAddress` (EIP for LVS master)
-- `ec2:CreateRoute`, `ec2:ReplaceRoute` (rtb-vpn management by ipsecpulse / ipsecscale)
-- `autoscaling:DescribeAutoScalingGroups`, `autoscaling:SetDesiredCapacity` (ipsecscale)
-- `autoscaling:CompleteLifecycleAction`, `autoscaling:RecordLifecycleActionHeartbeat` (ipsecnode drain)
-- `cloudwatch:PutMetricData` (ipsecscale + ipsecnode)
-- Connect to MemoryDB cluster (done via SG membership; no IAM permission needed)
+The `aerobake/fleetroute` AMI needs to render `keepalived.conf` at boot from
+IMDS tags (VRRP unicast peer address differs per node). Options:
+- Minimal shell script reading IMDS tags (sufficient for the static two-node case)
+- Minimal `fleetpulse` binary (subset of ipsecpulse, no EIP/nftables logic)
 
----
+### ipsecscale -- not yet implemented
 
-### Autoscaling Groups (5)
+See the design notes in the original `ipsecscale` section. Key points:
+- Reads `/run/ipsec-role` each cycle; only master acts
+- On promotion to master: immediately rediscover VPN pool via `DescribeInstances`
+  and regenerate `ipsec-nat.nft` (backup's file is stale during its standby period)
+- Scale-out rehashing: adding one backend reshuffles ~1/(N+1) of source IPs on
+  next tunnel re-establishment; mitigate with cooldown periods
 
-The four HA-node ASGs are each **single-AZ and single-subnet** so that a
-replacement instance always lands in the same AZ and can attach the correct
-pre-created management ENI. The VPN concentrator ASG spans both VPN subnets.
+### ipsecnode -- not yet implemented
 
-| ASG name | LT | Min | Max | eth0 Subnet | Purpose |
-|---|---|---|---|---|---|
-| `fleetipsec-lvs-master` | `fleetipsec-lt-lvs` | 1 | 2 | LVS-a `subnet-0fe6d05bc51c16ed8` | LVS primary (AZ-a) |
-| `fleetipsec-lvs-backup` | `fleetipsec-lt-lvs` | 1 | 2 | LVS-b `subnet-071e009038ce73f87` | LVS standby (AZ-b) |
-| `fleetipsec-returngw-master` | `fleetipsec-lt-returngw` | 1 | 2 | ReturnGW-a `subnet-017d5b3a6331e26a7` | Return GW primary (AZ-a) |
-| `fleetipsec-returngw-backup` | `fleetipsec-lt-returngw` | 1 | 2 | ReturnGW-b `subnet-082703ab573f0f4e9` | Return GW standby (AZ-b) |
-| `fleetipsec-vpn` | `fleetipsec-lt-vpn` | 1 | 50 | VPN-a `subnet-05a86c0fe6eec7b10` + VPN-b `subnet-0ab2ba73e9b587e2e` | VPN concentrators |
-
-**Why one ASG per HA node (not one per pair)?**  The `ipsec-lb-role` /
-`ipsec-gw-role` tags must differ between the primary and standby nodes. ASG
-instance tags propagate uniformly to every instance in the group — you cannot
-vary a tag within a single ASG. One ASG per node makes the role tag static and
-deterministic at boot without any per-instance bootstrap logic.
-
----
-
-### Instance Tags
-
-All tags below are set on the **ASG** with `PropagateAtLaunch = true`; they
-are then readable from IMDS by ipsecpulse / ipsecnode (requires
-`InstanceMetadataTags = enabled` in the LT).
-
-#### LVS nodes — read by ipsecpulse at boot
-
-| Tag | `fleetipsec-lvs-master` | `fleetipsec-lvs-backup` | Notes |
-|---|---|---|---|
-| `ipsec-lb-role` | `master` | `backup` | Sets VRRP priority; drives notify script behaviour |
-| `ipsec-lb-cluster` | `fleetipsec-lb` | `fleetipsec-lb` | Shared label for DescribeInstances peer lookup |
-| `ipsec-vip-outside` | `eipalloc-095ac59bb763cd2ce` | `eipalloc-095ac59bb763cd2ce` | EIP alloc ID; master calls `ec2:AssociateAddress` targeting the node's eth0 primary IP on MASTER transition |
-| ~~`ipsec-vip-inside`~~ | ~~dropped~~ | ~~dropped~~ | **Removed** — floating secondary private IPs are subnet-scoped and cannot cross LVS-a/LVS-b AZ boundary. SNAT source = IMDS `local-ipv4` at boot. See Architecture Decision #11. |
-| `ipsec-lb-peer-mgmt-ip` | `172.16.48.84` (lvs-mgmt-b, AZ-b) | `172.16.48.68` (lvs-mgmt-a, AZ-a) | Peer's eth1 fixed IP (from pre-created ENI); used for VRRP unicast peer address in keepalived.conf. Analogous to `keepalived-peer-sync` in aeroftp. |
-| `ipsec-vpn-asg` | `fleetipsec-vpn` | `fleetipsec-vpn` | VPN concentrator ASG name used by ipsecscale |
-| `ipsec-rtb-vpn` | `rtb-01c3275faa537fcc1` | `rtb-01c3275faa537fcc1` | Route table updated by ipsecpulse notify-master |
-
-#### Return GW nodes — read by the keepalived boot script
-
-| Tag | `fleetipsec-returngw-master` | `fleetipsec-returngw-backup` | Notes |
-|---|---|---|---|
-| `ipsec-gw-role` | `master` | `backup` | Sets VRRP priority |
-| `ipsec-gw-cluster` | `fleetipsec-gw` | `fleetipsec-gw` | Shared label for peer lookup |
-| `ipsec-gw-vip` | ⚠ see open question below | ⚠ see open question below | Floating VIP used as default gateway by backend servers |
-| `ipsec-gw-peer-mgmt-ip` | `172.16.51.100` (returngw-mgmt-b, AZ-b) | `172.16.51.68` (returngw-mgmt-a, AZ-a) | Peer's eth1 fixed IP; used for VRRP unicast. Analogous to `keepalived-peer-sync` in aeroftp. |
-
-#### VPN concentrators — no IMDS tags needed
-
-ipsecnode reads its configuration from `/etc/conf.d/ipsecnode` (baked into the
-AMI). No IMDS instance tags are required.
-
----
-
-### Open Design Questions (resolve before implementing ipsecpulse)
-
-#### ~~`ipsec-vip-inside`~~ — resolved, dropped from design
-
-This was an open question. It is now resolved as Architecture Decision #11:
-floating secondary private IPs are subnet-scoped; they cannot migrate between
-LVS-a (172.16.48.0/27, AZ-a) and LVS-b (172.16.48.32/27, AZ-b). The EIP is
-associated directly to the master's eth0 primary IP. The SNAT source is written
-into `/etc/nftables.d/ipsec-nat.nft` from IMDS `local-ipv4` at boot by
-ipsecpulse. The `ipsec-vip-inside` instance tag is not used.
-
-#### ⚠ Return GW floating VIP — cross-subnet problem
-
-The same subnet-scoping issue applies: Return GW-a and Return GW-b eth0 ENIs
-are in different /27 subnets (172.16.51.0/27 and 172.16.51.32/27).
-
-Options:
-1. **Route-table approach** (recommended, consistent with rtb-vpn pattern):
-   add `0.0.0.0/0 → <master-ReturnGW-eth0-ENI>` to the route table(s) used by
-   backend servers. On failover the notify script replaces the route's ENI
-   target. No floating IP needed; backend servers route to their default
-   gateway via the AWS route table, not a fixed IP. The `ipsec-gw-vip` tag
-   is replaced by `ipsec-gw-rtb` (the route table ID to update).
-2. **EIP approach**: assign a second EIP to the Return GW pair and associate
-   it to the master. Backend servers use the EIP's public IP as their gateway,
-   which only works if they route outbound traffic via the internet (unlikely
-   for internal backends).
-3. **New shared subnet**: create a small /29 that both Return GW nodes join as
-   a third interface, strictly for the floating gateway IP. Most complex option.
-
-Option 1 is strongly preferred for an all-private-VPC design.
-
-#### ⚠ Return GW boot script — no Rust binary planned
-
-The `aerobake/fleetroute` AMI is planned with no custom Rust binary. VRRP
-unicast configuration (keepalived.conf) must still be written at boot from
-IMDS tags. Options:
-- Write a minimal shell script that reads the required IMDS tags and renders
-  `/etc/keepalived/keepalived.conf` at boot (simpler than a binary, sufficient
-  for the static two-node case).
-- OR add a minimal `fleetpulse` binary (trivial subset of ipsecpulse, no EIP
-  logic, no nftables, just keepalived VRRP config generation).
+See the design notes in the original `ipsecnode` section.
 
 ---
 
 ## Important Cross-References
 
-- aerosuite reference: `~/software/aerosuite/` — read before writing anything
+- aerosuite reference: `~/software/aerosuite/` -- read before writing anything
 - aeropulse (model for ipsecpulse): `vendor/aerosuite/aeropulse/src/main.rs`
 - aeroscale (model for ipsecscale): `vendor/aerosuite/aeroscale/src/main.rs`
 - aeroplug (reused unchanged): `vendor/aerosuite/aeroplug/src/`
