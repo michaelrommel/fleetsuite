@@ -38,7 +38,7 @@ fleetsuite/
 
   aerobake/
     fleetscale/               <- IPSec LB AMI   (Alpine) -- IMPLEMENTED, TESTED
-    fleetsec/                 <- VPN concentrator AMI (Ubuntu 24.04) -- TODO
+    fleetnode/               <- VPN concentrator AMI (Debian 12 Bookworm) -- IN PROGRESS
     fleetroute/               <- Return-path GW AMI (Alpine) -- TODO
   infrastructure/             <- AWS CLI scripts + their output
 ```
@@ -88,7 +88,8 @@ IGW:       igw-0599736bc51a9ac5c
 | MemoryDB endpoint | `clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379` | |
 | MemoryDB subnet group | `nucleus-private-subnets` | subnets 172.16.128.0/20 (AZ-a) + 172.16.16.0/20 (AZ-b) |
 | Office SSH access SG | `sg-011b3ebfcfbcca22d` `CLI_RemoteAccess` | Add to every managed node |
-| Bastion host | `192.168.30.1` port 22 user `rommel` | SSH agent forwarding, both legs |
+| Office network | `192.168.13.0/24` | koi `.151`, local workstation `.185`, test Linux host `.133` |
+| SSH access | koi or workstation direct to instance private IP | SSH agent forwarding; no bastion |
 
 ### Subnets (all created, all in vpc-0595e17ce290fb050)
 
@@ -169,7 +170,7 @@ aws autoscaling describe-auto-scaling-groups \
                              |  DNAT: jhash(src_ip) % N
                              |  handles: UDP 500, UDP 4500, proto 50 (raw ESP)
                     +--------v----------------------------+
-                    |  VPN Concentrators (ASG)            |  Ubuntu 24.04
+                    |  VPN Concentrators (ASG)            |  Debian 12
                     |  StrongSwan  IKEv1 + IKEv2          |  c6in.4xlarge
                     |  VPP         data plane             |  3-N instances
                     |  FRR         BGP /32 routes         |  AZ-a + AZ-b
@@ -192,8 +193,8 @@ aws autoscaling describe-auto-scaling-groups \
 | Component | Location | Purpose |
 |---|---|---|
 | NAT Gateway | LVS-a subnet | Outbound internet for private subnets |
-| RDS PostgreSQL | Management + ReturnGW-b (Multi-AZ) | StrongSwan SQL plugin: PSK store + connection configs |
-| MemoryDB/Valkey | shared (existing) | Half-open IKE SA state, ipsecscale coordination |
+| RDS PostgreSQL | Management + ReturnGW-b (Multi-AZ) | Originally intended for StrongSwan SQL plugin (see Implementation Notes). Now available for device registry / management plane use. ipsecnode does NOT use it at runtime. |
+| MemoryDB/Valkey | shared (existing) | PSK store (`fleetipsec:psk:<ip>`), device metadata (`fleetipsec:device:<ip>`), half-open IKE SA state, ipsecscale coordination |
 
 ---
 
@@ -263,15 +264,28 @@ start or stop it.
 ### 6. ipsecnode is a separate per-node daemon on VPN concentrators
 
 Each VPN concentrator runs `ipsecnode` independently without any leader
-election. It handles node-local concerns: StrongSwan vici events, VPP VRF
-and NAT entry management, FRR /32 route management, ASG lifecycle hooks,
-and Prometheus metrics/health endpoints.
+election. It handles node-local concerns: StrongSwan tunnel events via VICI
+socket, VPP VRF and NAT entry management, FRR /32 route management, ASG
+lifecycle hooks, and Prometheus metrics/health endpoints.
 
-### 7. IKEv1 support with `rightid=%any`
+### 7. IKEv1 + IKEv2 support with `rightid=%any`
 
-StrongSwan is configured with `rightid=%any` to ignore the IKE identity and
-look up the PSK by **peer IP address**. PSKs are in the RDS PostgreSQL database
-via the StrongSwan SQL plugin.
+StrongSwan is configured with `rightid=%any` to accept any peer identity.
+PSKs are stored in MemoryDB (Valkey) under `fleetipsec:psk:<peer_ip>` and
+loaded into charon at startup (and on change) by ipsecnode via the VICI
+`load-shared` command (see Architecture Decision #12).
+
+PSK lookup behaviour varies by IKE version and mode:
+- **IKEv1 Main Mode**: StrongSwan must derive keys before identities are
+  exchanged (messages 5-6 are encrypted). It looks up the PSK by the packet
+  source IP. Clients may send any identity; it is accepted post-auth via
+  `rightid=%any`. Works correctly regardless of what the client puts in
+  its local identity config.
+- **IKEv2 + IKEv1 Aggressive Mode**: StrongSwan uses the peer's stated IKE
+  identity for lookup. If the client identifies as its public IP (common
+  default), the lookup works directly. If the client uses a different identity
+  (internal IP, FQDN), the device record must carry an `ike_identity` field
+  so ipsecnode can register the PSK under that identity too (see Decision #13).
 
 ### 8. Per-tunnel VRF + static 1:1 NAT on VPN concentrators
 
@@ -281,10 +295,19 @@ routable IP) is loaded as static 1:1 NAT entries in VPP at tunnel-up time.
 Return traffic: each unique IP has a `/32` host route advertised via FRR BGP
 to the Return GW pair (up to 600,000 entries).
 
-### 9. Ubuntu 24.04 for VPN concentrators, Alpine for everything else
+### 9. Debian 12 Bookworm for VPN concentrators, Alpine for everything else
 
-VPP has official `fd.io` apt packages for Ubuntu. Alpine does not have VPP in
-apk and building from source is impractical.
+VPP (`fd.io` packagecloud repo) and FRR (`frrouting.org` repo) both have
+official Debian Bookworm packages. Alpine does not have VPP in apk and
+building from source is impractical.
+
+Ubuntu 24.04 was the original choice but was abandoned: investigation into
+the `valkeyauth` C plugin approach (see Decision #12 history) revealed that
+`libstrongswan-dev` no longer exists on any current distro (dropped from
+Debian after Bullseye, never packaged by Canonical for Noble). This triggered
+a full redesign of credential management -- see Decision #12. With the C plugin
+approach dropped, Ubuntu offered no advantage over Debian Bookworm, and
+Debian is the more stable server base.
 
 ### 10. Shared MemoryDB (Valkey) cluster
 
@@ -347,6 +370,86 @@ instance that may have already claimed it).
 
 **Return GW VIP** is not a floating IP -- the route-table approach is used
 instead (see open questions).
+
+### 12. ipsecnode owns all StrongSwan credential management via VICI
+
+A custom C plugin (`valkeyauth`) was prototyped but abandoned. `libstrongswan-dev`
+does not exist on any current Debian or Ubuntu release (dropped after Debian
+Bullseye; never packaged by Canonical for Noble or Jammy). No viable path
+existed to compile a C plugin without significant build complexity.
+
+**Decision:** ipsecnode (Rust) is the single process that bridges Valkey and
+StrongSwan. It uses the VICI protocol directly over `/var/run/charon.vici`
+for both credential management and tunnel lifecycle events -- no C plugin,
+no secrets file on disk, no `swanctl` subprocess calls.
+
+**Startup sequence:**
+1. ipsecnode connects to `/var/run/charon.vici` and subscribes to
+   `child-updown` events.
+2. It scans `fleetipsec:psk:*` in Valkey, fetches each device record, and
+   issues one VICI `load-shared` command per device, registering the PSK
+   under the correct identity set (see Decision #13).
+3. It loads CA certificates from a configured path via VICI `load-cert`.
+4. It subscribes to Valkey keyspace notifications on `fleetipsec:psk:*` and
+   `fleetipsec:device:*`.
+
+**Runtime credential updates (non-disruptive):**
+- New device registered in Valkey: pubsub event fires, ipsecnode issues a
+  single VICI `load-shared` -- existing tunnels are unaffected.
+- Device removed: ipsecnode issues VICI `unload-shared`.
+- `swanctl --load-creds` is NOT used; all credential operations go through
+  the VICI socket directly.
+
+**Valkey key schema:**
+```
+fleetipsec:psk:<device_public_ip>
+    PSK string (plain text)
+
+fleetipsec:device:<device_public_ip>
+    JSON: {
+        "mapped_global_ip": "...",
+        "customer_id":      "...",
+        "ike_identity":     "..."    <- optional; see Decision #13
+    }
+```
+
+**VICI `load-shared` payload per device:**
+```
+id:     unique string, e.g. "psk-<device_public_ip>"
+type:   "IKE"
+data:   <PSK bytes>
+owners: [ <device_public_ip> ]               always present
+        + [ <ike_identity> ]                 if device record has ike_identity field
+```
+
+### 13. IKEv1 Aggressive Mode and certificate clients
+
+**IKEv1 Aggressive Mode PSK:**
+In IKEv1 Main Mode the PSK is always looked up by source IP (StrongSwan
+cannot know the peer identity before decrypting messages 5-6). In IKEv1
+Aggressive Mode and IKEv2 the peer's stated IKE identity is used for lookup.
+If a client identifies itself with something other than its public IP (internal
+IP, FQDN), the lookup fails unless the PSK is also registered under that
+identity.
+
+Solution: an optional `ike_identity` field in `fleetipsec:device:<public_ip>`.
+When present, ipsecnode registers the PSK under both the public IP AND the
+stated IKE identity (two entries in the VICI `owners` list). The device
+registration process must capture the IKE identity for any aggressive-mode
+device that does not identify by public IP. Devices without this field
+are treated as Main Mode / public-IP-identity devices.
+
+**Certificate-based clients:**
+VPN nodes do NOT need individual client certificates. The client sends its
+certificate in the IKE `CERT` payload; the node validates it against the
+CA certificate. Only a small set of CA certs (one per customer PKI or one
+global CA) needs to be loaded -- the same set on every node.
+
+ipsecnode loads CA certs at startup via VICI `load-cert` from a local
+directory (e.g. `/etc/ipsecnode/ca/`). CA certs are baked into the AMI
+or pushed via configuration management. Certificate revocation (CRL/OCSP)
+is handled dynamically by StrongSwan using URLs embedded in client certs.
+No per-device cert pre-loading is needed or possible.
 
 ---
 
@@ -449,9 +552,29 @@ behaviour. Not yet implemented.
 
 ### `ipsecnode` -- per-node tunnel lifecycle daemon (VPN nodes) -- STUB
 
-Long-running daemon on every VPN concentrator. Handles: StrongSwan vici
-tunnel up/down events, VPP VRF + NAT entry management, FRR /32 host routes,
-ASG termination lifecycle hooks, Prometheus metrics + health endpoint.
+Long-running daemon on every VPN concentrator. Single process that owns both
+the Valkey side and the StrongSwan side via VICI. No C plugin, no secrets
+file, no `swanctl` subprocess calls for credential management.
+
+**Responsibilities:**
+- Connect to `/var/run/charon.vici` at startup; subscribe to `child-updown`
+  events
+- Bulk-load all PSKs from Valkey via VICI `load-shared` at startup
+- Load CA certificates via VICI `load-cert` from `/etc/ipsecnode/ca/`
+- Subscribe to Valkey keyspace notifications (`fleetipsec:psk:*`,
+  `fleetipsec:device:*`); issue incremental `load-shared` / `unload-shared`
+  VICI commands on change -- non-disruptive to existing tunnels
+- On `child-updown` UP: look up `fleetipsec:device:<peer_ip>` in Valkey;
+  tell VPP to create VRF + install 1:1 NAT; tell FRR to advertise /32 route
+- On `child-updown` DOWN: tear down VRF/NAT in VPP; withdraw /32 from FRR
+- Disable src/dest check on eth0 at startup (EC2 API via aerocore)
+- ASG termination lifecycle hook: drain tunnels, call CompleteLifecycleAction
+- Prometheus metrics + health endpoint on port 9101
+
+**VICI** is a binary protocol over a Unix domain socket. The `rsvici` crate
+on crates.io provides an async Rust VICI client. Increments 6a and 6b are
+tightly coupled (VICI connection needed for both credential loading and
+tunnel events) and should be implemented together.
 
 Not yet implemented.
 
@@ -517,7 +640,7 @@ unassociated pool.
 - `_etc_conf.d_keepalived` -- sets REGION and VRRP_PASS env vars
 - `_etc_init.d_ipsecscale` -- OpenRC init for ipsecscale (stub binary for now)
 
-### `aerobake/fleetsec/` -- VPN Concentrator (Ubuntu 24.04) -- TODO
+### `aerobake/fleetnode/` -- VPN Concentrator (Debian 12 Bookworm) -- IN PROGRESS
 
 ### `aerobake/fleetroute/` -- Return GW (Alpine) -- TODO
 
@@ -581,11 +704,35 @@ net.core.wmem_max                = 134217728
 
 1. **`ipsecpulse` + `aerobake/fleetscale/`** -- COMPLETE. Cold boot, failover,
    and failback tested in dev. Remaining work: ipsecscale integration.
-2. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
-   See open questions for boot script approach.
-3. **`ipsecscale`** -- LVS autoscaling daemon.
-4. **`ipsecnode`** -- VPN concentrator per-node daemon.
-5. **`aerobake/fleetsec/`** -- VPN concentrator AMI (Ubuntu, most complex).
+   **Fix applied:** `ipsecpulse associate-mgmt-eip` now calls
+   `ModifyNetworkInterfaceAttribute` (SourceDestCheck=false) immediately after
+   associating the management EIP. Every future ASG replacement instance fixes
+   itself automatically at boot.
+2. **`aerobake/fleetnode/` VPN infra** -- COMPLETE. IAM role/profile, Launch
+   Template `fleetipsec-lt-vpn`, ASG `fleetipsec-vpn` with drain lifecycle hook
+   all created.
+3. **`aerobake/fleetnode/` -- rebase to Debian 12 Bookworm + AMI rebuild** -- COMPLETE (AMI rebuild in progress for swanctl config fix).
+   Debian 12 AMI, ssh user `admin`, FRR from `frrouting.org`, VPP from `fdio/release`.
+   Ubuntu-specific packages removed. `valkeyauth/` artefacts removed.
+   swanctl.conf: `install_policy` keyword not supported in StrongSwan 5.9.8
+   swanctl format; replaced with bypass-vpc (172.16.0.0/16) and bypass-office
+   (192.168.13.0/24) pass-mode connections. ami-0d3c80537d8b691f0 (LT v7) had
+   the broken config baked in; replaced by LT v8 (`ami-02dd075664df52991`).
+   T1 testing complete on Bookworm (see Implementation Notes).
+4. **`aerobake/fleetnode/` -- FRR BGP** -- base BGP config in AMI.
+5. **`aerobake/fleetnode/` -- VPP** -- startup.conf in AMI.
+6. **`ipsecnode`** -- implement in Rust. Increments 6a+6b are coupled and
+   should be done together (both require the VICI connection):
+   - 6a+6b: VICI connection + `child-updown` event loop + bulk PSK load at
+     startup via `load-shared` + Valkey pubsub listener for incremental
+     credential updates + CA cert loading via `load-cert` +
+     src/dest check disable + health endpoint
+   - 6c: FRR route management (/32 advertise/withdraw on tunnel up/down)
+   - 6d: VPP VRF + NAT entry management
+   - 6e: ASG lifecycle hook heartbeat
+   - 6f: Valkey half-open IKE SA state
+7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
+8. **`ipsecscale`** -- LVS autoscaling daemon.
 
 ---
 
@@ -610,8 +757,25 @@ executed have their output appended in the file after a `RESULT` marker.
 | `update_lt_lvs_publicip.sh` | Done | LT v2: AssociatePublicIpAddress=true (current default) |
 | `make_asg_lvs.sh` | Done | ASGs `fleetipsec-lvs-master` + `fleetipsec-lvs-backup` |
 | `make_vip_reservation_enis.sh` | Done | VIP reservation ENIs; `ipsec-vip-reservation-eni` ASG tags set |
+| `make_iam_vpn.sh` | Done | IAM role `fleetipsec-vpn-role` + instance profile `fleetipsec-vpn-profile` |
+| `make_lt_vpn.sh` | Done | Launch Template `fleetipsec-lt-vpn` (lt-02a4499a34fa61c3b); v1 = Ubuntu 24.04 stand-in; current default v8 = Debian Bookworm `ami-02dd075664df52991` |
+| `make_asg_vpn.sh` | Done | ASG `fleetipsec-vpn` (min=1 max=10) + lifecycle hook `fleetipsec-vpn-drain` |
+| `update_lt_vpn_srcdstcheck.sh` | Done | LT v2: user data disables src/dest check at boot; running instance `eni-0a3b04ae06663662f` fixed manually |
+| `update_lt_vpn_remove_userdata.sh` | Done | LT v3: removed awscli user data; src/dest check will be handled by ipsecnode at startup |
+| `update_lt_vpn_ami.sh` | Done | LT v4: fleetnode skeleton AMI `ami-0e4b56716bd7d28f6` |
 | `make_tag_vip_inside.sh` | Done | `ipsec-vip-inside` ASG tags set (.10 and .40) |
 | `make_mgmt_eips.sh` | Done | Management EIPs allocated; `ipsec-mgmt-eip` ASG tags set |
+
+### Packer AMIs
+
+| AMI ID | Name | Base OS | Built | Contents |
+|---|---|---|---|---|
+| `ami-0cbada86feaa752f7` | `fleetscale-alpine` | Alpine 3.23.3 | (prior) | keepalived, nftables, ipsecpulse, aeroplug, ipsecscale stub |
+| `ami-0e4b56716bd7d28f6` | `fleetnode-ubuntu2404` | Ubuntu 24.04 LTS | 2026-08-03 | skeleton only -- superseded, do not use |
+| `ami-0fc1555de9422edb4` | `fleetnode-ubuntu2404` | Ubuntu 24.04 LTS | 2026-08-03 | StrongSwan 5.9.13; Ubuntu base -- superseded, do not use |
+| `ami-05cb5d404a127a9e7` | `fleetnode-ubuntu2404` | Ubuntu 24.04 LTS | 2026-08-03 | superseded, do not use |
+| `ami-0d3c80537d8b691f0` | `fleetnode-bookworm` | Debian 12 Bookworm | 2026-08-03 | superseded -- swanctl config had invalid install_policy keyword; do not use |
+| `ami-02dd075664df52991` | `fleetnode-bookworm` | Debian 12 Bookworm | 2026-08-04 | current AMI (LT v8); bypass-vpc + bypass-office; StrongSwan, FRR (disabled), VPP (masked); ipsecnode stub |
 
 ### Pre-created ENIs (must not be deleted)
 
@@ -624,11 +788,12 @@ executed have their output appended in the file after a `RESULT` marker.
 | `fleetipsec-eni-returngw-mgmt-master` | (create when needed) | ReturnGW-mgmt-a (172.16.51.64/28) | 172.16.51.68 | `ipsec-gw-mgmt=master` | eth1 for master ReturnGW |
 | `fleetipsec-eni-returngw-mgmt-backup` | (create when needed) | ReturnGW-mgmt-b (172.16.51.96/28) | 172.16.51.100 | `ipsec-gw-mgmt=backup` | eth1 for backup ReturnGW |
 
-### Launch Template
+### Launch Templates
 
 | Name | ID | Current default | Notes |
 |---|---|---|---|
 | `fleetipsec-lt-lvs` | `lt-097024e3facf45bd3` | v2+ (check current) | c6in.xlarge (dev), AssociatePublicIpAddress=true, InstanceMetadataTags=enabled |
+| `fleetipsec-lt-vpn` | `lt-02a4499a34fa61c3b` | v8 | c6in.xlarge (dev), no public IP, sg-vpn, InstanceMetadataTags=enabled; src/dest check disabled by ipsecnode at startup (Increment 6a); current AMI `ami-02dd075664df52991` (Debian Bookworm) |
 
 When building a new AMI, create a new LT version pointing to it and set as
 default **before** terminating running instances:
@@ -644,6 +809,13 @@ aws ec2 modify-launch-template \
   --default-version '$Latest' \
   --region eu-west-2
 ```
+
+### IAM Instance Profiles
+
+| Profile | Role | Managed policies | Used by |
+|---|---|---|---|
+| `ecsInstanceRole` | (existing shared role) | AmazonEC2FullAccess, AutoScalingFullAccess, AmazonSSMManagedInstanceCore, AWSSecretsManagerClientReadOnlyAccess, + others | LVS nodes (dev), shared with aerosuite |
+| `fleetipsec-vpn-profile` | `fleetipsec-vpn-role` | AmazonEC2FullAccess, AutoScalingFullAccess, AmazonSSMManagedInstanceCore, AWSSecretsManagerClientReadOnlyAccess, CloudWatchAgentServerPolicy | VPN concentrator nodes |
 
 ### ASGs and Instance Tags
 
@@ -661,6 +833,25 @@ All LVS instance tags (set on ASG with PropagateAtLaunch=true):
 | `ipsec-vpn-asg` | `fleetipsec-vpn` | `fleetipsec-vpn` | VPN concentrator ASG |
 | `ipsec-rtb-vpn` | `rtb-01c3275faa537fcc1` | `rtb-01c3275faa537fcc1` | Route table updated on master transition |
 
+### VPN ASG (`fleetipsec-vpn`)
+
+| Resource | Value | Notes |
+|---|---|---|
+| ASG name | `fleetipsec-vpn` | Spans VPN-a (eu-west-2a) + VPN-b (eu-west-2b) |
+| Subnets | `subnet-05a86c0fe6eec7b10`, `subnet-0ab2ba73e9b587e2e` | 172.16.49.0/24 + 172.16.50.0/24 |
+| Sizing | min=1 max=10 desired=1 | Raise max for production (10 x c6in.4xlarge = 25k tunnels) |
+| Lifecycle hook | `fleetipsec-vpn-drain` | TERMINATING, 300 s heartbeat, default=ABANDON |
+
+VPN instance tags (set on ASG with PropagateAtLaunch=true):
+
+| Tag | Value | Notes |
+|---|---|---|
+| `Name` | `fleetipsec-vpn` | Console display name |
+| `ipsec-vpn-cluster` | `fleetipsec-vpn` | Cluster label; used by ipsecscale to discover pool members |
+| `ipsec-vpn-asg` | `fleetipsec-vpn` | ASG name; used by ipsecnode for lifecycle hook calls |
+| `ipsec-rds-endpoint` | `fleetshell-ipsec-strongswan.cpgmocimewi5.eu-west-2.rds.amazonaws.com` | Retained for future use; ipsecnode does NOT query it at runtime |
+| `ipsec-valkey-endpoint` | `clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379` | Half-open IKE SA state store |
+
 ---
 
 ## Deferred: rtb-vpn default route
@@ -674,6 +865,73 @@ aws ec2 create-route \
 ```
 On subsequent failovers, `ipsecscale` replaces this route with the new
 master's ENI ID.
+
+---
+
+## Implementation Notes (lessons learned in dev)
+
+### LVS src/dest check disabled automatically by ipsecpulse
+
+The nftables SNAT rule (`oifname eth0 ip saddr {172.16.49.0/24, 172.16.50.0/24} snat
+to <secondary-ip>`) only fires on RETURN traffic (VPN node to customer). FORWARD
+traffic (customer to VPN node, post-DNAT) leaves eth0 with the original customer
+source IP. AWS drops this with src/dest check enabled.
+
+Fix applied in `ipsecpulse associate-mgmt-eip`: immediately after associating
+the management EIP, ipsecpulse calls `ModifyNetworkInterfaceAttribute` with
+`SourceDestCheck.Value=false` on eth0. Every ASG replacement instance now
+fixes itself automatically at boot. Both running LVS eth0 ENIs were also fixed
+manually during earlier testing.
+
+### StrongSwan credential management -- C plugin approach abandoned
+
+A custom C plugin (`valkeyauth`) was prototyped (source retained in
+`aerobake/fleetnode/valkeyauth/` for reference, not built into the AMI).
+The approach was abandoned because `libstrongswan-dev` no longer exists on
+any current Debian or Ubuntu release (dropped from Debian after Bullseye;
+never packaged by Canonical). No viable path existed to compile a C plugin
+without significant build fragility.
+
+The chosen approach -- ipsecnode owning all credential management via VICI
+`load-shared`/`unload-shared` commands -- is simpler, has zero C code, and
+gives better operational properties (incremental updates, non-disruptive
+reloads). See Architecture Decision #12.
+
+### Traffic selectors and management access
+
+With the catch-all connection and `local_ts = remote_ts = 0.0.0.0/0`, StrongSwan
+installs an outbound xfrm policy that captures ALL packets from the VPN node,
+including SSH reply traffic. Management SSH breaks.
+
+Mitigation in AMI: `bypass-management` passthrough connection for `172.16.0.0/16`
+prevents VPC-internal traffic (including bastion SSH) from being tunneled.
+
+In production: customer devices propose their own LAN (e.g. `10.x.x.x/24`) as
+`local_ts`, so the VPN node's outbound xfrm policy only encrypts traffic destined
+for that specific LAN. Office-network SSH (from `192.168.13.x`) is never captured.
+
+Future (Increment 5 -- VPP): when VPP owns the data plane, investigate
+suppressing xfrm policy installation. StrongSwan 5.9.8 swanctl.conf does
+not support `install_policy` (that is ipsec.conf/stroke syntax). The bypass
+connections (bypass-vpc, bypass-office) are the 5.9.8-compatible approach
+and remain in place regardless.
+
+### T1 testing -- IKEv1 + IKEv2 NAT-T on Debian 12 Bookworm (Build Order step 3)
+
+- Client: koi (`swanctl --initiate`), public IP `185.17.205.224`
+- Path: koi -> EIP `3.11.124.22` -> LVS DNAT -> VPN node `172.16.50.71`
+- IKEv1 Main Mode + NAT-T: established. Phase 1 `AES_CBC_256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048`, Phase 2 `ESP:AES_GCM_16_256/NO_EXT_SEQ`
+- IKEv2 + NAT-T: established. Same proposals. MOBIKE supported. Initial CURVE_25519 KE rejected with INVAL_KE; koi retried with MODP_2048 and succeeded (expected -- our proposals list only MODP_2048).
+- Bypass policies confirmed: no xfrm tunnel policies installed until a tunnel SA is active.
+
+### First successful IKEv1 tunnel (dev test, Ubuntu era)
+
+- Client: koi (`swanctl --initiate --child s2-ikev1-natt`), `185.17.205.224`
+- Path: koi → EIP `3.11.124.22` → LVS DNAT → VPN node `172.16.49.23`
+- IKE: Main Mode, NAT-T negotiated (switched UDP 500 → UDP 4500 mid-handshake)
+- Phase 1 proposal selected: `IKE:AES_CBC_256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_2048`
+- Phase 2 proposal selected: `ESP:AES_GCM_16_256/NO_EXT_SEQ`
+- Return path confirmed: VPN node reply arrived at koi as `3.11.124.22` (SNAT working)
 
 ---
 

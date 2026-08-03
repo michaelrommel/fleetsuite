@@ -1,0 +1,56 @@
+#
+# nftables ruleset for fleetnode IPSec VPN concentrator nodes (Debian 12 Bookworm)
+#
+# AWS security groups enforce the coarse ingress policy (only LVS SG and
+# ReturnGW SG can send IPSec/BGP traffic here).  This filter table is a
+# defence-in-depth layer that restricts what reaches the local daemons.
+#
+# FORWARD policy is accept: VPP handles the data-plane forwarding entirely
+# in userspace via its own network stack.  When VPP uses kernel drivers
+# (initial dev mode), the kernel FORWARD chain is bypassed by VPP anyway.
+flush ruleset
+
+table inet filter {
+
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+
+		# Loopback
+		iifname "lo" accept
+
+		# Established / related (replies to ipsecnode-initiated connections:
+		# EC2 API, SSM, RDS, Valkey)
+		ct state established,related accept
+		ct state invalid drop
+
+		# ICMP
+		ip protocol icmp accept
+
+		# SSH -- AWS SG restricts source to CLI_RemoteAccess SG
+		tcp dport 22 accept
+
+		# IKE -- forwarded by LVS; src is original customer IP (LVS DNAT
+		# leaves src unchanged; only dst is rewritten to this node's IP)
+		udp dport 500  accept
+		udp dport 4500 accept
+
+		# ESP (proto 50) from customers, forwarded by LVS
+		ip protocol esp accept
+
+		# BGP from Return GW eth0 subnets
+		# ReturnGW-a: 172.16.51.0/27  ReturnGW-b: 172.16.51.32/27
+		ip saddr { 172.16.51.0/27, 172.16.51.32/27 } tcp dport 179 accept
+
+		# Prometheus node exporter (port 9100) -- from VPC management ranges
+		ip saddr 172.16.0.0/16 tcp dport 9100 accept
+
+		# ipsecnode health + metrics HTTP endpoint (port 9101)
+		ip saddr 172.16.0.0/16 tcp dport 9101 accept
+
+		reject with icmp type admin-prohibited
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+	}
+}

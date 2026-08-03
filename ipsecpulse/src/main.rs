@@ -362,6 +362,9 @@ async fn run_associate_mgmt_eip(cli: &Cli) -> Result<()> {
 	associate_eip(&cli.region, &creds, &alloc_id, &eth0.eni_id, &eth0.primary_ip).await?;
 	println!("  ✓ Management EIP {alloc_id} -> {} ({})", eth0.primary_ip, eth0.eni_id);
 
+	disable_src_dest_check(&cli.region, &creds, &eth0.eni_id).await?;
+	println!("  ✓ Source/dest check disabled on {}", eth0.eni_id);
+
 	println!("✅ ipsecpulse associate-mgmt-eip complete.");
 	Ok(())
 }
@@ -520,6 +523,29 @@ async fn associate_eip(
 	match extract_scalar(&xml, "associationId") {
 		Some(_) => Ok(()),
 		None    => bail!("AssociateAddress (VPC) response missing associationId:\n{xml}"),
+	}
+}
+
+/// Disable the source/dest check on a network interface.
+/// Required on LVS eth0 so that FORWARD traffic (customer src IP post-DNAT)
+/// is not dropped by AWS before reaching the VPN concentrators.
+async fn disable_src_dest_check(
+	region: &str,
+	creds: &AwsCredentials,
+	eni_id: &str,
+) -> Result<()> {
+	let host = format!("ec2.{region}.amazonaws.com");
+	let xml = aws_query(&host, "ec2", region, creds, &[
+		("Action",              "ModifyNetworkInterfaceAttribute"),
+		("Version",             "2016-11-15"),
+		("NetworkInterfaceId",  eni_id),
+		("SourceDestCheck.Value", "false"),
+	]).await?;
+
+	match extract_scalar(&xml, "return") {
+		Some("true") => Ok(()),
+		Some(v)      => bail!("ModifyNetworkInterfaceAttribute returned unexpected value: {v}"),
+		None         => bail!("Could not parse ModifyNetworkInterfaceAttribute response:\n{xml}"),
 	}
 }
 

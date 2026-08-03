@@ -134,3 +134,14 @@ RESULT
         "VpcId": "vpc-0595e17ce290fb050"
     }
 }
+
+# Later we disabled src/dest check
+   aws ec2 modify-network-interface-attribute \
+     --network-interface-id eni-05a8f017b4376f313 \
+     --no-source-dest-check --region eu-west-2
+
+   aws ec2 modify-network-interface-attribute \
+     --network-interface-id eni-02ac47992829a606b \
+     --no-source-dest-check --region eu-west-2
+
+

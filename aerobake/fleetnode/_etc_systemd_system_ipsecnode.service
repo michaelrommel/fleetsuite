@@ -1,0 +1,18 @@
+[Unit]
+Description=IPSec VPN node lifecycle daemon
+Documentation=https://github.com/michaelrommel/fleetsuite
+After=network-online.target strongswan.service frr.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipsecnode
+Restart=on-failure
+RestartSec=10s
+# ipsecnode writes structured logs to stdout; systemd-journald captures them.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ipsecnode
+
+[Install]
+WantedBy=multi-user.target
