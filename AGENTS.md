@@ -6,6 +6,69 @@ authoritative reference for a new agent session picking up this work.
 
 ---
 
+## Next Session Starting Point  <<<  READ THIS FIRST
+
+**Last completed session (2026-08-04):** ipsecnode Increment 6a+6b + Valkey
+schema finalisation. T1 testing passed on the freshly baked AMI.
+
+### What the next session should do
+
+**Immediate next step: T2 -- xfrm data path test (no new AMI needed).**
+See Testing Framework > T2 for the full procedure. The currently running
+instance is sufficient. Add `bypass-lan` to koi's `fleet-test.conf` first
+(192.168.13.0/24 pass-mode) to prevent SSH loss during the test.
+
+After T2:
+1. **Build Order step 5** -- VPP `startup.conf` baked into the fleetnode AMI.
+2. **ipsecnode Increment 6c** -- FRR /32 route management on CHILD_SA up/down.
+   Hook point is already stubbed in `vici.rs::handle_child_updown()`.
+   Uses `fleetipsec:nat:<site_ip>` from Valkey (see Architecture Decision #12).
+3. **ipsecnode Increment 6d** -- VPP VRF + per-device SNAT/DNAT.
+4. **Build Order step 7** -- `aerobake/fleetroute/` Return GW AMI (Alpine).
+   Required before T3. Fixed eth0 IPs: 172.16.51.4 (master), 172.16.51.36 (backup).
+
+### What changed in the last session (key facts for code work)
+
+- **Valkey schema redesigned** (Architecture Decision #12):
+  - `fleetipsec:psk:<site_ip>` -- PSK (unchanged)
+  - `fleetipsec:site:<site_ip>` -- tunnel / IKE config (was `:device:`)
+  - `fleetipsec:nat:<site_ip>` -- per-device NAT mappings (was `:natmap:`)
+  - `mapped_global_ip` removed from site record (kept as `Option` for compat)
+  - `local_ts` added to site record (customer's view of our backend addresses)
+  - Each crypto field now accepts a single value OR a JSON array (OneOrMany)
+  - No catch-all swanctl connections -- every site must be in Valkey
+
+- **ipsecnode source** (`ipsecnode/src/`):
+  - `SiteRecord` (was `DeviceRecord`), `SITE_PREFIX` (was `DEVICE_PREFIX`)
+  - `proposals.rs` -- `OneOrMany<T>` type, cartesian-product proposal builder
+  - `vici.rs` -- `ViciRawValue` custom Deserializer (handles serde_vici bytes),
+    `conn_id()` returns `"site-<ip>"`, `load_conn()` takes `Vec<String>` proposals
+  - `credentials.rs` -- always loads per-site VICI connection (no needs_custom_conn)
+  - `aws.rs` -- IMDS path bug fixed (`"mac"` not `"meta-data/mac"`)
+  - `main.rs` -- 5-second timeout on src/dest check disable (was 30 s default)
+  - `_etc_systemd_system_ipsecnode.service` -- `RUST_LOG=ipsecnode=debug`
+
+- **swanctl.conf** -- catch-all `fleetipsec-ikev1` and `fleetipsec-ikev2`
+  connections REMOVED. Only `bypass-vpc` and `bypass-office` remain static.
+
+- **Current AMI** -- built 2026-08-04, contains all of the above.
+  LT default version: check with `describe-launch-template-versions`.
+
+- **Pending small fix** -- `conn_id()` rename from `device-` to `site-` is
+  in the code but the running instance still shows the old name in logs.
+  Will be correct on the next instance cycle.
+
+### Valkey seed for testing (koi, 185.17.205.224)
+```bash
+redis-cli -u rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379 \
+  SET fleetipsec:psk:185.17.205.224 testpsk123
+redis-cli -u rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379 \
+  SET fleetipsec:site:185.17.205.224 \
+  '{"customer_id":"koi-test","static_ip":true}'
+```
+
+---
+
 ## What This Project Is
 
 A scalable IPSec VPN concentrator infrastructure hosted on AWS eu-west-2, built
@@ -194,7 +257,38 @@ aws autoscaling describe-auto-scaling-groups \
 |---|---|---|
 | NAT Gateway | LVS-a subnet | Outbound internet for private subnets |
 | RDS PostgreSQL | Management + ReturnGW-b (Multi-AZ) | Originally intended for StrongSwan SQL plugin (see Implementation Notes). Now available for device registry / management plane use. ipsecnode does NOT use it at runtime. |
-| MemoryDB/Valkey | shared (existing) | PSK store (`fleetipsec:psk:<ip>`), device metadata (`fleetipsec:device:<ip>`), half-open IKE SA state, ipsecscale coordination |
+| MemoryDB/Valkey | shared (existing) | PSK store (`fleetipsec:psk:<ip>`), tunnel config (`fleetipsec:site:<ip>`), NAT mappings (`fleetipsec:nat:<ip>`), half-open IKE SA state, ipsecscale coordination |
+
+### BGP ASN and Peer IP Assignments
+
+Fixed for the entire fleet. Baked into every VPN concentrator AMI and every
+Return GW AMI from Build Order step 4 onward.
+
+| Role | ASN | Notes |
+|---|---|---|
+| VPN concentrators | **AS 65001** | All nodes share one ASN; eBGP toward Return GW |
+| Return GW pair | **AS 65002** | Both nodes share one ASN |
+
+Return GW **fixed eth0 private IPs** (chosen in Build Order step 4;
+baked into fleetroute AMI in step 7):
+
+| Node | Fixed eth0 IP | Subnet | Notes |
+|---|---|---|---|
+| ReturnGW-master | **172.16.51.4** | ReturnGW-a (172.16.51.0/27) | First usable after AWS-reserved .0-.3 |
+| ReturnGW-backup | **172.16.51.36** | ReturnGW-b (172.16.51.32/27) | First usable after AWS-reserved .32-.35 |
+
+VPN concentrators (172.16.49.0/24 and 172.16.50.0/24) peer with both
+Return GW nodes simultaneously. Each VPN node has dynamic DHCP IPs;
+the Return GW uses `bgp listen range` to accept sessions from both
+VPN subnets without pre-configuring individual peer IPs.
+
+Route advertisement flow:
+- Each VPN node adds `ip route add <mapped_global_ip>/32 blackhole` via
+  ipsecnode (Increment 6c) on CHILD_SA up, and removes it on CHILD_SA down.
+- FRR redistributes static routes filtered by prefix-list
+  `CUSTOMER-HOST-ROUTES` (permit /32 only) via `EXPORT-CUSTOMER` route-map.
+- Return GW advertises nothing back to VPN nodes (REJECT-ALL inbound
+  route-map on VPN node BGP neighbors). VPN node forwarding is VPP-only.
 
 ---
 
@@ -390,8 +484,8 @@ no secrets file on disk, no `swanctl` subprocess calls.
    issues one VICI `load-shared` command per device, registering the PSK
    under the correct identity set (see Decision #13).
 3. It loads CA certificates from a configured path via VICI `load-cert`.
-4. It subscribes to Valkey keyspace notifications on `fleetipsec:psk:*` and
-   `fleetipsec:device:*`.
+4. It subscribes to Valkey keyspace notifications on `fleetipsec:psk:*`,
+   `fleetipsec:site:*`, and `fleetipsec:nat:*`.
 
 **Runtime credential updates (non-disruptive):**
 - New device registered in Valkey: pubsub event fires, ipsecnode issues a
@@ -402,23 +496,81 @@ no secrets file on disk, no `swanctl` subprocess calls.
 
 **Valkey key schema:**
 ```
-fleetipsec:psk:<device_public_ip>
+fleetipsec:psk:<tunnel_gw_ip>
     PSK string (plain text)
 
-fleetipsec:device:<device_public_ip>
-    JSON: {
-        "mapped_global_ip": "...",
-        "customer_id":      "...",
-        "ike_identity":     "..."    <- optional; see Decision #13
+fleetipsec:site:<tunnel_gw_ip>
+    JSON -- tunnel configuration and IKE crypto parameters.
+    Every device in Valkey gets an explicit per-device VICI load-conn;
+    there is no catch-all fallback.
+    All fields except customer_id are optional with strong defaults.
+    {
+        "customer_id":  "acme-corp",
+        "ike_identity": "10.5.0.1",     // optional; see Decision #13
+        "static_ip":    true,
+        "ike_version":  2,
+
+        // Each crypto field accepts a single value OR a JSON array.
+        // ipsecnode computes the cartesian product to build the proposal list.
+        // Absent = single strong default (aes256-sha256-modp2048 / aes256gcm16).
+        "ike_enc":  ["aes256", "aes128"],  // or "aes256"
+        "ike_auth": "sha256",
+        "ike_dh":   [14, 19],
+        "esp_enc":  ["aes256gcm", "aes256"],
+        "esp_auth": ["none", "sha256"],
+        "esp_pfs":  14,
+
+        // Traffic selectors
+        "remote_ts": ["10.67.0.0/16", "141.67.0.0/16"],  // customer device side
+        "local_ts":  ["10.67.250.0/24"]  // optional; only for customers that
+                                          // assign their own addresses to our
+                                          // backend servers.  Absent = 0.0.0.0/0
     }
+
+fleetipsec:nat:<tunnel_gw_ip>
+    JSON -- per-device NAT mappings for this tunnel.
+    Loaded by ipsecnode on CHILD_SA UP (Increments 6c + 6d).
+    {
+        "device_nat": [
+            {"internal_ip": "10.67.1.5",   "global_ip": "198.51.100.5"},
+            {"internal_ip": "10.67.1.6",   "global_ip": "198.51.100.6"}
+        ],
+        "backend_nat": [
+            {"customer_view_ip": "10.67.250.250", "real_ip": "194.138.39.18"},
+            {"customer_view_ip": "10.67.250.251", "real_ip": "194.138.39.19"}
+        ]
+    }
+    backend_nat is absent for customers that use real backend addresses directly.
 ```
+
+NAT data flow (with VPP, Increment 6d):
+```
+Forward  src=10.67.1.5, dst=10.67.250.250
+  SNAT: 10.67.1.5     -> 198.51.100.5  (medical device global identity)
+  DNAT: 10.67.250.250 -> 194.138.39.18 (customer backend view -> real IP)
+  -> backend sees: src=198.51.100.5, dst=194.138.39.18
+
+Return   src=194.138.39.18, dst=198.51.100.5
+  Return GW routes 198.51.100.5/32 to this concentrator (FRR, Increment 6c)
+  DNAT: 198.51.100.5  -> 10.67.1.5     (back to medical device)
+  SNAT: 194.138.39.18 -> 10.67.250.250 (restore customer backend view)
+  -> into tunnel: src=10.67.250.250, dst=10.67.1.5
+```
+
+FRR advertises one /32 per `global_ip` entry in `device_nat`, not one per tunnel.
+
+Field values for crypto:
+- `ike_enc` / `esp_enc`: `"aes128"`, `"aes192"`, `"aes256"`, `"aes128gcm"`, `"aes192gcm"`, `"aes256gcm"`
+- `ike_auth` / `esp_auth`: `"sha256"`, `"sha384"`, `"sha512"`, `"none"`
+- `ike_dh` / `esp_pfs`: DH group number `1,2,5,14,15,16,19,20,21,24` (or `0`/absent = no PFS for `esp_pfs`)
+- GCM encryption implies `esp_auth="none"` (authentication is built in)
 
 **VICI `load-shared` payload per device:**
 ```
-id:     unique string, e.g. "psk-<device_public_ip>"
+id:     unique string, e.g. "psk-<site_public_ip>"
 type:   "IKE"
 data:   <PSK bytes>
-owners: [ <device_public_ip> ]               always present
+owners: [ <site_public_ip> ]               always present
         + [ <ike_identity> ]                 if device record has ike_identity field
 ```
 
@@ -432,7 +584,7 @@ If a client identifies itself with something other than its public IP (internal
 IP, FQDN), the lookup fails unless the PSK is also registered under that
 identity.
 
-Solution: an optional `ike_identity` field in `fleetipsec:device:<public_ip>`.
+Solution: an optional `ike_identity` field in `fleetipsec:site:<public_ip>`.
 When present, ipsecnode registers the PSK under both the public IP AND the
 stated IKE identity (two entries in the VICI `owners` list). The device
 registration process must capture the IKE identity for any aggressive-mode
@@ -562,9 +714,9 @@ file, no `swanctl` subprocess calls for credential management.
 - Bulk-load all PSKs from Valkey via VICI `load-shared` at startup
 - Load CA certificates via VICI `load-cert` from `/etc/ipsecnode/ca/`
 - Subscribe to Valkey keyspace notifications (`fleetipsec:psk:*`,
-  `fleetipsec:device:*`); issue incremental `load-shared` / `unload-shared`
+  `fleetipsec:site:*`); issue incremental `load-shared` / `unload-shared`
   VICI commands on change -- non-disruptive to existing tunnels
-- On `child-updown` UP: look up `fleetipsec:device:<peer_ip>` in Valkey;
+- On `child-updown` UP: look up `fleetipsec:site:<peer_ip>` in Valkey;
   tell VPP to create VRF + install 1:1 NAT; tell FRR to advertise /32 route
 - On `child-updown` DOWN: tear down VRF/NAT in VPP; withdraw /32 from FRR
 - Disable src/dest check on eth0 at startup (EC2 API via aerocore)
@@ -719,16 +871,22 @@ net.core.wmem_max                = 134217728
    (192.168.13.0/24) pass-mode connections. ami-0d3c80537d8b691f0 (LT v7) had
    the broken config baked in; replaced by LT v8 (`ami-02dd075664df52991`).
    T1 testing complete on Bookworm (see Implementation Notes).
-4. **`aerobake/fleetnode/` -- FRR BGP** -- base BGP config in AMI.
-5. **`aerobake/fleetnode/` -- VPP** -- startup.conf in AMI.
-6. **`ipsecnode`** -- implement in Rust. Increments 6a+6b are coupled and
-   should be done together (both require the VICI connection):
-   - 6a+6b: VICI connection + `child-updown` event loop + bulk PSK load at
-     startup via `load-shared` + Valkey pubsub listener for incremental
-     credential updates + CA cert loading via `load-cert` +
-     src/dest check disable + health endpoint
-   - 6c: FRR route management (/32 advertise/withdraw on tunnel up/down)
-   - 6d: VPP VRF + NAT entry management
+4. **`aerobake/fleetnode/` -- FRR BGP** -- COMPLETE. BGP base config baked into
+   AMI. ASN 65001 (VPN nodes) peering with ASN 65002 (Return GW) at fixed IPs
+   172.16.51.4 and 172.16.51.36. EXPORT-CUSTOMER route-map enforces /32-only
+   export. FRR still DISABLED in AMI -- enable at T3 (after Return GW built).
+   Rebuild AMI, run `update_lt_vpn_ami.sh`, then `cycle_vpn_instance.sh`.
+5. **`aerobake/fleetnode/` -- VPP** -- startup.conf in AMI.  **TODO NEXT.**
+6. **`ipsecnode` Increment 6a+6b** -- COMPLETE (2026-08-04). VICI connection,
+   `child-updown` event loop, bulk PSK + per-site `load-conn` from Valkey,
+   Valkey keyspace pubsub, CA cert loading, src/dest check disable, health :9101.
+   Catch-all swanctl connections removed -- every site must have a Valkey record.
+   `OneOrMany<T>` proposal profiles, cartesian-product builder in `proposals.rs`.
+   `local_ts` + `remote_ts` both configurable per site. `mapped_global_ip`
+   removed from `SiteRecord` (kept as `Option` for backward compat).
+   T1 tested and passing on freshly baked AMI.
+   - 6c: FRR /32 route management (stub in `vici.rs::handle_child_updown`)
+   - 6d: VPP VRF + per-device SNAT/DNAT
    - 6e: ASG lifecycle hook heartbeat
    - 6f: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
@@ -868,6 +1026,150 @@ master's ENI ID.
 
 ---
 
+## Testing Framework
+
+Four incremental test stages. Each builds on the previous.
+
+### T1 -- IKE SA establishment (NAT-T, no data plane)
+
+**What is active:** StrongSwan + ipsecnode (Increment 6a+6b). FRR disabled. VPP masked.
+
+**What this proves:**
+- ipsecnode starts, connects to VICI, loads PSKs from Valkey via `load-shared`
+- IKEv1 Main Mode + NAT-T negotiates end-to-end through the LVS
+- IKEv2 + NAT-T negotiates; MOBIKE supported
+- `child-updown` events appear in ipsecnode logs
+- No xfrm tunnel policies installed until a CHILD_SA is active (bypass policies protect VPC/office)
+
+**Risk to management access:** zero.
+
+**Procedure:**
+1. Seed Valkey with koi's test PSK:
+   ```bash
+   # On any host with TLS-capable redis-cli and MemoryDB access:
+   redis-cli -u rediss://<memorydb-endpoint>:6379 \
+     SET fleetipsec:psk:185.17.205.224 testpsk123
+   redis-cli -u rediss://<memorydb-endpoint>:6379 \
+     SET fleetipsec:site:185.17.205.224 \
+     '{"mapped_global_ip":"203.0.113.1","customer_id":"koi-test"}'
+   ```
+2. Build and deploy the new AMI (includes ipsecnode 6a+6b + FRR config).
+3. From koi: `swanctl --initiate --child fleetipsec-ikev2` (IKEv2) or `--child fleetipsec-ikev1` (IKEv1).
+4. Verify on VPN node: `swanctl --list-sas` shows the CHILD_SA; `journalctl -u ipsecnode` shows `CHILD_SA UP`.
+
+**Status:** COMPLETE (2026-08-04). IKEv2 + NAT-T established end-to-end through LVS.
+ipsecnode loaded PSK from Valkey via VICI `load-shared`, received `child-updown` events
+with correct peer_ip/peer_id/conn_name/child_id/ike_sa fields.
+
+VICI `child-updown` event structure (StrongSwan 5.9.8, confirmed by trace log):
+```
+{
+  "<ike_sa_name>": {           // e.g. "fleetipsec-ikev2" -- IKE SA name is the key
+    "remote-host": "<peer_ip>",
+    "remote-id":   "<peer_id>",
+    "uniqueid":    "<ike_sa_id>",
+    "state":       "ESTABLISHED",
+    "child-sas": {
+      "<child_sa_name>": {      // e.g. "fleetipsec-ikev2-9"
+        "name":     "<conn_name>",
+        "uniqueid": "<child_id>",
+        "state":    "INSTALLED" | "DELETED",
+        "remote-ts": [...],
+        "local-ts":  [...]
+      }
+    }
+  },
+  "up": "yes"                  // present on UP; absent on DOWN
+}
+```
+
+Known issues fixed during T1:
+- IMDS path double-prefix bug (`meta-data/mac` → `mac`)
+- VICI `load-conn` field names: underscores, `remote_addrs` must be `Vec<String>`
+- VICI `child-updown` event: serde_vici emits bytes not strings; `ViciRawValue`
+  custom Deserialize handles `visit_bytes` for all VICI octet-strings
+- LVS SG missing ingress rule for VPN node management traffic (all from sg-vpn)
+- MemoryDB SG missing TCP 6379 inbound rule from VPN subnets
+- rtb-vpn default route verified correct; MemoryDB `CONFIG SET` not supported
+  (non-fatal; keyspace events configured via parameter group)
+- IMDS timeout capped at 5 s (was 30 s default, blocking startup)
+
+Add `bypass-lan` to koi's `fleet-test.conf` before re-testing to prevent SSH loss:
+```
+bypass-lan {
+    children { bypass-lan {
+        local_ts = 192.168.13.0/24; remote_ts = 192.168.13.0/24
+        mode = pass; start_action = trap
+    }}
+}
+```
+
+### T2 -- Data path through kernel xfrm (narrow selectors)
+
+**What is active:** StrongSwan only. ipsecnode logs events.
+No new AMI needed -- testable on the current running instance.
+
+**What this proves:** kernel xfrm encapsulates/decapsulates ESP correctly
+end-to-end through the LVS DNAT path.
+
+**Risk to management access:** zero -- the narrow selectors (RFC 5737 test-net
+subnets, 192.0.2.0/30 and 198.51.100.0/30) never match VPC or office traffic.
+
+**Procedure (on the running VPN node, no AMI rebuild required):**
+1. SSH into the VPN node.
+2. Add a dummy interface for the ping target:
+   ```bash
+   sudo ip link add dummy0 type dummy
+   sudo ip addr add 192.0.2.1/30 dev dummy0
+   sudo ip link set dummy0 up
+   ```
+3. No `test-narrow.conf` needed on the VPN node -- the catch-all connection
+   (`0.0.0.0/0 <-> 0.0.0.0/0`) accepts and narrows any proposal.
+4. On koi: upload a `test-narrow.conf` to `/etc/swanctl/conf.d/`:
+   ```
+   connections {
+     test-narrow {
+       version      = 2
+       local_addrs  = %any
+       remote_addrs = 3.11.124.22
+       proposals    = aes256-sha256-modp2048
+       local  { auth = psk }
+       remote { auth = psk; id = %any }
+       children {
+         test-narrow {
+           local_ts      = 198.51.100.0/30
+           remote_ts     = 192.0.2.0/30
+           esp_proposals = aes256gcm16
+           start_action  = none
+         }
+       }
+     }
+   }
+   secrets { ike-koi { id = %any; secret = testpsk123 } }
+   ```
+5. `swanctl --load-all && swanctl --initiate --child test-narrow`
+6. `ping -I 198.51.100.1 192.0.2.1` from koi.
+7. Verify on VPN node: `ip -s xfrm state show` shows increasing packet counters.
+
+### T3 -- FRR /32 route advertisement
+
+**Pre-requisites:** Return GW AMI built and running (Build Order step 7).
+ipsecnode Increment 6c implemented.
+
+**What this proves:** FRR BGP sessions come up between VPN nodes (AS 65001)
+and Return GW (AS 65002); `/32` host routes for customer `mapped_global_ip`
+appear in Return GW's BGP table on CHILD_SA UP.
+
+### T4 -- VPP data plane
+
+**Pre-requisites:** VPP startup.conf in AMI (Build Order step 5).
+ipsecnode Increment 6d implemented.
+
+**What this proves:** VPP handles inner-traffic forwarding with per-customer
+VRF isolation and 1:1 NAT.
+
+---
+
 ## Implementation Notes (lessons learned in dev)
 
 ### LVS src/dest check disabled automatically by ipsecpulse
@@ -949,6 +1251,11 @@ replaces the route's ENI target. No floating IP needed. The `ipsec-gw-vip` tag
 is replaced by `ipsec-gw-rtb` (the route table ID to update). This is
 consistent with how rtb-vpn is managed.
 
+**Fixed eth0 IPs:** 172.16.51.4 (master) and 172.16.51.36 (backup) -- chosen
+in Build Order step 4 and hardcoded into the VPN concentrator FRR config.
+The fleetroute AMI (step 7) must assign these as static private IPs on eth0
+(specified in the Launch Template or cloud-init). See BGP ASN section above.
+
 ### Return GW boot script
 
 The `aerobake/fleetroute` AMI needs to render `keepalived.conf` at boot from
@@ -965,9 +1272,22 @@ See the design notes in the original `ipsecscale` section. Key points:
 - Scale-out rehashing: adding one backend reshuffles ~1/(N+1) of source IPs on
   next tunnel re-establishment; mitigate with cooldown periods
 
-### ipsecnode -- not yet implemented
+### ipsecnode -- Increment 6a+6b complete (T1 passing)
 
-See the design notes in the original `ipsecnode` section.
+Core functionality working. See "Next Session Starting Point" at the top
+of this file for what to implement next (T2, step 5 VPP, Increment 6c/6d).
+
+Key source files:
+- `ipsecnode/src/main.rs` -- startup sequence, task orchestration
+- `ipsecnode/src/vici.rs` -- VICI commands, `ViciRawValue`, event parsing
+- `ipsecnode/src/credentials.rs` -- `SiteRecord`, PSK + conn bulk load, pubsub
+- `ipsecnode/src/proposals.rs` -- `OneOrMany<T>`, cartesian-product builders
+- `ipsecnode/src/health.rs` -- HTTP :9101
+- `ipsecnode/src/aws.rs` -- src/dest check disable via EC2 API
+
+Hook points for 6c and 6d are stubbed in `vici.rs::handle_child_updown()`.
+The `peer_ip` (= customer gateway public IP) is already extracted there;
+use it to GET `fleetipsec:nat:<peer_ip>` for the device NAT mappings.
 
 ---
 
