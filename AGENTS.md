@@ -8,26 +8,44 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-04):** ipsecnode Increment 6a+6b + Valkey
-schema finalisation. T1 testing passed on the freshly baked AMI.
+**Last completed session (2026-08-04):** T2 -- xfrm data path test passing.
 
 ### What the next session should do
 
-**Immediate next step: T2 -- xfrm data path test (no new AMI needed).**
-See Testing Framework > T2 for the full procedure. The currently running
-instance is sufficient. Add `bypass-lan` to koi's `fleet-test.conf` first
-(192.168.13.0/24 pass-mode) to prevent SSH loss during the test.
+**Immediate next step: Build Order step 5** -- VPP `startup.conf` baked into
+the fleetnode AMI. A new AMI rebuild is required (see below for what changed).
 
-After T2:
-1. **Build Order step 5** -- VPP `startup.conf` baked into the fleetnode AMI.
-2. **ipsecnode Increment 6c** -- FRR /32 route management on CHILD_SA up/down.
-   Hook point is already stubbed in `vici.rs::handle_child_updown()`.
-   Uses `fleetipsec:nat:<site_ip>` from Valkey (see Architecture Decision #12).
-3. **ipsecnode Increment 6d** -- VPP VRF + per-device SNAT/DNAT.
-4. **Build Order step 7** -- `aerobake/fleetroute/` Return GW AMI (Alpine).
-   Required before T3. Fixed eth0 IPs: 172.16.51.4 (master), 172.16.51.36 (backup).
+After step 5:
+1. **ipsecnode Increment 6c** -- FRR /32 route management on CHILD_SA up/down.
+2. **ipsecnode Increment 6d** -- VPP VRF + per-device SNAT/DNAT.
+3. **Build Order step 7** -- `aerobake/fleetroute/` Return GW AMI (Alpine).
 
 ### What changed in the last session (key facts for code work)
+
+- **T2 passed** (2026-08-04). Full xfrm data path: seagull (192.168.13.133)
+  -> koi (IPsec gateway, NAT-T encapsulation) -> office NAT -> LVS DNAT ->
+  VPN node (decapsulation) -> dummy0 (194.138.39.18). 0% packet loss, ~27ms RTT.
+
+- **bypass-office removed** from `aerobake/fleetnode/_etc_swanctl_conf.d_fleetipsec.conf`.
+  Management SSH to VPN nodes always arrives via the bastion (172.16.x.x),
+  never from the office LAN directly. bypass-vpc (172.16.0.0/16) is sufficient.
+  The running instance still has the old bypass-office xfrm shunt policies in
+  kernel state; they are removed on the next AMI rebuild + instance cycle.
+
+- **Customer gateway must have `send_redirects=0`** on its LAN interface.
+  When a gateway (koi) forwards customer device traffic into the xfrm tunnel,
+  Linux sends ICMP redirects to the device unless `send_redirects` is disabled
+  on the LAN interface. In the test: `sysctl -w net.ipv4.conf.all.send_redirects=0`
+  and per-interface. In production this must be set on every customer CPE.
+  Note: `net.ipv4.conf.all.send_redirects=0` alone is NOT sufficient -- Linux
+  uses OR(all, interface) semantics, so the interface-specific value must also
+  be set to 0.
+
+- **AMI rebuild needed** before next T3/production testing:
+  - bypass-office removed from fleetipsec.conf
+  - VPP startup.conf (Build Order step 5)
+  Run `aerobake/fleetnode/build.sh` (or equivalent Packer command), then
+  `update_lt_vpn_ami.sh` and `cycle_vpn_instance.sh`.
 
 - **Valkey schema redesigned** (Architecture Decision #12):
   - `fleetipsec:psk:<site_ip>` -- PSK (unchanged)
@@ -1151,6 +1169,22 @@ subnets, 192.0.2.0/30 and 198.51.100.0/30) never match VPC or office traffic.
 6. `ping -I 198.51.100.1 192.0.2.1` from koi.
 7. Verify on VPN node: `ip -s xfrm state show` shows increasing packet counters.
 
+**Status:** COMPLETE (2026-08-04). Full xfrm data path verified end-to-end.
+seagull (192.168.13.133) pinged dummy0 (194.138.39.18) on the VPN node via
+the IPsec tunnel. 0% packet loss, ~27ms RTT.
+
+Lessons learned during T2:
+- `send_redirects` must be disabled on the customer gateway (koi) LAN interface.
+  `net.ipv4.conf.all.send_redirects=0` alone is NOT sufficient -- Linux uses
+  OR(all, interface) semantics. Must also set the per-interface value to 0.
+- `bypass-office` in fleetipsec.conf interferes with the tunnel reply path when
+  test devices are in the office LAN range (192.168.13.x). Removed permanently
+  -- management SSH arrives via bastion (172.16.x.x), covered by bypass-vpc.
+- StrongSwan `dir out` xfrm policy applies to both locally-generated AND
+  forwarded packets (Linux checks XFRM_POLICY_OUT in the output phase of the
+  forward path). No separate `dir fwd` policy is needed for the customer
+  gateway to encapsulate forwarded device traffic.
+
 ### T3 -- FRR /32 route advertisement
 
 **Pre-requisites:** Return GW AMI built and running (Build Order step 7).
@@ -1217,6 +1251,32 @@ suppressing xfrm policy installation. StrongSwan 5.9.8 swanctl.conf does
 not support `install_policy` (that is ipsec.conf/stroke syntax). The bypass
 connections (bypass-vpc, bypass-office) are the 5.9.8-compatible approach
 and remain in place regardless.
+
+### StrongSwan ESP PFS and the initial CHILD_SA
+
+ipsecnode correctly loads `esp_proposals=["aes256gcm16-modp2048"]` into charon
+via VICI `load-conn` (confirmed by debug log). However, the initial CHILD_SA
+(created inside IKE_AUTH) always negotiates without PFS -- this is correct
+IKEv2 behaviour, not a bug.
+
+In IKEv2, PFS for a CHILD_SA requires an explicit Diffie-Hellman exchange: a
+`KE` payload inside IKE_AUTH (initial SA) or CREATE_CHILD_SA (rekeying).
+When the initiator's ESP proposal list contains BOTH PFS and non-PFS variants,
+StrongSwan does not include `KE` in IKE_AUTH. The responder cannot select a
+DH-requiring proposal without `KE` present, so it selects the first non-PFS
+match -- resulting in `AES_GCM_16_256/NO_EXT_SEQ` for the initial CHILD_SA.
+
+PFS IS applied on rekeying: the CREATE_CHILD_SA exchange includes `KE` with
+`modp2048`, and the rekeyed CHILD_SA uses PFS from that point forward. The
+`esp_pfs=14` Valkey field is therefore meaningful and enforced -- just not
+visible in the initial SA.
+
+To force PFS on the initial CHILD_SA the initiator must send ONLY DH-bearing
+proposals and include `KE` in IKE_AUTH. For our use case (responder role)
+this is not needed.
+
+IKE phase is unaffected: IKE DH is mandatory and was enforced correctly
+(`aes256-sha256-modp2048` accepted, others rejected).
 
 ### T1 testing -- IKEv1 + IKEv2 NAT-T on Debian 12 Bookworm (Build Order step 3)
 
