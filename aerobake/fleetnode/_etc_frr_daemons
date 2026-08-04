@@ -3,11 +3,12 @@
 # Only bgpd is enabled.  zebra is always started by the frr init script
 # when any routing daemon is active; it does not need to be listed here.
 #
-# Full BGP neighbour configuration is added in Build Order step 4.
-# This file just ensures bgpd starts when the frr service is enabled.
+# BGP neighbour config (AS 65001 -> AS 65002) is in /etc/frr/frr.conf
+# (Build Order step 4 complete).
 #
 # FRR service is installed but DISABLED in the AMI (systemctl disable frr).
-# Enable it manually when ready for T3 testing (ipsecnode BGP integration).
+# Enable it manually when Return GW (Build Order step 7) is ready for
+# T3 testing (ipsecnode BGP integration, Increment 6c).
 
 bgpd=yes
 ospfd=no

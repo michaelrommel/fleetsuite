@@ -20,6 +20,11 @@ aws ec2 authorize-security-group-ingress --group-id sg-0406887cfe67d8f15 \
 # SSH from office (CLI_RemoteAccess)
 aws ec2 authorize-security-group-ingress --group-id sg-0406887cfe67d8f15 \
   --ip-permissions '[{"IpProtocol":"tcp","FromPort":22,"ToPort":22,"UserIdGroupPairs":[{"GroupId":"sg-011b3ebfcfbcca22d"}]}]'
+# All traffic from VPN concentrators (forwarded management: apt, Valkey, EC2 API).
+# VPN nodes use the LVS as their default gateway for outbound traffic;
+# the LVS SG must allow this forwarded traffic to arrive on eth0.
+aws ec2 authorize-security-group-ingress --group-id sg-0406887cfe67d8f15 \
+  --ip-permissions '[{"IpProtocol":"-1","UserIdGroupPairs":[{"GroupId":"sg-04dcc0342150eb53b"}]}]'
 
 # === FleetShell-IPSec-sg-vpn ===
 # Proto 50 + UDP 500/4500 from LVS only
@@ -56,10 +61,15 @@ aws ec2 authorize-security-group-ingress --group-id sg-053524ea7dcdb64f1 \
   --ip-permissions '[{"IpProtocol":"tcp","FromPort":22,"ToPort":22,"UserIdGroupPairs":[{"GroupId":"sg-011b3ebfcfbcca22d"}]}]'
 
 # === Grant VPN concentrators access to existing MemoryDB ===
-# Add sg-vpn to the MemoryDB cluster — allows TCP 6379 from VPN nodes
+# Step 1: associate the VPN SG with the MemoryDB cluster.
 aws memorydb update-cluster \
   --cluster-name dev-valkey-aeroftp \
   --security-group-ids sg-06d737ea5595c275d sg-0709bc00b444b3a9a sg-04e471905c7422a96 sg-065f9193da9f46436 sg-04dcc0342150eb53b
+# Step 2: add a TCP 6379 inbound rule to that SG from the VPN subnets.
+# Associating the SG is not enough -- the inbound rule controls actual port access.
+aws ec2 authorize-security-group-ingress --group-id sg-04dcc0342150eb53b \
+  --ip-permissions '[{"IpProtocol":"tcp","FromPort":6379,"ToPort":6379,"IpRanges":[{"CidrIp":"172.16.49.0/24","Description":"VPN-a to Valkey"},{"CidrIp":"172.16.50.0/24","Description":"VPN-b to Valkey"}]}]' \
+  --region eu-west-2
 
 RESULT
 

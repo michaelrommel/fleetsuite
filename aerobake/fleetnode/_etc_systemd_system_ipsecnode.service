@@ -5,6 +5,7 @@ After=network-online.target strongswan.service frr.service
 Wants=network-online.target
 
 [Service]
+Environment="RUST_LOG=ipsecnode=debug"
 Type=simple
 ExecStart=/usr/local/bin/ipsecnode
 Restart=on-failure

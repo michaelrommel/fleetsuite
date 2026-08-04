@@ -2,9 +2,10 @@
 # fleetnode.pkr.hcl -- Packer build for the IPSec VPN concentrator AMI
 #                      (Debian 12 Bookworm, amd64)
 #
-# Increment 3: Debian 12 base + StrongSwan + FRR (disabled) + VPP (masked).
-# FRR BGP base config (Build Order step 4), VPP startup.conf (step 5),
-# and full ipsecnode (step 6) are added in subsequent build increments.
+# Increment 4+6ab: Debian 12 base + StrongSwan + FRR BGP base config (disabled)
+#             + ipsecnode Increment 6a+6b + VPP (masked).
+# VPP startup.conf (Build Order step 5) and ipsecnode Increments 6c-6f
+# are added in subsequent build increments.
 #
 # Prerequisites -- build the ipsecnode binary before running:
 #   cargo build --release --target x86_64-unknown-linux-musl -p ipsecnode
@@ -99,7 +100,7 @@ build {
   provisioner "shell" {
     inline = [
       "sudo apt-get update",
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https nftables prometheus-node-exporter jq iproute2 tcpdump nload conntrack logrotate",
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https nftables prometheus-node-exporter jq iproute2 tcpdump nload conntrack logrotate netcat-traditional valkey-tools",
       "sudo systemctl enable nftables",
       "sudo systemctl enable prometheus-node-exporter",
     ]
@@ -157,8 +158,8 @@ build {
   }
 
   # -- 5. FRR from deb.frrouting.org ------------------------------------------
-  # bgpd enabled in daemons file.  Service is DISABLED -- enable manually
-  # when ready for T3 testing (ipsecnode BGP integration, Build Order step 4).
+  # bgpd enabled.  Full BGP config (AS 65001 -> AS 65002) in frr.conf.
+  # Service is DISABLED -- enable when Return GW is ready (Build Order step 7).
   provisioner "file" {
     source      = "./_etc_frr_daemons"
     destination = "/tmp/_etc_frr_daemons"
