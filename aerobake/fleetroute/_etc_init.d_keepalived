@@ -49,14 +49,16 @@ fetch_imds_tag() {
 # -- Lifecycle hooks -----------------------------------------------------------
 
 start_pre() {
-	local TOKEN ROLE PEER_MGMT_IP
+	local TOKEN ROLE PEER_MGMT_IP PEER_BGP_IP REMOTE_VPN
 
-	# -- 1. IMDS: role and peer management IP ---------------------------------
+	# -- 1. IMDS: role and peer management IP, IPIP tunnel parameters ----------
 	fetch_imds_token TOKEN       || return 1
 	fetch_imds_tag "$TOKEN" "ipsec-gw-role"         ROLE         || return 1
 	fetch_imds_tag "$TOKEN" "ipsec-gw-peer-mgmt-ip" PEER_MGMT_IP || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-gw-peer-bgp-ip"  PEER_BGP_IP  || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-gw-remote-vpn"   REMOTE_VPN   || return 1
 
-	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP"
+	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP  Peer BGP IP: $PEER_BGP_IP  Remote VPN: $REMOTE_VPN"
 
 	# -- 2. Attach management ENI (eth1, device index 1) ----------------------
 	# Uses --takeover, which handles all cases:
@@ -111,8 +113,8 @@ start_pre() {
 	# and be dropped by AWS SourceDestCheck (source does not match eth0's IP).
 	# This makes SSH to eth1 robust regardless of whether fleetpulse has run.
 	ip rule  add from "${ETH1_IP}/32" lookup 201 prio 101
-	ip route add table 201 default via "$ETH1_GW" dev eth1
-	einfo "Policy routing 201: from ${ETH1_IP}/32 via $ETH1_GW dev eth1"
+	ip route add table 201 default via "$ETH1_GW" dev eth1 onlink
+	einfo "Policy routing 201: from ${ETH1_IP}/32 via $ETH1_GW dev eth1 onlink"
 
 	# Add explicit route to peer's management /28 via eth1 gateway.
 	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
@@ -191,7 +193,69 @@ start_pre() {
 	ip route add table 202 default via "$ETH2_GW" dev eth2 onlink
 	einfo "Policy routing 202: from ${BGP_IP}/32 via $ETH2_GW dev eth2 onlink"
 
-	# -- 6. Give CT entry and peer time to stabilise --------------------------
+	# -- 6. Claim the VPN-subnet ENI (eth3, device index 3) ------------------
+	# Pre-created ENI in the local AZ's VPN concentrator subnet.
+	# Provides L2 same-subnet access to VPN concentrators in this AZ.
+	# Cross-AZ concentrators are reached via the IPIP tunnel (below).
+	# Uses --takeover: handles available (first boot) and in-use (restart).
+	ebegin "Claiming VPN-subnet ENI (ipsec-gw-vpn=$ROLE)"
+	aeroplug eni \
+		--tag           "ipsec-gw-vpn=$ROLE" \
+		--takeover \
+		--device-index  3 \
+		--write-ip-file /run/vpn-ip \
+		--region        "${REGION}"
+	eend $? || return 1
+
+	local VPN_IP
+	VPN_IP=$(cat /run/vpn-ip 2>/dev/null)
+	if [ -z "$VPN_IP" ]; then
+		eerror "aeroplug did not write VPN ENI IP to /run/vpn-ip"
+		return 1
+	fi
+
+	# -- 7. Wait for eth3, bring it up with full subnet prefix ----------------
+	# Use the real /24 prefix (not /32) so the kernel automatically adds the
+	# local VPN subnet connected route used by FRR for next-hop resolution.
+	einfo "Waiting for eth3 to appear..."
+	local waited=0
+	while [ ! -d /sys/class/net/eth3 ]; do
+		sleep 1
+		waited=$((waited + 1))
+		if [ "$waited" -ge 60 ]; then
+			eerror "eth3 did not appear after 60 s"
+			return 1
+		fi
+	done
+
+	ip link set eth3 up
+
+	local ETH3_MAC ETH3_CIDR ETH3_PREFIX
+	ETH3_MAC=$(cat /sys/class/net/eth3/address)
+	ETH3_CIDR=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+		"http://169.254.169.254/latest/meta-data/network/interfaces/macs/$ETH3_MAC/subnet-ipv4-cidr-block")
+	if [ -z "$ETH3_CIDR" ]; then
+		eerror "Failed to read eth3 subnet CIDR from IMDS"
+		return 1
+	fi
+	ETH3_PREFIX="${ETH3_CIDR##*/}"
+
+	ip addr add "${VPN_IP}/${ETH3_PREFIX}" dev eth3
+	einfo "eth3 up: ${VPN_IP}/${ETH3_PREFIX} (local VPN subnet connected route auto-added)"
+
+	# -- 8. Create IPIP tunnel for cross-AZ VPN concentrators ----------------
+	# Packets destined for VPN concentrators in the REMOTE AZ are encapsulated
+	# in IPIP (outer dst = peer Return GW's BGP ENI IP, a real VPC IP).
+	# The peer decapsulates and forwards via its own eth3 (L2 in its AZ).
+	# Tunnel endpoints use the BGP ENI IPs (stable fixed IPs, already in
+	# rtb-private, not the heartbeat interface eth1).
+	# Outer packets use table-202 policy routing (from BGP_IP → via eth2 onlink).
+	ip tunnel add ipip-gw mode ipip local "${BGP_IP}" remote "${PEER_BGP_IP}" dev eth2
+	ip link set ipip-gw up
+	ip route add "${REMOTE_VPN}" dev ipip-gw
+	einfo "IPIP tunnel: ${BGP_IP} -> ${PEER_BGP_IP}  remote VPN ${REMOTE_VPN} via ipip-gw"
+
+	# -- 9. Give CT entry and peer time to stabilise --------------------------
 	sleep 5
 
 	# -- 7. Run fleetpulse (config generator + src/dest check disable) --------
@@ -233,6 +297,25 @@ stop_post() {
 		ebegin "Detaching management ENI (ipsec-gw-mgmt=$ROLE)"
 		aeroplug eni \
 			--tag    "ipsec-gw-mgmt=$ROLE" \
+			--detach \
+			--region "${REGION}" || true
+		eend $?
+	fi
+
+	# -- Tear down eth3 (VPN-subnet ENI) and IPIP tunnel ----------------------
+	local VPN_IP
+	VPN_IP=$(cat /run/vpn-ip 2>/dev/null || true)
+	if [ -n "$VPN_IP" ]; then
+		ip route del dev ipip-gw 2>/dev/null || true
+		ip tunnel del ipip-gw   2>/dev/null || true
+		ip addr del dev eth3    2>/dev/null || true
+	fi
+	ip link set eth3 down 2>/dev/null || true
+
+	if [ -n "$TOKEN" ] && [ -n "$ROLE" ]; then
+		ebegin "Detaching VPN-subnet ENI (ipsec-gw-vpn=$ROLE)"
+		aeroplug eni \
+			--tag    "ipsec-gw-vpn=$ROLE" \
 			--detach \
 			--region "${REGION}" || true
 		eend $?

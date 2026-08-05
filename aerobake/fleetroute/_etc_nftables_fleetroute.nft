@@ -35,6 +35,11 @@ table inet filter {
 		# VRRP unicast from peer Return GW node (arrives on eth1)
 		iifname "eth1" ip protocol 112 accept
 
+		# IPIP tunnel traffic from peer Return GW node (arrives on eth2).
+		# The IPIP outer packet (protocol 4) must be allowed so the kernel
+		# IPIP module can decapsulate it before nftables drops it.
+		iifname "eth2" ip protocol 4 accept
+
 		# BGP from VPN concentrators arriving on eth2 (the BGP ENI).
 		# VPN nodes connect to the fixed BGP IP (172.16.51.4 / 172.16.51.36)
 		# which is assigned to eth2 -- NOT eth0.

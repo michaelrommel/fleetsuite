@@ -102,11 +102,9 @@ build {
       # dnsmasq must run even in debug mode -- resolv.conf points to 127.0.0.1
       # and aeroplug/fleetpulse need DNS to reach the EC2 API.
       "sudo rc-update add dnsmasq      default",
-      # DEBUG: services below are intentionally disabled for manual boot-sequence
-      # debugging. Re-enable before building the production AMI.
-      #"sudo rc-update add nftables     default",
-      #"sudo rc-update add frr          default",
-      #"sudo rc-update add node-exporter default",
+      "sudo rc-update add nftables     default",
+      "sudo rc-update add frr          default",
+      "sudo rc-update add node-exporter default",
     ]
   }
 
@@ -268,9 +266,7 @@ build {
       "sudo chown root:root /etc/init.d/keepalived",
       "sudo chown root:root /etc/conf.d/keepalived",
       "sudo chmod +x /etc/init.d/keepalived",
-      # DEBUG: disabled for manual boot-sequence debugging.
-      # Re-enable before building the production AMI.
-      #"sudo rc-update add keepalived default",
+      "sudo rc-update add keepalived default",
     ]
   }
 
