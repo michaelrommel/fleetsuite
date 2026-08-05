@@ -1,0 +1,270 @@
+#!/sbin/openrc-run
+
+extra_started_commands="reload"
+description_reload="Reload keepalived configuration (SIGHUP)"
+
+: ${cfgfile:="/etc/keepalived/keepalived.conf"}
+
+command="/usr/sbin/keepalived"
+command_args="
+	--dont-fork
+	--use-file=$cfgfile
+	${command_args:-}"
+command_background="yes"
+pidfile="/run/$RC_SVCNAME.pid"
+
+required_files="$cfgfile"
+
+depend() {
+	use logger
+	need net
+}
+
+# -- IMDS helpers --------------------------------------------------------------
+
+fetch_imds_token() {
+	local _var="$1"
+	local _token
+	_token=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+		-H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+	if [ -z "$_token" ]; then
+		eerror "Failed to fetch IMDSv2 token"
+		return 1
+	fi
+	eval "${_var}=\"\${_token}\""
+}
+
+fetch_imds_tag() {
+	local _token="$1" _key="$2" _var="$3"
+	local _value
+	_value=$(curl -sf -H "X-aws-ec2-metadata-token: $_token" \
+		"http://169.254.169.254/latest/meta-data/tags/instance/$_key")
+	if [ -z "$_value" ]; then
+		eerror "IMDS tag '$_key' not found -- is InstanceMetadataTags enabled?"
+		return 1
+	fi
+	eval "${_var}=\"\${_value}\""
+}
+
+# -- Lifecycle hooks -----------------------------------------------------------
+
+start_pre() {
+	local TOKEN ROLE PEER_MGMT_IP
+
+	# -- 1. IMDS: role and peer management IP ---------------------------------
+	fetch_imds_token TOKEN       || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-gw-role"         ROLE         || return 1
+	fetch_imds_tag "$TOKEN" "ipsec-gw-peer-mgmt-ip" PEER_MGMT_IP || return 1
+
+	einfo "Role: $ROLE  Peer mgmt IP: $PEER_MGMT_IP"
+
+	# -- 2. Attach management ENI (eth1, device index 1) ----------------------
+	# Uses --takeover, which handles all cases:
+	#   - Fresh boot: ENI is available -> direct attach.
+	#   - keepalived restart: ENI is in-use on this instance -> force-detach
+	#     and re-attach (brief eth1 disruption, acceptable on restart).
+	#   - ASG replacement: ENI is in-use on old instance -> force-detach + attach.
+	ebegin "Claiming management ENI (ipsec-gw-mgmt=$ROLE)"
+	aeroplug eni \
+		--tag           "ipsec-gw-mgmt=$ROLE" \
+		--takeover \
+		--device-index  1 \
+		--write-ip-file /run/eth1-ip \
+		--region        "${REGION}"
+	eend $? || return 1
+	local ETH1_IP
+	ETH1_IP=$(cat /run/eth1-ip 2>/dev/null)
+	if [ -z "$ETH1_IP" ]; then
+		eerror "aeroplug did not write eth1 IP to /run/eth1-ip"
+		return 1
+	fi
+
+	# -- 3. Wait for eth1 to appear in sysfs, bring it up --------------------
+	einfo "Waiting for eth1 to appear..."
+	local waited=0
+	while [ ! -d /sys/class/net/eth1 ]; do
+		sleep 1
+		waited=$((waited + 1))
+		if [ "$waited" -ge 60 ]; then
+			eerror "eth1 did not appear after 60 s"
+			return 1
+		fi
+	done
+
+	ip link set eth1 up
+
+	local ETH1_MAC ETH1_CIDR ETH1_PREFIX
+	ETH1_MAC=$(cat /sys/class/net/eth1/address)
+	ETH1_CIDR=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+		"http://169.254.169.254/latest/meta-data/network/interfaces/macs/$ETH1_MAC/subnet-ipv4-cidr-block")
+	if [ -z "$ETH1_CIDR" ]; then
+		eerror "Failed to read eth1 subnet CIDR from IMDS"
+		return 1
+	fi
+	ETH1_PREFIX="${ETH1_CIDR##*/}"
+
+	ip addr add "$ETH1_IP/$ETH1_PREFIX" dev eth1
+	einfo "eth1 up: $ETH1_IP/$ETH1_PREFIX"
+
+	# Policy routing table 201: all traffic sourced from ETH1_IP egresses eth1.
+	# Without this, SSH reply packets (src=172.16.51.68) would exit via eth0
+	# and be dropped by AWS SourceDestCheck (source does not match eth0's IP).
+	# This makes SSH to eth1 robust regardless of whether fleetpulse has run.
+	ip rule  add from "${ETH1_IP}/32" lookup 201 prio 101
+	ip route add table 201 default via "$ETH1_GW" dev eth1
+	einfo "Policy routing 201: from ${ETH1_IP}/32 via $ETH1_GW dev eth1"
+
+	# Add explicit route to peer's management /28 via eth1 gateway.
+	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
+	ETH1_NET="${ETH1_CIDR%/*}"
+	ETH1_LAST="${ETH1_NET##*.}"
+	ETH1_BASE="${ETH1_NET%.*}"
+	ETH1_GW="${ETH1_BASE}.$((ETH1_LAST + 1))"
+
+	local PEER_LAST PEER_BASE PEER_NET_LAST PEER_SUBNET
+	PEER_LAST="${PEER_MGMT_IP##*.}"
+	PEER_BASE="${PEER_MGMT_IP%.*}"
+	PEER_NET_LAST=$(( (PEER_LAST / 16) * 16 ))
+	PEER_SUBNET="${PEER_BASE}.${PEER_NET_LAST}/28"
+	ip route add "$PEER_SUBNET" via "$ETH1_GW" dev eth1
+	einfo "Route: $PEER_SUBNET via $ETH1_GW dev eth1"
+
+	# -- 4. Claim the BGP ENI (eth2, device index 2) --------------------------
+	# Uses --takeover which handles all cases:
+	#   - ENI is available (normal boot): direct attach.
+	#   - ENI is in-use on old instance (ASG replacement): force-detach,
+	#     poll until available, then attach.
+	# The BGP ENI carries the fixed IP (172.16.51.4 for master, 172.16.51.36
+	# for backup) that VPN concentrators use as their static BGP neighbor.
+	ebegin "Claiming BGP ENI (ipsec-gw-bgp=$ROLE) via takeover"
+	aeroplug eni \
+		--tag           "ipsec-gw-bgp=$ROLE" \
+		--takeover \
+		--device-index  2 \
+		--write-ip-file /run/bgp-ip \
+		--region        "${REGION}"
+	eend $? || return 1
+
+	local BGP_IP
+	BGP_IP=$(cat /run/bgp-ip 2>/dev/null)
+	if [ -z "$BGP_IP" ]; then
+		eerror "aeroplug did not write BGP IP to /run/bgp-ip"
+		return 1
+	fi
+
+	# -- 5. Wait for eth2, bring it up with /32 --------------------------------
+	# We use /32 instead of the subnet prefix (e.g. /27) so the kernel does
+	# NOT add a duplicate 172.16.51.0/27 subnet route (eth0 is in the same
+	# subnet).  A /32 host route is sufficient for receiving BGP connections
+	# and for policy-routing BGP reply traffic.
+	einfo "Waiting for eth2 to appear..."
+	waited=0
+	while [ ! -d /sys/class/net/eth2 ]; do
+		sleep 1
+		waited=$((waited + 1))
+		if [ "$waited" -ge 60 ]; then
+			eerror "eth2 did not appear after 60 s"
+			return 1
+		fi
+	done
+
+	ip link set eth2 up
+	ip addr add "${BGP_IP}/32" dev eth2
+	einfo "eth2 up: ${BGP_IP}/32 (BGP peer address)"
+
+	# Get eth2's VPC gateway (subnet base + 1) for policy routing.
+	local ETH2_MAC ETH2_CIDR ETH2_NET ETH2_LAST ETH2_BASE ETH2_GW
+	ETH2_MAC=$(cat /sys/class/net/eth2/address)
+	ETH2_CIDR=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+		"http://169.254.169.254/latest/meta-data/network/interfaces/macs/$ETH2_MAC/subnet-ipv4-cidr-block")
+	ETH2_NET="${ETH2_CIDR%/*}"
+	ETH2_LAST="${ETH2_NET##*.}"
+	ETH2_BASE="${ETH2_NET%.*}"
+	ETH2_GW="${ETH2_BASE}.$((ETH2_LAST + 1))"
+
+	# Policy routing table 202: all traffic sourced from BGP_IP egresses eth2.
+	# This ensures FRR's BGP keepalive and reply packets go via eth2 (which has
+	# the fixed IP), not eth0 (which has a dynamic IP in the same subnet).
+	# rp_filter=2 (loose) in sysctl allows inbound BGP packets on eth2 whose
+	# best-route is via eth0.
+	ip rule  add from "${BGP_IP}/32" lookup 202 prio 100
+	ip route add table 202 default via "$ETH2_GW" dev eth2 onlink
+	einfo "Policy routing 202: from ${BGP_IP}/32 via $ETH2_GW dev eth2 onlink"
+
+	# -- 6. Give CT entry and peer time to stabilise --------------------------
+	sleep 5
+
+	# -- 7. Run fleetpulse (config generator + src/dest check disable) --------
+	ebegin "Running fleetpulse"
+	fleetpulse --auth-pass "${VRRP_PASS}" --region "${REGION}"
+	eend $? || return 1
+
+	# -- 8. Prime VRRP proto 112 connection tracking --------------------------
+	einfo "Priming proto 112 CT toward $PEER_MGMT_IP..."
+	printf '\x21\x01\x34\x01\x01\x01\x42\x45\xc0\xa8\x01\x01\x63\x30\x66\x57\x6d\x2c\x71\x59' \
+		| socat - "IP4-DATAGRAM:${PEER_MGMT_IP}:112,ip-ttl=255" 2>/dev/null || true
+
+	# -- 9. Pre-create files that notify scripts need to write ----------------
+	touch /run/fleetpulse-notify.log /run/ipsec-role
+	chown keepalived_script:nogroup \
+	      /run/fleetpulse-notify.log /run/ipsec-role
+	chmod 755 /etc/keepalived/notify-master.sh \
+	          /etc/keepalived/notify-backup.sh
+}
+
+stop_post() {
+	local TOKEN ROLE
+
+	# Fetch token -- used for IMDS queries below.
+	fetch_imds_token TOKEN 2>/dev/null || true
+
+	# -- Tear down eth1 (management ENI) --------------------------------------
+	local INSIDE_IP
+	INSIDE_IP=$(ip -4 addr show eth1 2>/dev/null | awk '/inet / { print $2 }')
+	if [ -n "$INSIDE_IP" ]; then
+		local BARE_IP="${INSIDE_IP%/*}"
+		ip rule  del from "${BARE_IP}/32" lookup 201 prio 101 2>/dev/null || true
+		ip route flush table 201                                2>/dev/null || true
+		ip addr  del "$INSIDE_IP" dev eth1                     2>/dev/null || true
+	fi
+	ip link set eth1 down 2>/dev/null || true
+
+	if [ -n "$TOKEN" ] && fetch_imds_tag "$TOKEN" "ipsec-gw-role" ROLE 2>/dev/null; then
+		ebegin "Detaching management ENI (ipsec-gw-mgmt=$ROLE)"
+		aeroplug eni \
+			--tag    "ipsec-gw-mgmt=$ROLE" \
+			--detach \
+			--region "${REGION}" || true
+		eend $?
+	fi
+
+	# -- Tear down eth2 (BGP ENI) ----------------------------------------------
+	# Remove policy routing rules added in start_pre.
+	local BGP_IP
+	BGP_IP=$(cat /run/bgp-ip 2>/dev/null || true)
+	if [ -n "$BGP_IP" ]; then
+		ip rule  del from "${BGP_IP}/32" lookup 202 prio 100 2>/dev/null || true
+		ip route flush table 202                                2>/dev/null || true
+		ip addr  del "${BGP_IP}/32" dev eth2                   2>/dev/null || true
+	fi
+	ip link set eth2 down 2>/dev/null || true
+
+	# Graceful detach -- if the new instance has already force-detached it
+	# via --takeover this call is a no-op (ENI no longer attached here).
+	if [ -n "$TOKEN" ] && [ -n "$ROLE" ]; then
+		ebegin "Detaching BGP ENI (ipsec-gw-bgp=$ROLE)"
+		aeroplug eni \
+			--tag    "ipsec-gw-bgp=$ROLE" \
+			--detach \
+			--region "${REGION}" || true
+		eend $?
+	fi
+}
+
+# -- Custom commands -----------------------------------------------------------
+
+reload() {
+	ebegin "Reloading keepalived configuration"
+	start-stop-daemon --pidfile "$pidfile" --signal HUP
+	eend $?
+}

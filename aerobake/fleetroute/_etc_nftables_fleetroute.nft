@@ -1,0 +1,52 @@
+#
+# nftables ruleset for fleetroute IPSec Return GW nodes
+#
+# Drop any existing ruleset on load.
+flush ruleset
+
+# -- Filter table --------------------------------------------------------------
+table inet filter {
+
+	# INPUT: packets destined for the Return GW node itself.
+	# Forwarded traffic (backend replies, customer traffic from VPN nodes)
+	# never reaches INPUT -- it is routed through FORWARD by the kernel.
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+
+		# Loopback
+		iifname "lo" accept
+
+		# Established / related (replies to GW-initiated connections,
+		# e.g. AWS EC2 API calls, FRR BGP keepalives, IMDS responses)
+		ct state established,related accept
+		ct state invalid drop
+
+		# ICMP (reachability probes, unreachables for path MTU)
+		icmp type {
+			echo-request,
+			destination-unreachable,
+			time-exceeded
+		} accept
+
+		# SSH on management NIC only
+		# AWS SG (sg-returngw) restricts inbound TCP 22 to CLI_RemoteAccess SG.
+		iifname "eth1" tcp dport 22 accept
+
+		# VRRP unicast from peer Return GW node (arrives on eth1)
+		iifname "eth1" ip protocol 112 accept
+
+		# BGP from VPN concentrators arriving on eth2 (the BGP ENI).
+		# VPN nodes connect to the fixed BGP IP (172.16.51.4 / 172.16.51.36)
+		# which is assigned to eth2 -- NOT eth0.
+		iifname "eth2" ip saddr { 172.16.49.0/24, 172.16.50.0/24 } tcp dport 179 accept
+
+		reject with icmp type admin-prohibited
+	}
+
+	# FORWARD: packets routed through this node.
+	# The Return GW is a pure L3 router -- accept all forwarded traffic.
+	# The security boundary is enforced by the SGs on VPN nodes and backends.
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+	}
+}

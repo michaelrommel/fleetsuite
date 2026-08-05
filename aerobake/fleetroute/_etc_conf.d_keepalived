@@ -1,0 +1,14 @@
+# Configuration for /etc/init.d/keepalived (fleetroute -- IPSec Return GW nodes)
+
+# Path of the keepalived configuration file.
+# cfgfile="/etc/keepalived/keepalived.conf"
+
+# Additional command-line options passed to keepalived.
+# -S local3 routes keepalived's own syslog output to facility local3.
+command_args="-S local3"
+
+# AWS region -- read by fleetpulse and aeroplug.
+export REGION="eu-west-2"
+
+# VRRP authentication password.  Must be identical on both Return GW nodes.
+export VRRP_PASS="changeme"

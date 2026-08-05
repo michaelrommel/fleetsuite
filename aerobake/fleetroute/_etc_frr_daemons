@@ -1,0 +1,38 @@
+# /etc/frr/daemons -- fleetroute Return GW (Alpine)
+#
+# Only bgpd is enabled.  zebra is always started by the frr init script
+# when any routing daemon is active; it does not need to be listed here.
+#
+# BGP config (AS 65002, bgp listen range for VPN subnets) is in frr.conf.
+#
+# FRR is ENABLED in this AMI (rc-update add frr default in the Packer build).
+# Both master and backup nodes run FRR and maintain BGP sessions with all VPN
+# concentrators simultaneously so failover needs no BGP reconvergence -- only
+# the backend route table default route is updated by the notify-master script.
+
+bgpd=yes
+ospfd=no
+ospf6d=no
+ripd=no
+ripngd=no
+isisd=no
+pimd=no
+pim6d=no
+ldpd=no
+nhrpd=no
+eigrpd=no
+babeld=no
+sharpd=no
+pbrd=no
+bfdd=no
+fabricd=no
+vrrpd=no
+pathd=no
+
+#
+# Daemon options
+#
+vtysh_enable=yes
+# Large zebra API socket buffer for up to 600,000 /32 customer host routes.
+zebra_options="  -A 127.0.0.1 -s 90000000"
+bgpd_options="   -A 127.0.0.1"
