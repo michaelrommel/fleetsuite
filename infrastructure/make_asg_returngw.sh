@@ -43,6 +43,8 @@ aws autoscaling create-auto-scaling-group \
     "ResourceId=fleetipsec-returngw-master,ResourceType=auto-scaling-group,Key=ipsec-gw-role,Value=master,PropagateAtLaunch=true" \
     "ResourceId=fleetipsec-returngw-master,ResourceType=auto-scaling-group,Key=ipsec-gw-peer-mgmt-ip,Value=172.16.51.100,PropagateAtLaunch=true" \
     "ResourceId=fleetipsec-returngw-master,ResourceType=auto-scaling-group,Key=ipsec-gw-rtb,Value=${RTB_BACKEND},PropagateAtLaunch=true" \
+    "ResourceId=fleetipsec-returngw-master,ResourceType=auto-scaling-group,Key=ipsec-gw-peer-bgp-ip,Value=172.16.51.36,PropagateAtLaunch=true" \
+    "ResourceId=fleetipsec-returngw-master,ResourceType=auto-scaling-group,Key=ipsec-gw-remote-vpn,Value=172.16.50.0/24,PropagateAtLaunch=true" \
   --region eu-west-2
 
 echo ""
@@ -64,6 +66,8 @@ aws autoscaling create-auto-scaling-group \
     "ResourceId=fleetipsec-returngw-backup,ResourceType=auto-scaling-group,Key=ipsec-gw-role,Value=backup,PropagateAtLaunch=true" \
     "ResourceId=fleetipsec-returngw-backup,ResourceType=auto-scaling-group,Key=ipsec-gw-peer-mgmt-ip,Value=172.16.51.68,PropagateAtLaunch=true" \
     "ResourceId=fleetipsec-returngw-backup,ResourceType=auto-scaling-group,Key=ipsec-gw-rtb,Value=${RTB_BACKEND},PropagateAtLaunch=true" \
+    "ResourceId=fleetipsec-returngw-backup,ResourceType=auto-scaling-group,Key=ipsec-gw-peer-bgp-ip,Value=172.16.51.4,PropagateAtLaunch=true" \
+    "ResourceId=fleetipsec-returngw-backup,ResourceType=auto-scaling-group,Key=ipsec-gw-remote-vpn,Value=172.16.49.0/24,PropagateAtLaunch=true" \
   --region eu-west-2
 
 echo ""
