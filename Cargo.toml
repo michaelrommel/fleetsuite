@@ -8,6 +8,7 @@ members = [
     "ipsecpulse",
     "ipsecscale",
     "ipsecnode",
+    "fleetpulse",
 ]
 
 # ── Pinned shared dependency versions ─────────────────────────────────────────
