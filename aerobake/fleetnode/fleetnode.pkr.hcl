@@ -3,9 +3,8 @@
 #                      (Debian 12 Bookworm, amd64)
 #
 # Increment 4+6ab: Debian 12 base + StrongSwan + FRR BGP base config (disabled)
-#             + ipsecnode Increment 6a+6b + VPP (masked).
-# VPP startup.conf (Build Order step 5) and ipsecnode Increments 6c-6f
-# are added in subsequent build increments.
+#             + ipsecnode Increment 6a+6b + VPP with startup.conf (step 5).
+# ipsecnode Increments 6c-6f are added in subsequent build increments.
 #
 # Prerequisites -- build the ipsecnode binary before running:
 #   cargo build --release --target x86_64-unknown-linux-musl -p ipsecnode
@@ -28,7 +27,7 @@
 #   T1  IKE SA establishment (NAT-T)  -- StrongSwan + ipsecnode only
 #   T2  kernel xfrm data path         -- add test-narrow.conf manually
 #   T3  FRR /32 route advertisement   -- systemctl start frr
-#   T4  VPP data plane                -- systemctl unmask vpp + configure
+#   T4  VPP data plane                -- af_packet + ipsecnode Increment 6d
 
 # -- Variables -----------------------------------------------------------------
 
@@ -183,11 +182,23 @@ build {
     ]
   }
 
-  # -- 6. VPP from packagecloud.io/fdio/release --------------------------------
-  # MASKED: VPP requires hugepages and a startup.conf before it can run.
-  # Unmask and configure in Build Order step 5.
-  # policy-rc.d guard prevents the apt post-install script from attempting
-  # to start VPP (which would fail on a plain t3.medium build instance).
+  # -- 6. VPP from packagecloud.io/fdio/release ----------------------------------
+  # Build Order step 5: startup.conf and setup.gate baked in.
+  # Hugepages (vm.nr_hugepages=1024) configured via sysctl.d (step 7 below);
+  # systemd-sysctl.service applies them before vpp.service starts at boot.
+  # DPDK plugin disabled -- ENA stays with the kernel driver (af_packet mode).
+  # VPP is ENABLED: starts at boot, exposes /run/vpp/api.sock for ipsecnode
+  # (Increment 6d) to configure af_packet interfaces, VRFs, and NAT tables.
+  # policy-rc.d guard prevents the apt postinstall script from attempting to
+  # start VPP on the t3.medium Packer build instance (no hugepages there).
+  provisioner "file" {
+    source      = "./_etc_vpp_startup.conf"
+    destination = "/tmp/_etc_vpp_startup.conf"
+  }
+  provisioner "file" {
+    source      = "./_etc_vpp_setup.gate"
+    destination = "/tmp/_etc_vpp_setup.gate"
+  }
   provisioner "shell" {
     inline = [
       "curl -fsSL https://packagecloud.io/fdio/release/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/fdio-release.gpg",
@@ -196,7 +207,19 @@ build {
       "echo 'exit 101' | sudo tee /usr/sbin/policy-rc.d && sudo chmod +x /usr/sbin/policy-rc.d",
       "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends vpp vpp-plugin-core vpp-plugin-dpdk",
       "sudo rm -f /usr/sbin/policy-rc.d",
-      "sudo systemctl mask vpp",
+      # Deploy startup.conf and setup.gate.
+      # The vpp package creates /etc/vpp/ and the 'vpp' system group.
+      "sudo mv /tmp/_etc_vpp_startup.conf /etc/vpp/startup.conf",
+      "sudo mv /tmp/_etc_vpp_setup.gate   /etc/vpp/setup.gate",
+      "sudo chown root:root /etc/vpp/startup.conf /etc/vpp/setup.gate",
+      # Ensure the VPP log directory exists (package postinstall normally
+      # creates it, but be explicit so the AMI is consistent).
+      "sudo mkdir -p /var/log/vpp",
+      "sudo chown root:vpp /var/log/vpp",
+      "sudo chmod 750 /var/log/vpp",
+      # Enable VPP: starts at boot, exposes binary API socket for ipsecnode.
+      # (Was masked in prior increments; startup.conf is now baked in.)
+      "sudo systemctl enable vpp",
     ]
   }
 

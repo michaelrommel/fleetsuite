@@ -1,0 +1,11 @@
+comment {
+  /etc/vpp/setup.gate -- VPP startup CLI for fleetnode IPSec concentrators.
+
+  This file is executed as VPP CLI commands immediately after VPP starts
+  (before the binary API socket accepts connections).  For fleetnode, all
+  runtime configuration -- af_packet interface creation, VRF setup, and
+  NAT table population -- is applied by ipsecnode (Increment 6d) via the
+  binary API socket at /run/vpp/api.sock.
+
+  Intentionally empty: no interface or NAT configuration here.
+}

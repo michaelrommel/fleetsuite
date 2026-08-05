@@ -1,7 +1,7 @@
 [Unit]
 Description=IPSec VPN node lifecycle daemon
 Documentation=https://github.com/michaelrommel/fleetsuite
-After=network-online.target strongswan.service frr.service
+After=network-online.target strongswan.service frr.service vpp.service
 Wants=network-online.target
 
 [Service]
