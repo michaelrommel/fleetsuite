@@ -8,41 +8,93 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-05):** Build Order step 7 -- Return GW deployed. BGP sessions Established with VPN concentrators. /32 routes propagating correctly. **T3 NOT yet marked complete -- data-plane routing gap identified (see Architecture Decision #14).**
+**Last completed session (2026-08-05):** T3 complete -- BGP sessions established, /32 routes propagate to Return GW, full forwarding path confirmed (master IPIP -> backup eth3 -> VPN concentrator ens5 -> VPP DNAT). **T3 PASSED.**
 
 ### What the next session should do
 
-**Immediate next step:** Resolve Architecture Decision #14 (Return GW data-plane routing gap),
-then rebuild both AMIs and run T4.
 
-Step 1 -- Verify the gap (quick test, can do on the running debug instance):
-```bash
-# On VPN concentrator
-tcpdump -i ens5 host 198.51.100.133 -n &
-# On Return GW simultaneously
-ping -c 5 -I eth0 198.51.100.133
-```
-If ICMP echo requests appear on VPN concentrator ens5, the VPC IS delivering them
-(perhaps via same-subnet L2 if the AZs happen to align). If not, the gap is confirmed
-and one of the solutions in Architecture Decision #14 must be implemented.
+**Immediate next step: rebuild both AMIs and run T4.** T3 is COMPLETE.
 
-Step 2 -- Implement chosen solution for Architecture Decision #14.
+All fixes are committed. Running instances are hand-configured and will not survive
+reboot. A clean AMI rebuild is the ONLY required next action before T4.
 
-Step 3 -- Rebuild AMIs (production fleetroute + fleetnode with FRR enabled).
-Before building the production fleetroute AMI, uncomment the 5 `#rc-update add`
-lines in `aerobake/fleetroute/fleetroute.pkr.hcl` (nftables, dnsmasq, frr,
-node-exporter, keepalived).
+----------------------------------------------------------------------
+REBUILD SEQUENCE  <<<  DO THIS FIRST
+----------------------------------------------------------------------
 
-Step 4 -- Run T4 (full data-plane test with VPP NAT and confirmed return path).
+1. Re-enable services in Packer (5 lines to uncomment in fleetroute.pkr.hcl):
+   - nftables, dnsmasq, frr, node-exporter, keepalived
 
-**State of running instances (2026-08-05 session end):**
-- Return GW master (`i-000bd61e451d47ee0`, 172.16.51.27, AZ-a) running DEBUG AMI.
-  All services started manually; will NOT survive reboot. BGP ENIs, eth1 ENIs,
-  rtb-backend and ASGs are all deployed and working.
-- Return GW backup: running old broken AMI; ignore.
-- VPN concentrator (172.16.50.119, AZ-b): FRR enabled, BGP Established with Return
-  GW master. Two CHILD_SAs active. /32 routes 198.51.100.133 and 198.51.100.134
-  present in Return GW kernel routing table (proto bgp, via 172.16.51.1 dev eth0).
+2. Rebuild musl binaries (aeroplug changed -- --takeover now writes --write-ip-file):
+   ```bash
+   cd vendor/aerosuite
+   cargo build --release --target x86_64-unknown-linux-musl -p aeroplug
+   cd ../..
+   cargo build --release --target x86_64-unknown-linux-musl -p fleetpulse
+   ```
+
+3. Build the production fleetroute AMI:
+   ```bash
+   cd aerobake/fleetroute && packer build fleetroute.pkr.hcl
+   ```
+
+4. Update LT and recycle Return GW instances:
+   ```bash
+   FLEETROUTE_AMI=ami-XXXX bash infrastructure/update_lt_returngw_ami.sh
+   CONFIRM=yes bash infrastructure/cycle_returngw_instances.sh
+   ```
+
+5. Check ASG tags include the IPIP parameters (ipsec-gw-peer-bgp-ip, ipsec-gw-remote-vpn).
+   These were added to make_asg_returngw.sh but the RUNNING ASGs may need manual update.
+
+6. Rebuild fleetnode AMI (FRR fixes committed: redistribute kernel,
+   disable-connected-check, peer-group-before-listen-range, FRR ENABLED):
+   ```bash
+   cd aerobake/fleetnode && packer build fleetnode.pkr.hcl
+   ```
+   Update fleetipsec-lt-vpn and cycle the VPN concentrator instance.
+
+7. Run T4: full VPP NAT + confirmed return path via Return GW.
+   From koi: swanctl --initiate --child fleetipsec-ikev2
+   Ping from seagull (192.168.13.133) through tunnel to backend (194.138.39.18).
+
+----------------------------------------------------------------------
+STATE OF RUNNING INSTANCES (end of 2026-08-05 session)
+----------------------------------------------------------------------
+
+Return GW master (i-02c098dca9fbe0b41, 172.16.51.23, AZ-a):
+  Running ami-0ce52bcbd3c5e7d17. All services UP, manually configured.
+  eth3=172.16.49.4 (VPN-a), ipip-gw tunnel to backup. VRRP master.
+  BGP Established with 172.16.50.119. rp_filter=0 set at runtime only.
+
+Return GW backup (i-058d47f181f4794fa, 172.16.51.55, AZ-b):
+  Same AMI, same caveats. eth3=172.16.50.4 (VPN-b), ipip-gw tunnel to master.
+
+VPN concentrator (172.16.50.119, AZ-b):
+  FRR enabled. BGP Established with both Return GW nodes.
+  Two CHILD_SAs active. /32 routes in Return GW kernel (proto bgp, via ipip-gw).
+  FRR fixes applied via vtysh only -- NOT in AMI yet.
+
+----------------------------------------------------------------------
+FIXES COMMITTED BUT NOT YET IN ANY DEPLOYED AMI
+----------------------------------------------------------------------
+
+fleetroute (need rebuild):
+  - rp_filter=0 (was 2) -- critical for IPIP forwarding
+  - nftables: ip protocol 4 accept on eth2 (IPIP in INPUT chain)
+  - init.d: eth3 attach + IPIP tunnel + dev eth2 + remote VPN route
+  - init.d: table 201 route with onlink
+  - init.d: eth1 uses --takeover instead of --attach
+  - Packer: 5 rc-update lines commented out (DEBUG MODE -- re-enable!)
+
+fleetnode (need rebuild):
+  - frr.conf: redistribute kernel (was: redistribute static)
+  - frr.conf: disable-connected-check on both Return GW neighbors
+  - frr.conf: peer-group declared BEFORE bgp listen range
+  - frr.conf: FRR ENABLED in rc-update (was disabled in AMI)
+
+aerosuite/aeroplug (need musl rebuild):
+  - attach.rs: --takeover writes --write-ip-file (was silently omitted)
 
 Operational notes learned during 6d testing:
 - `swanctl --load-conns` removes VICI-loaded per-site connections. Any swanctl
@@ -718,44 +770,40 @@ or pushed via configuration management. Certificate revocation (CRL/OCSP)
 is handled dynamically by StrongSwan using URLs embedded in client certs.
 No per-device cert pre-loading is needed or possible.
 
-### 14. Return GW data-plane routing gap -- non-VPC IPs cannot be VPC-routed to VPN concentrators
+### 14. Return GW data-plane routing -- RESOLVED (2026-08-05)
 
-**The gap:** Customer global IPs (e.g. 198.51.100.133/32) are not VPC IP addresses.
-When the Return GW's kernel forwards a packet with dst=198.51.100.133, the VPC
-hypervisor applies the route table of the Return GW's outgoing ENI subnet (rtb-private).
-rtb-private has `0.0.0.0/0 -> NAT GW`, so the packet goes to the internet, not to
-the VPN concentrator. The FRR BGP route correctly identifies WHICH concentrator
-should handle the packet, but the VPC fabric cannot deliver it there.
+**The gap (resolved):** Customer global IPs (e.g. 198.51.100.133/32) are not VPC IP
+addresses. AWS VPC routes traffic based on destination IP using the source ENI's route
+table. Non-VPC destination IPs follow the default route (NAT GW), not to the VPN
+concentrator. However, within the SAME SUBNET, the VPC honours L2 MAC-based delivery:
+a packet from eth3 (172.16.50.4, in VPN-b) to VPN concentrator (172.16.50.119, also
+in VPN-b) with dst=198.51.100.133 IS delivered correctly by the VPC fabric.
 
-This means: the Return GW can compute the correct forwarding decision but cannot
-act on it at the VPC network level without additional mechanism.
+**Solution implemented -- IPIP between Return GW nodes + VPN-subnet ENI (eth3):**
+- Each Return GW node has eth3 in its local AZ VPN subnet (master: VPN-a 172.16.49.4,
+  backup: VPN-b 172.16.50.4).
+- An IPIP tunnel (ipip-gw) runs between the two Return GW BGP ENI IPs (172.16.51.4
+  and 172.16.51.36). Cross-AZ customer traffic is tunnelled to the peer Return GW
+  node which has local eth3 access to the VPN concentrators in its AZ.
+- FRR BGP installs routes: same-AZ concentrators via eth3 (L2), remote-AZ via ipip-gw.
+- The VPN concentrator's ens5 receives the forwarded packet (src=original backend IP,
+  dst=customer global IP). VPP does the reverse DNAT.
 
-**Why per-/32 VPC routes don't scale:** AWS route tables have entry limits and
-managing up to 600,000 /32 entries dynamically via EC2 CreateRoute/DeleteRoute
-per CHILD_SA transition is not practical.
+**Critical sysctl finding:** `net.ipv4.conf.all.rp_filter = 0` (disabled) is required.
+rp_filter=2 (loose) silently drops forwarded packets on the ipip-gw tunnel interface
+because the source IP (e.g. 172.16.51.23 from ReturnGW-a) has no visible return path
+via ipip-gw. The drop happens between PREROUTING and FORWARD with no log entry.
+nftables trace (`meta nftrace set 1`) was the tool that revealed this: trace stopped
+at PREROUTING before the fix, flowed to FORWARD oif=eth3 after.
 
-**Candidate solutions (to be decided):**
-
-**Option A -- L2 same-subnet delivery (user suggestion, AZ-constrained):**
-Add an extra ENI to each Return GW node in the VPN concentrator subnet for its AZ:
-- Return GW master (AZ-a) gets ENI in VPN-a (172.16.49.0/24)
-- Return GW backup (AZ-b) gets ENI in VPN-b (172.16.50.0/24)
-Within the same subnet, the Return GW can ARP for the VPN concentrator's MAC and
-deliver the packet at L2. The VPC delivers it to the matching MAC regardless of the
-destination IP. SourceDestCheck=false on the VPN concentrator allows receiving it.
-
-Limitation: cross-AZ routing (master serving a VPN-b concentrator) still fails.
-For the current single-concentrator dev setup this may be sufficient.
-
-**Option B -- IPIP/GRE tunneling:**
-Return GW encapsulates: outer dst=VPN concentrator VPC IP, inner dst=customer global IP.
-The VPC routes the outer packet correctly (VPC IP). The VPN concentrator decapsulates
-and processes the inner packet through VPP NAT. Requires ipsecnode to manage IPIP
-tunnels per VPN concentrator and VPP changes to handle encapsulated return traffic.
-Scales well (one tunnel per concentrator, not per customer).
-
-**Option C -- User's unexplored idea (session ended before exploration):**
-User had a new idea at session end. To be explored in next session.
+**AMI changes needed for production build:**
+- `_etc_sysctl.d_50-fleetroute.conf`: rp_filter changed from 2 to 0.
+- `_etc_nftables_fleetroute.nft`: added `iifname "eth2" ip protocol 4 accept`
+  (IPIP protocol must be allowed in INPUT for the tunnel to decapsulate).
+- `_etc_init.d_keepalived`: added eth3 attach + IPIP tunnel setup + `dev eth2`
+  on the ip tunnel add command.
+- `fleetroute.pkr.hcl`: re-enable all 5 rc-update lines for production build.
+- `aeroplug/src/attach.rs`: --takeover now correctly writes --write-ip-file.
 
 ---
 
