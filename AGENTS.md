@@ -8,15 +8,41 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-05):** Increment 6d -- VPP NAT44 SNAT confirmed working. **Test passed.**
+**Last completed session (2026-08-05):** Build Order step 7 -- Return GW deployed. BGP sessions Established with VPN concentrators. /32 routes propagating correctly. **T3 NOT yet marked complete -- data-plane routing gap identified (see Architecture Decision #14).**
 
 ### What the next session should do
 
-**Immediate next step:** Build Order step 7 -- `aerobake/fleetroute/` Return GW AMI
-(Alpine). This completes the return path: FRR BGP /32 routes propagate to the
-Return GW, which routes backend replies back to the correct VPN node for
-reverse DNAT. After Return GW is built, rebuild the fleetnode AMI with the
-final ipsecnode binary and run T3 + T4.
+**Immediate next step:** Resolve Architecture Decision #14 (Return GW data-plane routing gap),
+then rebuild both AMIs and run T4.
+
+Step 1 -- Verify the gap (quick test, can do on the running debug instance):
+```bash
+# On VPN concentrator
+tcpdump -i ens5 host 198.51.100.133 -n &
+# On Return GW simultaneously
+ping -c 5 -I eth0 198.51.100.133
+```
+If ICMP echo requests appear on VPN concentrator ens5, the VPC IS delivering them
+(perhaps via same-subnet L2 if the AZs happen to align). If not, the gap is confirmed
+and one of the solutions in Architecture Decision #14 must be implemented.
+
+Step 2 -- Implement chosen solution for Architecture Decision #14.
+
+Step 3 -- Rebuild AMIs (production fleetroute + fleetnode with FRR enabled).
+Before building the production fleetroute AMI, uncomment the 5 `#rc-update add`
+lines in `aerobake/fleetroute/fleetroute.pkr.hcl` (nftables, dnsmasq, frr,
+node-exporter, keepalived).
+
+Step 4 -- Run T4 (full data-plane test with VPP NAT and confirmed return path).
+
+**State of running instances (2026-08-05 session end):**
+- Return GW master (`i-000bd61e451d47ee0`, 172.16.51.27, AZ-a) running DEBUG AMI.
+  All services started manually; will NOT survive reboot. BGP ENIs, eth1 ENIs,
+  rtb-backend and ASGs are all deployed and working.
+- Return GW backup: running old broken AMI; ignore.
+- VPN concentrator (172.16.50.119, AZ-b): FRR enabled, BGP Established with Return
+  GW master. Two CHILD_SAs active. /32 routes 198.51.100.133 and 198.51.100.134
+  present in Return GW kernel routing table (proto bgp, via 172.16.51.1 dev eth0).
 
 Operational notes learned during 6d testing:
 - `swanctl --load-conns` removes VICI-loaded per-site connections. Any swanctl
@@ -31,6 +57,67 @@ Operational notes learned during 6d testing:
   these FIB entries automatically and adding them creates ECMP.
 
 ### What changed in the last session (key facts for code work)
+
+- **Return GW deployed and BGP sessions confirmed working** (2026-08-05).
+  Many bugs discovered and fixed during manual boot-sequence debugging.
+  All fixes are committed to the relevant config files.
+
+  **aeroplug fix (`vendor/aerosuite/aeroplug/src/attach.rs`):**
+  - `--takeover` did not write `--write-ip-file`. Fixed: private IP is now
+    extracted from the DescribeNetworkInterfaces XML and written, same as `--attach`.
+  - Requires aeroplug musl rebuild before next Packer run.
+
+  **`aerobake/fleetroute/` fixes:**
+  - `fleetroute.pkr.hcl`: services commented out for debug build (dnsmasq, nftables,
+    frr, node-exporter, keepalived). Re-enable all 5 `rc-update add` lines before
+    production build. dnsmasq MUST run at boot (resolv.conf points to 127.0.0.1;
+    aeroplug/fleetpulse cannot reach EC2 API without DNS).
+  - `_etc_init.d_keepalived`:
+    - eth1 changed from `--attach` with retry to `--takeover` (handles restart
+      where eth1 is already in-use on this instance).
+    - Policy routing table 201 added for eth1 source IP (so SSH replies egress
+      via eth1, not eth0 -- prevents SourceDestCheck drop on eth0).
+    - `ip route add table 202 ... onlink` required for /32 eth2 address (without
+      `onlink`, kernel rejects gateway as unreachable from a /32 interface).
+  - `_etc_nftables_fleetroute.nft`: BGP rule changed from `iifname "eth0"` to
+    `iifname "eth2"` -- BGP sessions arrive on eth2 (the BGP ENI), not eth0.
+  - `_etc_frr_frr.conf`:
+    - Peer group (`neighbor VPN-NODES peer-group`) must be declared BEFORE
+      `bgp listen range` lines. FRR parses config sequentially; referencing an
+      undefined peer group silently drops the listen range lines.
+    - Added `neighbor VPN-NODES disable-connected-check`. Without this, FRR's
+      NHT marks the BGP next-hop as `unresolved(Connected)` because VPN
+      concentrators are not in a directly-connected subnet of the Return GW.
+      Routes appear in the BGP table but have no `*>` and are not installed
+      in the kernel. `ip nht resolve-via-default` alone was NOT sufficient.
+
+  **`aerobake/fleetnode/_etc_frr_frr.conf` fixes:**
+  - Added `neighbor 172.16.51.4 disable-connected-check` and same for .36.
+    Without this, FRR on the VPN node never sends TCP SYNs to the Return GW
+    (BGP state shows `Active` but `Last write never`, zero Opens). FRR silently
+    refuses connections to peers not in a directly-connected subnet.
+  - Changed `redistribute static` to `redistribute kernel`. ipsecnode installs
+    /32 routes via `ip route` which zebra classifies as `K` (kernel) routes,
+    not `S` (static). `redistribute static` was silently not redistributing them.
+
+- **Build Order step 7 scaffolding complete** (2026-08-05).
+  - New `fleetpulse` Cargo workspace member (`fleetpulse/`) -- boot-time config
+    generator for Return GW nodes. Subcommands: `(boot)`, `notify-master`,
+    `notify-backup`. Same patterns as ipsecpulse but simpler (no EIP, no ASG
+    polling, no nftables). Disables src/dest check on eth0 during boot run.
+    Upserts `0.0.0.0/0 -> eth0_eni_id` in the backend route table on MASTER.
+  - `aerobake/fleetroute/` -- complete Alpine AMI files:
+    - FRR BGP config (AS 65002, `bgp listen range` for 172.16.49/50.x).
+    - keepalived VRRP (unicast on eth1, VRID 52, route-table failover, no VIP).
+    - init.d boot sequence: aeroplug attach eth1, fleetpulse boot, prime VRRP CT.
+    - nftables filter: allows BGP (TCP 179) from VPN subnets, VRRP/SSH on eth1.
+    - Packer build file: Alpine 3.23.3, packages frr+frr-openrc+keepalived.
+  - Infrastructure scripts:
+    - `make_enis_returngw.sh` -- creates eth1 ENIs (172.16.51.68 master, 172.16.51.100 backup).
+    - `make_rtb_backend.sh` -- creates `FleetShell-IPSec-rtb-backend` (no default route until notify-master fires).
+    - `make_lt_returngw.sh` -- two LTs with fixed primary IPs (172.16.51.4 / 172.16.51.36).
+    - `make_asg_returngw.sh` -- two ASGs (min=max=1) for master/backup nodes.
+  - Uses `ecsInstanceRole` IAM profile (same as LVS dev) -- no new IAM setup needed.
 
 - **T2 passed** (2026-08-04). Full xfrm data path: seagull (192.168.13.133)
   -> koi (IPsec gateway, NAT-T encapsulation) -> office NAT -> LVS DNAT ->
@@ -631,6 +718,45 @@ or pushed via configuration management. Certificate revocation (CRL/OCSP)
 is handled dynamically by StrongSwan using URLs embedded in client certs.
 No per-device cert pre-loading is needed or possible.
 
+### 14. Return GW data-plane routing gap -- non-VPC IPs cannot be VPC-routed to VPN concentrators
+
+**The gap:** Customer global IPs (e.g. 198.51.100.133/32) are not VPC IP addresses.
+When the Return GW's kernel forwards a packet with dst=198.51.100.133, the VPC
+hypervisor applies the route table of the Return GW's outgoing ENI subnet (rtb-private).
+rtb-private has `0.0.0.0/0 -> NAT GW`, so the packet goes to the internet, not to
+the VPN concentrator. The FRR BGP route correctly identifies WHICH concentrator
+should handle the packet, but the VPC fabric cannot deliver it there.
+
+This means: the Return GW can compute the correct forwarding decision but cannot
+act on it at the VPC network level without additional mechanism.
+
+**Why per-/32 VPC routes don't scale:** AWS route tables have entry limits and
+managing up to 600,000 /32 entries dynamically via EC2 CreateRoute/DeleteRoute
+per CHILD_SA transition is not practical.
+
+**Candidate solutions (to be decided):**
+
+**Option A -- L2 same-subnet delivery (user suggestion, AZ-constrained):**
+Add an extra ENI to each Return GW node in the VPN concentrator subnet for its AZ:
+- Return GW master (AZ-a) gets ENI in VPN-a (172.16.49.0/24)
+- Return GW backup (AZ-b) gets ENI in VPN-b (172.16.50.0/24)
+Within the same subnet, the Return GW can ARP for the VPN concentrator's MAC and
+deliver the packet at L2. The VPC delivers it to the matching MAC regardless of the
+destination IP. SourceDestCheck=false on the VPN concentrator allows receiving it.
+
+Limitation: cross-AZ routing (master serving a VPN-b concentrator) still fails.
+For the current single-concentrator dev setup this may be sufficient.
+
+**Option B -- IPIP/GRE tunneling:**
+Return GW encapsulates: outer dst=VPN concentrator VPC IP, inner dst=customer global IP.
+The VPC routes the outer packet correctly (VPC IP). The VPN concentrator decapsulates
+and processes the inner packet through VPP NAT. Requires ipsecnode to manage IPIP
+tunnels per VPN concentrator and VPP changes to handle encapsulated return traffic.
+Scales well (one tunnel per concentrator, not per customer).
+
+**Option C -- User's unexplored idea (session ended before exploration):**
+User had a new idea at session end. To be explored in next session.
+
 ---
 
 ## Binaries
@@ -942,7 +1068,7 @@ net.core.wmem_max                = 134217728
      **Awaiting test** -- see "Next Session Starting Point" above.
    - 6e: ASG lifecycle hook heartbeat
    - 6f: Valkey half-open IKE SA state
-7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
+7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
 8. **`ipsecscale`** -- LVS autoscaling daemon.
 
 ---
