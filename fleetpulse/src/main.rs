@@ -255,14 +255,25 @@ async fn run_boot(cli: &Cli) -> Result<()> {
 	println!("  eth0       : {}  ({})", eth0.primary_ip, eth0.eni_id);
 	println!("  eth1       : {}  ({})", eth1.primary_ip, eth1.subnet_cidr);
 
-	// 4. Disable src/dest check on eth0
-	// The Return GW forwards customer traffic with source/destination IPs
-	// that do not match its own interface IP -- AWS drops such packets unless
-	// the src/dest check is disabled.
-	println!("  Disabling src/dest check on {} ...", eth0.eni_id);
+	// 4. Disable src/dest check on eth0 and eth3 (if present).
+	// eth0: forwards backend traffic with arbitrary dst IPs to VPN concentrators.
+	// eth3: VPN-subnet ENI forwards customer global IPs via L2 to concentrators.
+	// eth1 (VRRP heartbeat) and eth2 (BGP ENI) are fine with src/dest check on.
 	let creds = fetch_imds_credentials().await?;
+	println!("  Disabling src/dest check on {} (eth0) ...", eth0.eni_id);
 	disable_src_dest_check(&cli.region, &creds, &eth0.eni_id).await?;
-	println!("  ✓ Source/dest check disabled on {}", eth0.eni_id);
+	println!("  Source/dest check disabled on {}", eth0.eni_id);
+
+	// eth3 may not be present in debug/minimal boot -- non-fatal.
+	if let Some((_, eth3)) = ifaces.iter().find(|(dev, _)| *dev == 3) {
+		println!("  Disabling src/dest check on {} (eth3) ...", eth3.eni_id);
+		match disable_src_dest_check(&cli.region, &creds, &eth3.eni_id).await {
+			Ok(()) => println!("  Source/dest check disabled on {} (eth3)", eth3.eni_id),
+			Err(e)  => eprintln!("  warning: src/dest check on eth3 failed: {e}"),
+		}
+	} else {
+		println!("  eth3 not present -- src/dest check disable skipped");
+	}
 
 	// 5. Build state and write to disk
 	let state = State {
