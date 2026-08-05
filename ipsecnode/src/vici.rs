@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{TryStreamExt, pin_mut};
+use redis;
 use serde::{Deserialize, Serialize};
 use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use tracing::{debug, error, info, warn};
@@ -378,23 +379,42 @@ pub struct ChildUpdownEvent {
 //
 // Enable trace logging with: RUST_LOG=ipsecnode=trace
 
-/// Long-running task: subscribes to child-updown events and logs them.
+/// Long-running task: subscribes to child-updown events, manages FRR /32
+/// blackhole routes (Increment 6c) and VPP NAT/routing (Increment 6d).
 ///
 /// `_keep_alive` is the VICI event Client.  It MUST be kept in scope here --
 /// dropping it aborts the internal Listener task and the stream ends.
-///
-/// Increment 6c will add FRR route management calls here.
 pub async fn event_listener_task(
-	_keep_alive: Client,
-	stream:      impl futures_util::Stream<Item = Result<ViciRawValue, rsvici::Error>>,
+	_keep_alive:   Client,
+	stream:        impl futures_util::Stream<Item = Result<ViciRawValue, rsvici::Error>>,
+	valkey_client: redis::Client,
+	vpp_taps:      Option<crate::vpp::VppTaps>,
 ) {
+	// One multiplexed Valkey connection shared for all NAT record lookups.
+	let mut valkey_conn = match valkey_client.get_multiplexed_async_connection().await {
+		Ok(c)  => c,
+		Err(e) => {
+			error!("event_listener_task: Valkey connect failed: {e} -- exiting");
+			return;
+		}
+	};
+
+	let mut route_cache = crate::nat::RouteCache::new();
+	let mut vpp_cache   = crate::vpp::VppCache::new();
+
 	pin_mut!(stream);
 
 	loop {
 		match stream.try_next().await {
 			Ok(Some(raw)) => {
 				tracing::trace!(payload = %raw, "VICI child-updown raw");
-				handle_child_updown(raw);
+				handle_child_updown(
+					raw,
+					&mut valkey_conn,
+					&mut route_cache,
+					vpp_taps.as_ref(),
+					&mut vpp_cache,
+				).await;
 			}
 			Ok(None) => {
 				warn!("VICI child-updown stream ended (charon closed the connection?)");
@@ -426,7 +446,13 @@ fn find_child_sa(ike: &ViciRawValue) -> Option<&ViciRawValue> {
 	}
 }
 
-fn handle_child_updown(raw: ViciRawValue) {
+async fn handle_child_updown(
+	raw:         ViciRawValue,
+	conn:        &mut redis::aio::MultiplexedConnection,
+	route_cache: &mut crate::nat::RouteCache,
+	vpp_taps:    Option<&crate::vpp::VppTaps>,
+	vpp_cache:   &mut crate::vpp::VppCache,
+) {
 	// "up" is at the top level; absent on DOWN events.
 	let up = raw.get("up")
 		.and_then(|v| v.as_str())
@@ -474,8 +500,22 @@ fn handle_child_updown(raw: ViciRawValue) {
 		"CHILD_SA {direction}"
 	);
 
-	// Increment 6c: on UP, call FRR to advertise /32 for mapped_global_ip.
-	// Increment 6d: on UP, configure VPP VRF + NAT entry.
+	// Increment 6c: /32 blackhole route (FRR BGP signal).
+	// Increment 6d: VPP NAT mappings + routing.
+	if up {
+		crate::nat::on_child_up(conn, peer_ip, route_cache).await;
+		if let Some(taps) = vpp_taps {
+			crate::vpp::on_child_up(conn, peer_ip, taps, vpp_cache).await;
+		}
+	} else {
+		if let Some(taps) = vpp_taps {
+			crate::vpp::on_child_down(peer_ip, taps, vpp_cache).await;
+		}
+		crate::nat::on_child_down(peer_ip, route_cache).await;
+	}
+
+	// Increment 6e: ASG lifecycle hook heartbeat.
+	// Increment 6f: Valkey half-open IKE SA state.
 }
 
 // ── Connection management (load-conn / unload-conn) ───────────────────────────

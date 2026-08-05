@@ -20,8 +20,10 @@ mod aws;
 mod config;
 mod credentials;
 mod health;
+mod nat;
 mod proposals;
 mod vici;
+mod vpp;
 
 use config::Args;
 
@@ -44,10 +46,10 @@ async fn main() -> Result<()> {
 		ca_cert_dir     = %args.ca_cert_dir,
 		health_port     = args.health_port,
 		region          = %args.region,
-		"ipsecnode starting (Increment 6a+6b)"
+		"ipsecnode starting (Increment 6d)"
 	);
 
-	// ── Step 1: Disable src/dest check on eth0 ───────────────────────────────
+	// -- Step 1: Disable src/dest check on eth0 -----------------------------
 	// Must happen before traffic flows. Hard timeout of 5 s so a slow or
 	// unreachable IMDS endpoint does not hold up the rest of startup.
 	info!("disabling src/dest check on eth0 via EC2 API ...");
@@ -62,13 +64,30 @@ async fn main() -> Result<()> {
 		Err(_timeout) => warn!("src/dest check disable timed out after 5 s (continuing)"),
 	}
 
-	// ── Step 2: Connect to VICI (command connection) ─────────────────────────
+	// -- Step 2: Initialise VPP data plane ----------------------------------
+	// Creates tap interfaces, enables NAT44, sets VPP default route.
+	// If VPP is not running, continues in degraded mode (no data plane).
+	info!("initialising VPP data plane ...");
+	let vpp_taps = match vpp::init().await {
+		Ok(taps) => taps,
+		Err(e)   => {
+			warn!("VPP init error: {e:#} -- continuing without VPP data plane");
+			None
+		}
+	};
+	if vpp_taps.is_some() {
+		info!("VPP data plane ready");
+	} else {
+		warn!("VPP data plane unavailable -- 6d NAT/routing will be skipped");
+	}
+
+	// -- Step 3: Connect to VICI (command connection) -----------------------
 	info!(socket = %args.vici_socket, "connecting to VICI (command connection) ...");
 	let mut cmd_client = vici::connect_with_retry(&args.vici_socket, 30).await
 		.context("Could not connect to VICI socket after retries")?;
 	info!("VICI command connection established");
 
-	// ── Step 3: Bulk-load PSKs from Valkey via VICI load-shared ──────────────
+	// -- Step 4: Bulk-load PSKs from Valkey via VICI load-shared ------------
 	info!(url = %args.valkey_url, "connecting to Valkey for bulk PSK load ...");
 	let valkey_client =
 		aerocore::redis_pool::build_redis_client(&args.valkey_url, true, false, &None)
@@ -86,30 +105,34 @@ async fn main() -> Result<()> {
 		.context("Bulk PSK load from Valkey failed")?;
 	info!(count = loaded, "PSKs loaded into charon via VICI");
 
-	// ── Step 4: Load CA certificates ─────────────────────────────────────────
+	// -- Step 5: Load CA certificates ----------------------------------------
 	let ca_count = vici::load_ca_certs(&mut cmd_client, &args.ca_cert_dir).await
 		.context("CA certificate loading failed")?;
 	info!(count = ca_count, dir = %args.ca_cert_dir, "CA certificates loaded");
 
-	// ── Step 5: Connect to VICI (event connection) ───────────────────────────
+	// -- Step 6: Connect to VICI (event connection) -------------------------
 	info!(socket = %args.vici_socket, "connecting to VICI (event connection) ...");
 	let mut evt_client = vici::connect_with_retry(&args.vici_socket, 30).await
 		.context("Could not connect to VICI event socket after retries")?;
 	let child_updown_stream = evt_client.subscribe::<vici::ViciRawValue>("child-updown");
 	info!("subscribed to VICI child-updown events");
 
-	// ── Step 6: Connect to Valkey pubsub (separate connection required) ───────
+	// -- Step 7: Connect to Valkey pubsub (separate connection required) ----
 	info!("opening Valkey pubsub connection ...");
 	let valkey_pubsub =
 		valkey_client.get_async_pubsub().await
 			.context("Failed to open Valkey pubsub connection")?;
 
-	// ── Step 7: Spawn background tasks ───────────────────────────────────────
+	// -- Step 8: Spawn background tasks -------------------------------------
 
 	// child-updown event listener (keeps evt_client alive as _keep_alive).
+	// valkey_client is cloned so the event task has its own handle for NAT
+	// record lookups (Increment 6c) without contending with the pubsub task.
 	let event_handle = tokio::spawn(vici::event_listener_task(
 		evt_client,
 		child_updown_stream,
+		valkey_client.clone(),
+		vpp_taps,
 	));
 
 	// Valkey pubsub listener drives incremental VICI credential updates.

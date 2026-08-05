@@ -8,17 +8,27 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-04):** T2 -- xfrm data path test passing.
+**Last completed session (2026-08-05):** Increment 6d -- VPP NAT44 SNAT confirmed working. **Test passed.**
 
 ### What the next session should do
 
-**Immediate next step: Build Order step 5** -- VPP `startup.conf` baked into
-the fleetnode AMI. A new AMI rebuild is required (see below for what changed).
+**Immediate next step:** Build Order step 7 -- `aerobake/fleetroute/` Return GW AMI
+(Alpine). This completes the return path: FRR BGP /32 routes propagate to the
+Return GW, which routes backend replies back to the correct VPN node for
+reverse DNAT. After Return GW is built, rebuild the fleetnode AMI with the
+final ipsecnode binary and run T3 + T4.
 
-After step 5:
-1. **ipsecnode Increment 6c** -- FRR /32 route management on CHILD_SA up/down.
-2. **ipsecnode Increment 6d** -- VPP VRF + per-device SNAT/DNAT.
-3. **Build Order step 7** -- `aerobake/fleetroute/` Return GW AMI (Alpine).
+Operational notes learned during 6d testing:
+- `swanctl --load-conns` removes VICI-loaded per-site connections. Any swanctl
+  file change on the VPN node must be followed by `systemctl restart ipsecnode`.
+- VPP can accumulate stale tap interfaces across ipsecnode restarts; the
+  cleanup_stale_state() function handles this, but deleting many stale taps at
+  once can crash VPP. In production (AMI boot) VPP starts fresh, so this is
+  only a development/testing concern.
+- VPP's 0.0.0.0/0 default route must be added BEFORE `nat44 plugin enable`;
+  adding it after causes the NAT plugin to add a second ECMP path.
+- Manual VPP ip routes for internal_ip must NOT be added; VPP NAT manages
+  these FIB entries automatically and adding them creates ECMP.
 
 ### What changed in the last session (key facts for code work)
 
@@ -894,7 +904,12 @@ net.core.wmem_max                = 134217728
    172.16.51.4 and 172.16.51.36. EXPORT-CUSTOMER route-map enforces /32-only
    export. FRR still DISABLED in AMI -- enable at T3 (after Return GW built).
    Rebuild AMI, run `update_lt_vpn_ami.sh`, then `cycle_vpn_instance.sh`.
-5. **`aerobake/fleetnode/` -- VPP** -- startup.conf in AMI.  **TODO NEXT.**
+5. **`aerobake/fleetnode/` -- VPP** -- startup.conf in AMI.  **COMPLETE (step 5).**
+   Two new files: `_etc_vpp_startup.conf` (DPDK disabled, af_packet mode,
+   hugepages via sysctl) and `_etc_vpp_setup.gate` (empty CLI startup).
+   VPP is ENABLED (was masked); `ipsecnode.service` now orders after `vpp.service`.
+   `vm.nr_hugepages = 1024` added to `_etc_sysctl.d_50-fleetnode.conf`.
+   **AMI rebuild required** -- see "Next Session Starting Point".
 6. **`ipsecnode` Increment 6a+6b** -- COMPLETE (2026-08-04). VICI connection,
    `child-updown` event loop, bulk PSK + per-site `load-conn` from Valkey,
    Valkey keyspace pubsub, CA cert loading, src/dest check disable, health :9101.
@@ -903,8 +918,28 @@ net.core.wmem_max                = 134217728
    `local_ts` + `remote_ts` both configurable per site. `mapped_global_ip`
    removed from `SiteRecord` (kept as `Option` for backward compat).
    T1 tested and passing on freshly baked AMI.
-   - 6c: FRR /32 route management (stub in `vici.rs::handle_child_updown`)
-   - 6d: VPP VRF + per-device SNAT/DNAT
+   - 6c: FRR /32 route management -- **COMPLETE**. `nat.rs` module with
+     `NatRecord`/`DeviceNatEntry`/`BackendNatEntry` types. `on_child_up` adds
+     `ip route replace blackhole <global_ip>/32` and caches per-peer state
+     with a refcount for re-keying safety. `on_child_down` removes routes when
+     the last CHILD_SA for a peer goes down. `event_listener_task` now accepts
+     `redis::Client` for NAT record lookups.
+     **Test passed (2026-08-04):** `fleetipsec:nat:62.238.96.148` seeded with
+     `198.51.100.133` for helena1. `blackhole 198.51.100.133` appeared in
+     `ip route show` on CHILD_SA UP and disappeared on DOWN.
+   - 6d: VPP tap interface + NAT44 data plane -- **COMPLETE**.
+     New `vpp.rs` module. `vpp::init()` at startup: creates `vpp-inner`/`vpp-outer`
+     tap interfaces (IPs 10.255.0.1/30 and 10.255.0.5/30), enables NAT44,
+     sets inside/outside, adds VPP default route via outer tap, adds Linux
+     table-200 default route to vpp-inner.
+     On CHILD_SA UP: VPP static NAT mapping + VPP return-path route +
+     Linux policy rule (`ip rule from <internal_ip>/32 lookup 200`) +
+     upgrades global_ip route from blackhole to `dev vpp-outer`.
+     On CHILD_SA DOWN: reverses all of the above.
+     VPP unavailability is non-fatal (degraded mode, no data plane).
+     `nat.rs route_del` no longer specifies `blackhole` type (works for both
+     blackhole and dev routes).
+     **Awaiting test** -- see "Next Session Starting Point" above.
    - 6e: ASG lifecycle hook heartbeat
    - 6f: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived.
