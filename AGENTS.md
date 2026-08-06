@@ -22,26 +22,35 @@ AWS services via VPC endpoints; global IP traffic via BGP automatically.
 
 ### What the next session should do
 
-**T4 is COMPLETE. Both AMI source fixes are committed. Rebuild both AMIs before
-the next instance cycle.**
+**T4 is COMPLETE. AMI source fixes committed. Rebuild both AMIs when instance
+cycle is next needed (see Rebuild Sequence below).**
 
-fleetnode rebuild needed (FRR enable fix):
-```bash
-cd aerobake/fleetnode && packer build fleetnode.pkr.hcl
-```
-Update `fleetipsec-lt-vpn` and cycle the VPN concentrator instance.
+**Current priority: Increment 6e -- per-customer VRF isolation in vpp.rs.**
+This is a correctness blocker: the current global VPP NAT table silently breaks
+when two customers share the same device internal_ip (e.g. 192.168.1.10).
+The fix uses XFRM interfaces (one per site, created at VICI load-conn time)
+and per-site VPP fib tables (created on CHILD_SA UP). See Architecture
+Decision #15 for the full design.
 
-fleetroute rebuild needed (rp_filter default fix):
-```bash
-cd aerobake/fleetroute && packer build fleetroute.pkr.hcl
-```
-Update LT and cycle both Return GW instances.
+Files to change (in order):
+1. `ipsecnode/src/vici.rs`  -- add `if_id_in`, `if_id_out`, `mark_out` to
+   `ChildConnConfig` and `load_conn()` signature.
+2. `ipsecnode/src/vpp.rs`   -- major refactor: per-site VRFs, VrfAllocator,
+   nftables mangle map for return-path marking.
+3. `ipsecnode/src/credentials.rs` -- create/delete XFRM interface around
+   VICI load-conn/unload-conn.
+4. `ipsecnode/src/main.rs`  -- update `VppTaps` -> `VppState` type.
 
-**Open topic (not blocking further testing):** Initiating tunnels from the AWS
-side toward customer CPEs -- needed for the fleetshell use case where internal
-users drive the connection. Architecture not yet designed.
+After 6e: implement backend DNAT (Increment 6g) using nftables PREROUTING
+map (see Architecture Decision #16 -- Step 1 manually tested and confirmed).
 
-**Next development work:** ipsecscale (Build Order step 8) -- LVS autoscaling daemon.
+**Open topic (not blocking 6e/6g):** Initiating tunnels from the AWS side
+toward customer CPEs. Architecture Decision #17 documents the design approach
+(`start_action = trap` + `inactivity` timeout). Implement after routing design
+for backend-to-device traffic is resolved.
+
+**After ipsecnode increments:** ipsecscale (Build Order step 8) -- see the
+ipsecscale section for concrete sizing and scale-out criteria.
 
 ----------------------------------------------------------------------
 REBUILD SEQUENCE  <<<  DO THIS FIRST
@@ -844,6 +853,164 @@ at PREROUTING before the fix, flowed to FORWARD oif=eth3 after.
 
 ---
 
+### 15. Per-customer VRF isolation on VPN concentrators (Increment 6e)
+
+**Problem:** The global VPP NAT table uses `internal_ip` as the key for
+`nat44 add static mapping local <internal_ip> external <global_ip>`. With
+180,000 medical devices behind 25,000 tunnels, hundreds of customers share
+common internal IPs (e.g. 192.168.1.10). The second customer to connect
+silently overwrites the first customer's NAT mapping. The `ip rule from
+<internal_ip>/32 lookup 200` and `ip route replace <internal_ip>/32 dev
+vpp-outer` entries are also in a single global namespace.
+
+**Solution: XFRM interfaces + per-site VPP fib tables + per-site tap pairs.**
+
+**XFRM interface per site (created at VICI load-conn time):**
+- `ip link add xfrm-{hex} type xfrm dev ens5 if_id {if_id}`
+- `if_id` = `u32::from(peer_ip.parse::<Ipv4Addr>())` -- derived from the
+  customer gateway public IP, which is globally unique. No allocator needed.
+  Name example: `xfrm-3eee6094` for 62.238.96.148.
+- StrongSwan VICI `load-conn` includes `if_id_in = if_id`, `if_id_out = if_id`,
+  `mark_out = if_id` in the child SA config.
+- Inbound (decapsulate): StrongSwan installs XFRM state with `if_id`; all
+  decapsulated packets from that tunnel appear arriving on `xfrm-{hex}`.
+- Outbound (encapsulate): traffic routed to `xfrm-{hex}` is encrypted by
+  the XFRM state with matching `if_id`.
+- Lifecycle: created in `credentials::load_one_device`, deleted in
+  `credentials::unload_one_device`.
+
+**Per-site VPP VRF + tap (created on CHILD_SA UP, destroyed on DOWN):**
+- `vrf_id = if_id` (same value, u32 from peer IPv4 address). VPP accepts any
+  u32 as a fib table ID; public IPs are all > 16M so no conflict with reserved
+  Linux tables (0-255).
+- VPP commands: `ip table add {vrf_id}`, `create tap host-if-name vpp-{hex}`,
+  `set interface ip table <vpp_tap> {vrf_id}`, `set interface ip address
+  <vpp_tap> {tap_vpp_ip}/30`, `set interface state <vpp_tap> up`.
+- Kernel: `ip addr add {tap_kern_ip}/30 dev vpp-{hex}`, `ip link set vpp-{hex} up`.
+- NAT: `nat44 add static mapping local {internal_ip} external {global_ip} vrf
+  {vrf_id}` -- per-site VRF isolates NAT tables; same internal_ip in two
+  different VRFs coexist without conflict.
+- `set interface nat44 in <per_site_tap> out vpp-outer` -- the shared outside
+  interface (vpp-outer) handles all post-SNAT traffic regardless of VRF.
+
+**Forward routing (inside -> VPP, per-site):**
+- `ip rule add iif xfrm-{hex} prio 100 lookup {fwd_table}` (allocated
+  10000+ by task-local VrfAllocator in event_listener_task).
+- `ip route add default via {tap_vpp_ip} dev vpp-{hex} table {fwd_table}`.
+
+**Return routing (VPP -> XFRM encrypt, per-site):**
+- nftables mangle map `ipsecnode/vpp_mark { type iface_index : mark }` with
+  rule `iif @vpp_taps meta mark set iif map @vpp_mark`. Added in `vpp::init()`.
+  On CHILD_SA UP: add `{ifindex} : {if_id}` to both the set and map via
+  `nft add element`. On DOWN: remove.
+- `ip rule add iif vpp-{hex} prio 200 lookup 9999`.
+- Shared table 9999 (created once): `ip route add default dev ens5 table 9999`.
+- StrongSwan `mark_out = if_id` means the XFRM output policy for this CHILD_SA
+  requires the packet mark to equal `if_id`. The nftables mangle sets this mark
+  on packets arriving from vpp-{hex}, so the correct tunnel is selected even
+  when two customers have the same `internal_ip`.
+
+**Tap IP allocation:**
+- `VrfAllocator` is task-local in `event_listener_task` (no shared state).
+- Allocates: `fwd_table` from range 10000+, `ret_table` 60000+,
+  `tap_subnet_idx` 0+ -> /30 from 10.127.0.0/16.
+- Subnet n: VPP IP = 10.127.{n>>6}.{(n&63)*4+1}/30,
+             kernel IP = 10.127.{n>>6}.{(n&63)*4+2}/30.
+- IDs freed to a Vec freelist on CHILD_SA DOWN for reuse.
+
+**Production capacity per c6in.4xlarge node:**
+- Max concurrent sites: ~5,000 (memory bound: ~6-12 GB for taps + VRFs).
+- NAT sessions: `nat44 plugin enable sessions 500000` (raise from 65536).
+- Hugepages: `vm.nr_hugepages = 8192` = 16 GB (raise from 1024).
+- Concentrators needed for 25,000 tunnels: 5 nodes (5 x 5,000).
+
+---
+
+### 16. Backend DNAT -- nftables PREROUTING with globally unique customer_view_ip
+
+**Problem:** Customers may have devices configured to connect to a virtual IP
+(e.g. `194.138.39.18`) that is NOT the real backend address in the VPC. The
+`backend_nat` field in `NatRecord` (already deserialized) maps these virtual
+IPs to real VPC IPs.
+
+**Decision:** Handle `backend_nat` translations in the Linux kernel using
+nftables PREROUTING DNAT, NOT inside VPP. VPP NAT44 static mappings only
+translate source on inside->outside (SNAT) -- there is no standard mechanism
+for destination NAT on the inside interface.
+
+**How it works:**
+- Forward: decapsulated packet arrives on ens5 with `dst=customer_view_ip`.
+  nftables PREROUTING DNAT: `dst=customer_view_ip -> real_ip`. Conntrack
+  tracks the connection.
+- The packet then goes through VPP via vpp-{hex} (per-site tap). VPP applies
+  device SNAT: `src=internal_ip -> global_ip`. Backend sees:
+  `src=global_ip, dst=real_ip`.
+- Return: backend replies `src=real_ip, dst=global_ip`. VPP reverses SNAT:
+  `dst=global_ip -> internal_ip`. Kernel receives `src=real_ip, dst=internal_ip`
+  on vpp-{hex}. Conntrack matches REPLY direction and applies reverse SNAT:
+  `src=real_ip -> customer_view_ip` in POSTROUTING -- which fires BEFORE
+  xfrm4_output_finish() encrypts the inner packet. Customer sees correct
+  `src=customer_view_ip` inside the tunnel.
+
+**Implementation in ipsecnode (Increment 6f):**
+- `vpp::init()`: create nftables nat table `ipsecnode_bnat` with named map
+  `bnat_map { type ipv4_addr : ipv4_addr }`, PREROUTING chain with rule
+  `iifname ens5 dnat ip to ip daddr map @bnat_map`, and empty POSTROUTING
+  chain (registers conntrack hook).
+- On CHILD_SA UP: for each `backend_nat` entry, `nft add element ip
+  ipsecnode_bnat bnat_map { customer_view_ip : real_ip }`.
+- On CHILD_SA DOWN: `nft delete element ...`.
+
+**Constraint:** `customer_view_ip` MUST be globally unique across all customers
+on the same concentrator. Operators allocate `customer_view_ip` values from a
+dedicated range (e.g. 194.138.39.0/24) with the same discipline as `global_ip`.
+RFC 1918 overlapping `customer_view_ip` values across customers require VPP VRF
+support (future increment; not currently implemented).
+
+**Step 1 (manual test) PASSED:** nftables DNAT rule installed manually on
+concentrator; helena1 curled 194.138.39.18, which was DNAT'd to 172.16.53.6.
+Conntrack correctly reversed the SNAT on the return path.
+
+---
+
+### 17. On-demand tunnels -- start_action=trap + inactivity teardown
+
+**Goal:** Tunnels should not be permanently maintained. When a device (or a
+backend server on the AWS side) generates traffic, the tunnel is established
+on-demand. When idle, the tunnel tears down and concentrator resources are freed.
+This enables natural scale-in on concentrators.
+
+**Mechanism:**
+- `start_action = "trap"` (instead of `"none"`) in the VICI child SA config.
+  StrongSwan installs XFRM trap policies. When the first packet matching the
+  traffic selector arrives on EITHER side, StrongSwan auto-initiates IKE.
+- `inactivity = 300` (seconds) in the child SA config. StrongSwan tears down
+  a CHILD_SA that has carried no traffic for 5 minutes.
+- `dpd_action = "restart"` (already set) re-establishes a dropped tunnel if
+  the remote side is still reachable (DPD probe succeeds).
+
+**Effect on ipsecnode:**
+- VPP VRFs are already created on CHILD_SA UP and destroyed on DOWN -- the
+  VRF design (Architecture Decision #15) is fully compatible with on-demand
+  tunnels. No additional changes needed in vpp.rs.
+- `start_action` and `inactivity` are per-site parameters added to
+  `SiteRecord` (optional, with defaults matching current behaviour).
+
+**Constraint for AWS-initiated tunnels:**
+- For the trap policy to be specific enough (so concentrator initiates toward
+  the RIGHT customer when backend traffic arrives), `local_ts` must NOT be
+  `0.0.0.0/0`. It must include the device's `global_ip` range so the trap
+  policy matches that customer only.
+- `static_ip = true` required; dynamic-IP (CGNAT) devices cannot be dialled
+  into from the AWS side.
+- The routing path (backend subnet -> concentrator -> customer) needs design
+  before this is testable. Deferred; see open topics.
+
+**Status:** Design documented. Implementation deferred until AWS-initiated
+tunnel routing design is complete.
+
+---
+
 ## Binaries
 
 ### Shared from aerosuite -- via git submodule at `vendor/aerosuite`
@@ -938,8 +1105,44 @@ Long-running daemon on both LVS nodes. Reads `/run/ipsec-role` each cycle;
 only the master acts. Responsibilities: backend pool management, ASG scaling
 decisions, rtb-vpn maintenance, Valkey coordination (`fleetipsec:scale:`).
 
-See the original design notes below for the scale-out sequence and rehashing
-behaviour. Not yet implemented.
+**Sizing (25,000 tunnels, 180,000 devices, c6in.4xlarge):**
+
+| Metric | Per-node limit | Production target |
+|---|---|---|
+| Active tunnels | 5,000-8,000 | 5,000 |
+| Devices | ~36,000 | 5,000 tunnels x 7.2 avg |
+| NAT sessions | 500,000 (configurable) | set at VPP startup |
+| Throughput | ~15 Gbps usable | ~360 Mbps at 180k x 10 kbps avg |
+| Hugepages | 8,192 (16 GB) | production sysctl |
+| Nodes steady state | 5 | 25,000 / 5,000 |
+| ASG max | 10 | handles reconnect bursts |
+
+**Scale-out criteria (add a node):**
+- `avg_tunnels_per_node > 4,000` (80% of 5,000 target), OR
+- `any_node_tunnels > 6,000`.
+
+**Scale-in criteria (remove a node):**
+- `avg_tunnels_per_node < 1,500` AND `desired_count > 2` (HA minimum).
+
+**Scale-out sequence:**
+1. `SetDesiredCapacity(N+1)` on ASG.
+2. Wait for new node's `:9101/health` to return OK.
+3. Rewrite LVS nftables DNAT pool: `jhash(src_ip) % (N+1)`. New connections
+   land on the new node; existing tunnels stay on their current nodes.
+
+**Scale-in sequence:**
+1. Pick the lowest-tunnel node; remove from LVS pool (`jhash % (N-1)`).
+2. Wait up to 300 s for tunnels to drain (DPD reconnect moves devices to
+   surviving nodes naturally).
+3. `CompleteLifecycleAction(CONTINUE)` -- ASG terminates the instance.
+
+**Rehashing note:** `jhash(src_ip) % N` reassigns approximately `1/N` of
+source IPs when N changes. Existing CHILD_SAs remain alive on their current
+nodes until the next DPD failure or rekey. No forced teardown is needed.
+
+**ipsecscale polls** each VPN node's `:9101/metrics` (or `/health`) for
+tunnel count. The primary signal is active CHILD_SA count, not CPU or
+throughput. Not yet implemented.
 
 ### `ipsecnode` -- per-node tunnel lifecycle daemon (VPN nodes) -- STUB
 
@@ -1151,10 +1354,39 @@ net.core.wmem_max                = 134217728
      `nat.rs route_del` no longer specifies `blackhole` type (works for both
      blackhole and dev routes).
      **T4 PASSED (2026-08-06).** See T4 section and Next Session Starting Point.
-   - 6e: ASG lifecycle hook heartbeat
-   - 6f: Valkey half-open IKE SA state
+     **KNOWN ISSUE:** global VPP NAT table breaks when two customers share the
+     same device internal_ip. Fixed in Increment 6e.
+   - 6e: Per-customer VRF isolation -- **IN PROGRESS**.
+     Replaces global vpp-inner + table-200 with per-site XFRM interfaces,
+     per-site VPP fib tables, and per-site tap pairs. See Architecture
+     Decision #15 for full design. Key constants:
+       - Physical NIC: `ens5` (Nitro naming, Debian Bookworm AMI)
+       - XFRM interface name: `xfrm-{peer_ip_hex8}` (e.g. xfrm-3eee6094)
+       - Per-site tap kernel name: `vpp-{peer_ip_hex8}` (e.g. vpp-3eee6094)
+       - if_id = u32::from(peer_ip as Ipv4Addr) (unique, no allocator needed)
+       - Forward routing table: allocated 10000+ (VrfAllocator, task-local)
+       - Return routing table: allocated 60000+ (VrfAllocator, task-local)
+       - Tap /30 subnet: allocated from 10.127.0.0/16 (VrfAllocator)
+       - Shared return table 9999: `default dev ens5`
+       - nftables mangle map `ipsecnode/vpp_mark`: ifindex -> mark (if_id)
+     Production sysctl values (raise from dev defaults):
+       - `nat44 plugin enable sessions 500000` (was 65536 -- too low)
+       - `vm.nr_hugepages = 8192` (was 1024 = 2 GB; per-site taps need ~16 GB)
+   - 6f: Backend DNAT via nftables PREROUTING -- see Architecture Decision #16.
+     Tested manually (Step 1 PASSED). Implement in ipsecnode after 6e.
+   - 6g: ASG lifecycle hook heartbeat
+   - 6h: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
-8. **`ipsecscale`** -- LVS autoscaling daemon.
+8. **`ipsecscale`** -- LVS autoscaling daemon. See ipsecscale section for
+   concrete sizing and scale-out criteria.
+   - 25,000 tunnels across 5 x c6in.4xlarge concentrators (5,000/node).
+   - Scale-out trigger: avg tunnels/node > 4,000 OR any node > 6,000.
+   - Scale-in trigger: avg tunnels/node < 1,500 AND desired > 2.
+   - Scale-out: ASG SetDesiredCapacity(N+1), wait for :9101 health OK,
+     add to LVS nftables pool (jhash % N+1).
+   - Scale-in: remove from LVS pool, wait 300 s drain, CompleteLifecycleAction.
+   - Rehashing: jhash(src_ip) % N shifts ~1/N of source IPs on resize;
+     existing tunnels reconnect naturally via DPD.
 
 ---
 
