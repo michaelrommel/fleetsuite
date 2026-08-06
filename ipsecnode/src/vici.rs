@@ -388,7 +388,7 @@ pub async fn event_listener_task(
 	_keep_alive:   Client,
 	stream:        impl futures_util::Stream<Item = Result<ViciRawValue, rsvici::Error>>,
 	valkey_client: redis::Client,
-	vpp_taps:      Option<crate::vpp::VppTaps>,
+	vpp_state:     Option<crate::vpp::VppState>,
 ) {
 	// One multiplexed Valkey connection shared for all NAT record lookups.
 	let mut valkey_conn = match valkey_client.get_multiplexed_async_connection().await {
@@ -400,7 +400,8 @@ pub async fn event_listener_task(
 	};
 
 	let mut route_cache = crate::nat::RouteCache::new();
-	let mut vpp_cache   = crate::vpp::VppCache::new();
+	let mut vpp_cache   = crate::vpp::VrfCache::new();
+	let mut vrf_alloc   = crate::vpp::VrfAllocator::new();
 
 	pin_mut!(stream);
 
@@ -412,8 +413,9 @@ pub async fn event_listener_task(
 					raw,
 					&mut valkey_conn,
 					&mut route_cache,
-					vpp_taps.as_ref(),
+					vpp_state.as_ref(),
 					&mut vpp_cache,
+					&mut vrf_alloc,
 				).await;
 			}
 			Ok(None) => {
@@ -450,8 +452,9 @@ async fn handle_child_updown(
 	raw:         ViciRawValue,
 	conn:        &mut redis::aio::MultiplexedConnection,
 	route_cache: &mut crate::nat::RouteCache,
-	vpp_taps:    Option<&crate::vpp::VppTaps>,
-	vpp_cache:   &mut crate::vpp::VppCache,
+	vpp_state:   Option<&crate::vpp::VppState>,
+	vrf_cache:   &mut crate::vpp::VrfCache,
+	vrf_alloc:   &mut crate::vpp::VrfAllocator,
 ) {
 	// "up" is at the top level; absent on DOWN events.
 	let up = raw.get("up")
@@ -501,15 +504,15 @@ async fn handle_child_updown(
 	);
 
 	// Increment 6c: /32 blackhole route (FRR BGP signal).
-	// Increment 6d: VPP NAT mappings + routing.
+	// Increment 6e: per-customer VRF + VPP NAT (replaces 6d global table).
 	if up {
 		crate::nat::on_child_up(conn, peer_ip, route_cache).await;
-		if let Some(taps) = vpp_taps {
-			crate::vpp::on_child_up(conn, peer_ip, taps, vpp_cache).await;
+		if let Some(state) = vpp_state {
+			crate::vpp::on_child_up(conn, peer_ip, state, vrf_cache, vrf_alloc).await;
 		}
 	} else {
-		if let Some(taps) = vpp_taps {
-			crate::vpp::on_child_down(peer_ip, taps, vpp_cache).await;
+		if let Some(state) = vpp_state {
+			crate::vpp::on_child_down(peer_ip, state, vrf_cache, vrf_alloc).await;
 		}
 		crate::nat::on_child_down(peer_ip, route_cache).await;
 	}
@@ -567,6 +570,19 @@ struct ChildConnConfig {
 	mode:          &'static str,
 	/// Restart the CHILD SA if DPD detects the peer is gone.
 	dpd_action:    &'static str,
+	/// XFRM interface ID for inbound SA (Architecture Decision #15).
+	/// Decapsulated packets appear on the xfrm-{hex} kernel interface.
+	/// Absent (None) = no XFRM interface binding (dev/test only).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	if_id_in:  Option<u32>,
+	/// XFRM interface ID for outbound SA.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	if_id_out: Option<u32>,
+	/// Mark required on outbound packets for XFRM policy selection.
+	/// Set by nftables mangle on vpp-{hex} input; disambiguates tunnels
+	/// whose customers share the same internal_ip.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	mark_out:  Option<u32>,
 }
 
 /// IKE SA configuration for one per-device connection.
@@ -603,6 +619,10 @@ struct IkeConnConfig {
 /// `remote_ts`     -- customer subnets; defaults to ["0.0.0.0/0"]
 /// `local_ts`      -- VPN-node-side selectors: customer's view of our backends
 ///                    or ["0.0.0.0/0"] when not customised
+/// `if_id`         -- optional XFRM interface ID (u32 from peer IPv4 address).
+///                    When Some, sets if_id_in, if_id_out, and mark_out on the
+///                    child SA for per-customer VRF isolation (AD #15).
+///                    None = legacy global-table mode (dev/test only).
 #[allow(clippy::too_many_arguments)]
 pub async fn load_conn(
 	client:          &mut Client,
@@ -615,6 +635,7 @@ pub async fn load_conn(
 	esp_proposals:   Vec<String>,
 	remote_ts:       Vec<String>,
 	local_ts:        Vec<String>,
+	if_id:           Option<u32>,
 ) -> Result<()> {
 	let remote_addrs = if static_ip {
 		vec![device_ip.to_string()]
@@ -633,6 +654,9 @@ pub async fn load_conn(
 		start_action:  "none",
 		mode:          "tunnel",
 		dpd_action:    "restart",
+		if_id_in:  if_id,
+		if_id_out: if_id,
+		mark_out:  if_id,
 	};
 
 	let mut children = HashMap::new();
