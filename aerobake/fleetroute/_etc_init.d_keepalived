@@ -108,6 +108,13 @@ start_pre() {
 	ip addr add "$ETH1_IP/$ETH1_PREFIX" dev eth1
 	einfo "eth1 up: $ETH1_IP/$ETH1_PREFIX"
 
+	# Compute eth1 gateway (VPC router = subnet base address + 1).
+	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
+	ETH1_NET="${ETH1_CIDR%/*}"
+	ETH1_LAST="${ETH1_NET##*.}"
+	ETH1_BASE="${ETH1_NET%.*}"
+	ETH1_GW="${ETH1_BASE}.$((ETH1_LAST + 1))"
+
 	# Policy routing table 201: all traffic sourced from ETH1_IP egresses eth1.
 	# Without this, SSH reply packets (src=172.16.51.68) would exit via eth0
 	# and be dropped by AWS SourceDestCheck (source does not match eth0's IP).
@@ -117,11 +124,6 @@ start_pre() {
 	einfo "Policy routing 201: from ${ETH1_IP}/32 via $ETH1_GW dev eth1 onlink"
 
 	# Add explicit route to peer's management /28 via eth1 gateway.
-	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
-	ETH1_NET="${ETH1_CIDR%/*}"
-	ETH1_LAST="${ETH1_NET##*.}"
-	ETH1_BASE="${ETH1_NET%.*}"
-	ETH1_GW="${ETH1_BASE}.$((ETH1_LAST + 1))"
 
 	local PEER_LAST PEER_BASE PEER_NET_LAST PEER_SUBNET
 	PEER_LAST="${PEER_MGMT_IP##*.}"
