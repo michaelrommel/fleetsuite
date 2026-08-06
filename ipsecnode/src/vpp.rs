@@ -1,32 +1,17 @@
-//! VPP data-plane management for fleetnode (Increment 6d).
+//! VPP data-plane management for fleetnode (Increment 6e -- per-site VRFs).
 //!
-//! # Interface topology
+//! See Architecture Decision #15 in AGENTS.md for the full design rationale.
 //!
-//! Two tap interfaces are created once at ipsecnode startup:
+//! Each active customer site gets its own VPP fib table (VRF), keyed by
+//! if_id = u32::from(peer_ip as Ipv4Addr).  Per-site NAT mappings use
+//! `vrf if_id` so two customers with the same internal_ip coexist without
+//! conflict.  The shared vpp-outer tap handles the NAT outside interface.
 //!
-//!   vpp-inner (kernel) / tap0 (VPP): NAT inside  -- customer inner traffic
-//!   vpp-outer (kernel) / tap1 (VPP): NAT outside -- backend-facing traffic
-//!
-//! IP addresses for reliable VPP next-hop routing:
-//!   vpp-inner kernel side: 10.255.0.1/30   VPP tap0 side: 10.255.0.2/30
-//!   vpp-outer kernel side: 10.255.0.5/30   VPP tap1 side: 10.255.0.6/30
-//!
-//! VPP FIB (global):
-//!   0.0.0.0/0           via 10.255.0.5 tap1    (forward path: SNAT'd traffic out)
-//!   <internal_ip>/32    via 10.255.0.1 tap0    (return path: DNAT'd traffic in)
-//!
-//! # Forward data path (per-tunnel)
-//!   StrongSwan xfrm decap --> inner pkt: src=192.168.13.133, dst=backend
-//!   Linux policy rule: from 192.168.13.133/32 lookup 200
-//!   Table 200 default:  dev vpp-inner
-//!   VPP receives on tap0 (inside), applies SNAT: src -> global_ip
-//!   VPP routes via tap1 (default); kernel forwards to backend via ens5
-//!
-//! # Return data path (per-tunnel)
-//!   Backend reply: src=backend, dst=global_ip
-//!   Kernel route: global_ip/32 dev vpp-outer  (upgraded from blackhole by 6d)
-//!   VPP receives on tap1 (outside), applies DNAT: dst -> internal_ip
-//!   VPP routes via tap0 (per-device route); kernel forwards into xfrm tunnel
+//! Forward path: xfrm-{hex} -> ip rule prio 100 -> fwd_table -> vpp-{hex}
+//!   -> VPP SNAT in VRF if_id -> vpp-outer -> backend.
+//! Return path: vpp-outer -> VPP DNAT -> vpp-{hex} -> nftables mark=if_id
+//!   -> ip rule prio 200 -> table 9999 default dev ens5
+//!   -> XFRM mark_out=if_id selects the right tunnel.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,458 +22,551 @@ use tracing::{debug, info, warn};
 
 use crate::nat::{NAT_PREFIX, NatRecord};
 
-// -- Constants -----------------------------------------------------------------
+// -- Constants ----------------------------------------------------------------
 
-const VPPCTL: &str = "/usr/bin/vppctl";
-
-/// Kernel-side name of the NAT-inside tap interface.
-pub const VPP_INNER_KERNEL: &str = "vpp-inner";
-/// Kernel-side name of the NAT-outside tap interface.
+const VPPCTL:          &str = "/usr/bin/vppctl";
+const TUNNEL_DEV:      &str = "ens5";
 pub const VPP_OUTER_KERNEL: &str = "vpp-outer";
-
-/// Kernel-side IP on the inner tap (next-hop for VPP return-path routes).
-/// Reserved for future use when manual VPP FIB entries are needed.
-#[allow(dead_code)]
-const INNER_KERNEL_IP: &str = "10.255.0.1";
-const INNER_ADDR: &str = "10.255.0.1/30";
-/// VPP-side IP on the inner tap.
-/// Used as the kernel's gateway for table-200 routes so the kernel ARPs for
-/// VPP (which responds) rather than for the final destination (which doesn't).
-const INNER_VPP_IP:  &str = "10.255.0.2";
-const INNER_VPP_ADDR: &str = "10.255.0.2/30";
-
-/// Kernel-side IP on the outer tap (next-hop for VPP forward-path default route).
+const OUTER_ADDR:      &str = "10.255.0.5/30";
+const OUTER_VPP_ADDR:  &str = "10.255.0.6/30";
 const OUTER_KERNEL_IP: &str = "10.255.0.5";
-const OUTER_ADDR: &str = "10.255.0.5/30";
-/// VPP-side IP on the outer tap.
-const OUTER_VPP_ADDR: &str = "10.255.0.6/30";
+const RETURN_TABLE:    u32  = 9999;
+const NFT_TABLE:       &str = "ipsecnode";
+const NFT_VPP_SET:     &str = "vpp_taps";
+const NFT_VPP_MAP:     &str = "vpp_mark";
+const VPP_READY_SECS:  u64  = 30;
 
-/// Linux policy routing table number used for inner-traffic interception.
-/// Traffic from a customer internal IP is sent to this table, which routes
-/// it to vpp-inner for VPP NAT processing.
-const VPP_INNER_TABLE: u32 = 200;
+// -- Public types -------------------------------------------------------------
 
-/// How long to wait for VPP to be ready at startup before giving up.
-const VPP_READY_TIMEOUT_SECS: u64 = 30;
-
-// -- VppTaps -------------------------------------------------------------------
-
-/// VPP-side interface names for the two tap interfaces.
-/// Assigned by VPP sequentially (e.g., "tap0" and "tap1").
+/// Minimal state produced by init() and passed to the event listener.
 #[derive(Debug, Clone)]
-pub struct VppTaps {
-	/// VPP interface name for the inside (customer) tap, e.g., "tap0".
-	#[allow(dead_code)]
-	pub inner: String,
-	/// VPP interface name for the outside (backend) tap, e.g., "tap1".
-	/// Retained for logging and future vppctl calls that reference the VPP-side name.
-	#[allow(dead_code)]
-	pub outer: String,
+pub struct VppState {
+	/// VPP-side name of the shared outside tap (e.g. "tap0").
+	pub outer_tap: String,
 }
 
-// -- Per-peer VPP state (cache) ------------------------------------------------
+/// Per-site VRF state, created on CHILD_SA UP and destroyed on DOWN.
+#[allow(dead_code)]
+pub struct SiteVrfState {
+	/// u32 from peer IPv4; also VPP fib table ID and XFRM if_id.
+	pub if_id:           u32,
+	/// Linux forward routing table ID (range 10000+).
+	pub fwd_table:       u32,
+	/// Tap /30 subnet index (for deallocation).
+	pub tap_idx:         u32,
+	/// VPP-side tap name (e.g. "tap1").
+	pub vpp_tap:         String,
+	/// Kernel-side tap name (e.g. "vpp-3eee6094").
+	pub inner_if:        String,
+	/// VPP-side tap IP, used as gateway in fwd_table.
+	pub tap_vpp_ip:      String,
+	/// Kernel-side tap IP with /30 prefix.
+	pub tap_kern_prefix: String,
+	/// Linux ifindex of inner_if (key in nftables mangle map).
+	pub ifindex:         u32,
+	/// Device NAT entries currently installed in VPP.
+	pub devices:         Vec<DeviceVrfEntry>,
+	/// Active CHILD_SA count (re-keying guard).
+	pub child_sa_count:  u32,
+}
 
-/// Device entry cached in memory for one peer.
 #[derive(Debug, Clone)]
-pub struct VppDeviceEntry {
+pub struct DeviceVrfEntry {
 	pub internal_ip: String,
 	pub global_ip:   String,
 }
 
-/// VPP state held per peer (one VPN site).
-pub struct VppPeerState {
-	/// Devices whose NAT mappings are currently installed in VPP.
-	pub devices:        Vec<VppDeviceEntry>,
-	/// Number of active CHILD_SAs for this peer (re-keying safety counter).
-	pub child_sa_count: u32,
+/// In-memory map: peer_ip -> per-site VRF state.  Owned by event_listener_task.
+pub type VrfCache = HashMap<String, SiteVrfState>;
+
+// -- VrfAllocator -------------------------------------------------------------
+
+/// Allocates Linux routing table IDs and tap /30 subnet indices.
+/// Task-local to event_listener_task -- no Arc<Mutex<>> needed.
+pub struct VrfAllocator {
+	next_fwd: u32,
+	free_fwd: Vec<u32>,
+	next_tap: u32,
+	free_tap: Vec<u32>,
 }
 
-/// In-memory VPP state map: peer_ip -> active state.
-/// Owned by `event_listener_task`; not shared across threads.
-pub type VppCache = HashMap<String, VppPeerState>;
+impl VrfAllocator {
+	pub fn new() -> Self {
+		Self { next_fwd: 10_000, free_fwd: Vec::new(), next_tap: 0, free_tap: Vec::new() }
+	}
+	fn alloc_fwd(&mut self) -> u32 {
+		self.free_fwd.pop().unwrap_or_else(|| { let t = self.next_fwd; self.next_fwd += 1; t })
+	}
+	fn free_fwd(&mut self, t: u32) { self.free_fwd.push(t); }
+	fn alloc_tap(&mut self) -> u32 {
+		self.free_tap.pop().unwrap_or_else(|| { let i = self.next_tap; self.next_tap += 1; i })
+	}
+	fn free_tap(&mut self, i: u32) { self.free_tap.push(i); }
+}
 
-// -- vppctl helpers ------------------------------------------------------------
+// -- Naming helpers -----------------------------------------------------------
 
-/// Run a vppctl command and return trimmed stdout.
-/// VPP sometimes exits 0 but writes an error to stdout (e.g., "unknown input").
-/// Both the exit-code path and the inline-error path are treated as failures.
+fn if_id_from_peer(peer_ip: &str) -> Option<u32> {
+	peer_ip.parse::<std::net::Ipv4Addr>().ok().map(u32::from)
+}
+
+fn xfrm_if_name(if_id: u32)  -> String { format!("xfrm-{if_id:08x}") }
+fn inner_tap_name(if_id: u32) -> String { format!("vpp-{if_id:08x}")  }
+
+struct TapIps { vpp_ip: String, vpp_prefix: String, kern_prefix: String }
+
+/// Derive tap /30 IPs from subnet index n within 10.127.0.0/16.
+/// Subnet n: base = 10.127.{n>>6}.{(n&63)*4}; VPP = base+1, kernel = base+2.
+fn tap_ips_from_idx(n: u32) -> TapIps {
+	let o3 = n >> 6;
+	let b  = (n & 63) * 4;
+	TapIps {
+		vpp_ip:      format!("10.127.{o3}.{}", b + 1),
+		vpp_prefix:  format!("10.127.{o3}.{}/30", b + 1),
+		kern_prefix: format!("10.127.{o3}.{}/30", b + 2),
+	}
+}
+
+// -- Process helpers ----------------------------------------------------------
+
 async fn vppctl(args: &[&str]) -> Result<String> {
-	let out = tokio::process::Command::new(VPPCTL)
-		.args(args)
-		.output()
-		.await
-		.with_context(|| format!("failed to spawn vppctl {}", args.join(" ")))?;
-
+	let out = tokio::process::Command::new(VPPCTL).args(args).output().await
+		.with_context(|| format!("spawn vppctl {}", args.join(" ")))?;
 	let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
 	let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-
 	if !out.status.success() {
-		anyhow::bail!(
-			"vppctl {} failed (exit {}): stderr={} stdout={}",
-			args.join(" "), out.status, stderr, stdout,
-		);
+		anyhow::bail!("vppctl {} failed: stderr={stderr} stdout={stdout}", args.join(" "));
 	}
-
-	// VPP returns exit 0 but writes diagnostic errors in stdout.
-	if stdout.starts_with("unknown input")
-		|| stdout.starts_with("Failed:")
-		|| stdout.contains("is not a valid value")
-	{
-		anyhow::bail!("vppctl {} returned error: {}", args.join(" "), stdout);
+	if stdout.starts_with("unknown input") || stdout.starts_with("Failed:") {
+		anyhow::bail!("vppctl {} error: {stdout}", args.join(" "));
 	}
-
 	Ok(stdout)
 }
 
-/// Wait for VPP to be ready by polling `vppctl show version`.
-/// Returns Ok(()) when VPP responds, Err if the timeout expires.
-async fn wait_for_vpp() -> Result<()> {
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(VPP_READY_TIMEOUT_SECS);
-	loop {
-		let result = tokio::process::Command::new(VPPCTL)
-			.args(["show", "version"])
-			.output()
-			.await;
-
-		match result {
-			Ok(out) if out.status.success() => {
-				let ver = String::from_utf8_lossy(&out.stdout);
-				info!("VPP ready: {}", ver.lines().next().unwrap_or("(no version)"));
-				return Ok(());
-			}
-			_ => {
-				if tokio::time::Instant::now() >= deadline {
-					anyhow::bail!(
-						"VPP did not become ready within {VPP_READY_TIMEOUT_SECS} s"
-					);
-				}
-				debug!("VPP not ready yet -- retrying in 2 s");
-				tokio::time::sleep(Duration::from_secs(2)).await;
-			}
-		}
-	}
+async fn vppctl_warn(args: &[&str]) {
+	if let Err(e) = vppctl(args).await { warn!("vppctl {} (non-fatal): {e:#}", args.join(" ")); }
 }
 
-// -- ip helpers ----------------------------------------------------------------
-
-/// Run an `ip` subcommand.  Failures are returned as errors.
 async fn ip(args: &[&str]) -> Result<()> {
-	let out = tokio::process::Command::new("ip")
-		.args(args)
-		.output()
-		.await
-		.with_context(|| format!("failed to spawn ip {}", args.join(" ")))?;
-
+	let out = tokio::process::Command::new("ip").args(args).output().await
+		.with_context(|| format!("spawn ip {}", args.join(" ")))?;
 	if !out.status.success() {
-		let stderr = String::from_utf8_lossy(&out.stderr);
-		anyhow::bail!("ip {} failed: {}", args.join(" "), stderr.trim());
+		anyhow::bail!("ip {} failed: {}", args.join(" "),
+			String::from_utf8_lossy(&out.stderr).trim());
 	}
 	Ok(())
 }
 
-/// Same as `ip()` but treats failure as a warning (e.g., idempotent deletes).
 async fn ip_warn(args: &[&str]) {
-	if let Err(e) = ip(args).await {
-		warn!("ip {} (non-fatal): {e:#}", args.join(" "));
+	if let Err(e) = ip(args).await { warn!("ip {} (non-fatal): {e:#}", args.join(" ")); }
+}
+
+async fn nft(args: &[&str]) -> Result<()> {
+	let out = tokio::process::Command::new("nft").args(args).output().await
+		.with_context(|| format!("spawn nft {}", args.join(" ")))?;
+	if !out.status.success() {
+		anyhow::bail!("nft {} failed: {}", args.join(" "),
+			String::from_utf8_lossy(&out.stderr).trim());
+	}
+	Ok(())
+}
+
+async fn nft_warn(args: &[&str]) {
+	if let Err(e) = nft(args).await { warn!("nft {} (non-fatal): {e:#}", args.join(" ")); }
+}
+
+async fn nft_batch(rules: &str) -> Result<()> {
+	use tokio::io::AsyncWriteExt;
+	let mut child = tokio::process::Command::new("nft")
+		.arg("-f").arg("-")
+		.stdin(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn().context("spawn nft -f -")?;
+	if let Some(mut stdin) = child.stdin.take() {
+		stdin.write_all(rules.as_bytes()).await.context("write nft rules")?;
+	}
+	let out = child.wait_with_output().await.context("wait nft")?;
+	if !out.status.success() {
+		anyhow::bail!("nft batch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+	}
+	Ok(())
+}
+
+// -- VPP readiness + cleanup --------------------------------------------------
+
+async fn wait_for_vpp() -> Result<()> {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(VPP_READY_SECS);
+	loop {
+		let ok = tokio::process::Command::new(VPPCTL)
+			.args(["show", "version"]).output().await
+			.map(|o| o.status.success()).unwrap_or(false);
+		if ok {
+			info!("VPP ready");
+			return Ok(());
+		}
+		if tokio::time::Instant::now() >= deadline {
+			anyhow::bail!("VPP not ready after {VPP_READY_SECS} s");
+		}
+		debug!("VPP not ready -- retrying in 2 s");
+		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
 }
 
-// -- Startup cleanup ---------------------------------------------------------
-
-/// Remove any tap interfaces and NAT44 state left by a previous ipsecnode run.
-/// Called at the start of init() to make startup idempotent.
-/// All errors are ignored -- if VPP is fresh there is nothing to clean up.
+/// Remove tap interfaces, NAT44 state, nftables, and ip rules left by a
+/// previous run.  All errors are ignored.
 async fn cleanup_stale_state() {
-	// Disable NAT44 plugin first (clears mappings + interface assignments).
 	let _ = vppctl(&["nat44", "plugin", "disable"]).await;
-
-	// Parse `show interface` and delete every tap interface found.
-	// ipsecnode is the only process that creates tap interfaces on these nodes,
-	// so deleting all taps is safe.
-	if let Ok(output) = vppctl(&["show", "interface"]).await {
-		for line in output.lines() {
-			let parts: Vec<&str> = line.split_whitespace().collect();
-			// Each line: "<name> <sw_if_index> <state> ..."
-			if parts.len() >= 2
-				&& parts[0].starts_with("tap")
-				&& parts[0] != "tap"
+	if let Ok(out) = vppctl(&["show", "interface"]).await {
+		for line in out.lines() {
+			let p: Vec<&str> = line.split_whitespace().collect();
+			if p.len() >= 2 && p[0].starts_with("tap") && p[0] != "tap"
+				&& p[1].parse::<u32>().is_ok()
 			{
-				if let Ok(_idx) = parts[1].parse::<u32>() {
-					let sw_if_index = parts[1];
-					debug!(iface = parts[0], sw_if_index, "removing stale tap");
-					let _ = vppctl(&["delete", "tap", "sw_if_index", sw_if_index]).await;
-				}
+				let _ = vppctl(&["delete", "tap", "sw_if_index", p[1]]).await;
 			}
 		}
 	}
-
-	// Remove stale kernel-side state (IPs, policy rules, routes).
-	// These are all best-effort -- ignore errors for missing entries.
-	ip_warn(&["addr", "flush", "dev", VPP_INNER_KERNEL]).await;
 	ip_warn(&["addr", "flush", "dev", VPP_OUTER_KERNEL]).await;
+	let _ = nft(&["delete", "table", "ip", NFT_TABLE]).await;
+	for prio in ["100", "200"] {
+		loop {
+			let ok = tokio::process::Command::new("ip")
+				.args(["rule", "del", "prio", prio]).output().await
+				.map(|o| o.status.success()).unwrap_or(false);
+			if !ok { break; }
+		}
+	}
 }
 
-// -- Startup initialisation ----------------------------------------------------
+// -- Startup initialisation ---------------------------------------------------
 
-/// Initialize the VPP data plane.
-///
-/// Idempotent: any tap interfaces left by a previous ipsecnode run are
-/// detected and removed before fresh ones are created.
-/// Returns `Ok(Some(taps))` on success.
-/// Returns `Ok(None)` if VPP is not available (degraded mode -- no data plane).
-pub async fn init() -> Result<Option<VppTaps>> {
-	// Wait for VPP to be ready.  If it doesn't start in time, run without VPP.
+pub async fn init() -> Result<Option<VppState>> {
 	if let Err(e) = wait_for_vpp().await {
-		warn!("VPP not available: {e:#} -- running without VPP data plane");
+		warn!("VPP not available: {e:#} -- running without data plane");
 		return Ok(None);
 	}
-
-	// Remove any tap interfaces and NAT44 state left by a previous run.
 	cleanup_stale_state().await;
 
-	let inner = match create_tap(VPP_INNER_KERNEL).await {
+	let outer_tap = match create_tap(VPP_OUTER_KERNEL).await {
 		Ok(n)  => n,
-		Err(e) => {
-			warn!("VPP tap create failed: {e:#} -- running without VPP data plane");
-			return Ok(None);
-		}
-	};
-	let outer = match create_tap(VPP_OUTER_KERNEL).await {
-		Ok(n)  => n,
-		Err(e) => {
-			warn!("VPP tap create failed: {e:#} -- running without VPP data plane");
-			return Ok(None);
-		}
+		Err(e) => { warn!("VPP outer tap failed: {e:#}"); return Ok(None); }
 	};
 
-	// Assign IPs on the VPP side of both taps.
-	vppctl(&["set", "interface", "ip", "address", &inner, INNER_VPP_ADDR]).await
-		.context("failed to set IP on inner tap (VPP side)")?;
-	vppctl(&["set", "interface", "ip", "address", &outer, OUTER_VPP_ADDR]).await
-		.context("failed to set IP on outer tap (VPP side)")?;
-
-	// Bring both VPP interfaces up.
-	vppctl(&["set", "interface", "state", &inner, "up"]).await
-		.context("failed to bring inner tap up in VPP")?;
-	vppctl(&["set", "interface", "state", &outer, "up"]).await
-		.context("failed to bring outer tap up in VPP")?;
-
-	// Assign IPs on the kernel side of both taps.
-	ip(&["addr", "add", INNER_ADDR, "dev", VPP_INNER_KERNEL]).await
-		.context("failed to set IP on vpp-inner (kernel side)")?;
+	vppctl(&["set", "interface", "ip", "address", &outer_tap, OUTER_VPP_ADDR]).await
+		.context("set IP on vpp-outer (VPP)")?;
+	vppctl(&["set", "interface", "state", &outer_tap, "up"]).await
+		.context("bring vpp-outer up (VPP)")?;
 	ip(&["addr", "add", OUTER_ADDR, "dev", VPP_OUTER_KERNEL]).await
-		.context("failed to set IP on vpp-outer (kernel side)")?;
+		.context("set IP on vpp-outer (kernel)")?;
+	ip(&["link", "set", VPP_OUTER_KERNEL, "up"]).await
+		.context("bring vpp-outer up (kernel)")?;
 
-	// Bring both kernel interfaces up.
-	ip(&["link", "set", VPP_INNER_KERNEL, "up"]).await?;
-	ip(&["link", "set", VPP_OUTER_KERNEL, "up"]).await?;
-
-	// VPP default route: all post-SNAT traffic exits via the outer tap.
-	// Added BEFORE enabling NAT44 so the NAT plugin does not add a second
-	// path to this entry (which would create ECMP and send half the traffic
-	// back via vpp-inner).  Nexthop only, no interface name: VPP resolves
-	// 10.255.0.5 via the connected 10.255.0.4/30 route on tap1.
+	// Default route BEFORE nat44 enable -- avoids ECMP second path.
 	vppctl(&["ip", "route", "add", "0.0.0.0/0", "via", OUTER_KERNEL_IP]).await
-		.context("failed to add VPP default route via outer tap")?;
+		.context("VPP default route")?;
 
-	// Enable NAT44 with a reasonable session limit.
-	vppctl(&["nat44", "plugin", "enable", "sessions", "65536"]).await
-		.context("failed to enable NAT44")?;
+	// 500000 sessions: production value for 180k devices (dev default 65536 too low).
+	vppctl(&["nat44", "plugin", "enable", "sessions", "500000"]).await
+		.context("enable NAT44")?;
+	vppctl(&["set", "interface", "nat44", "out", &outer_tap]).await
+		.context("set NAT44 outside interface")?;
 
-	// Set NAT interface roles (inside + outside in one command -- VPP 26.x syntax).
-	vppctl(&["set", "interface", "nat44", "in", &inner, "out", &outer]).await
-		.context("failed to set NAT44 inside/outside interfaces")?;
+	// Shared return table: all per-site return ip rules point here.
+	let ret_str = RETURN_TABLE.to_string();
+	ip(&["route", "replace", "default", "dev", TUNNEL_DEV, "table", &ret_str]).await
+		.context("create shared return routing table")?;
 
-	// Table 200 default route: inner traffic intercepted by policy rules
-	// goes to VPP via the gateway 10.255.0.2 (VPP-side IP on tap0).
-	// Using an explicit gateway prevents the kernel from ARPing for final
-	// destinations on vpp-inner; instead it ARPs for VPP's own IP (which
-	// VPP answers), then delivers the frame to VPP for NAT + forwarding.
-	let table_str = VPP_INNER_TABLE.to_string();
-	ip(&["route", "replace", "default",
-		"via", INNER_VPP_IP, "dev", VPP_INNER_KERNEL,
-		"table", &table_str]).await
-		.context("failed to add table 200 default route to vpp-inner")?;
+	init_nftables_mangle().await?;
 
-	info!(
-		inner, outer,
-		inner_kernel = VPP_INNER_KERNEL,
-		outer_kernel = VPP_OUTER_KERNEL,
-		"VPP NAT44 data plane initialised"
-	);
-
-	Ok(Some(VppTaps { inner, outer }))
+	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
+		  return_table = RETURN_TABLE, "VPP NAT44 initialised (per-site VRF mode)");
+	Ok(Some(VppState { outer_tap }))
 }
 
-/// Create a VPP tap interface with the given kernel-side name.
-/// Returns the VPP-side interface name (e.g., "tap0").
-/// VPP 26.x (TAPv2 / virtio): `create tap host-if-name <name>`
 async fn create_tap(kernel_name: &str) -> Result<String> {
-	let output = vppctl(&["create", "tap", "host-if-name", kernel_name]).await
-		.with_context(|| format!("create tap host-if-name {kernel_name}"))?;
-
-	let iface = output.trim().to_string();
+	let out = vppctl(&["create", "tap", "host-if-name", kernel_name]).await
+		.with_context(|| format!("create tap {kernel_name}"))?;
+	let iface = out.trim().to_string();
 	if iface.is_empty() {
-		anyhow::bail!("VPP tap create returned empty interface name for kernel={kernel_name}");
+		anyhow::bail!("VPP create tap returned empty name for {kernel_name}");
 	}
-	info!(vpp_iface = %iface, %kernel_name, "VPP tap interface created");
+	info!(vpp_iface = %iface, %kernel_name, "VPP tap created");
 	Ok(iface)
 }
 
-// -- Per-CHILD_SA handlers -----------------------------------------------------
+async fn init_nftables_mangle() -> Result<()> {
+	let rules = format!(
+		"add table ip {NFT_TABLE}\n\
+		 add set ip {NFT_TABLE} {NFT_VPP_SET} {{ type iface_index; }}\n\
+		 add map ip {NFT_TABLE} {NFT_VPP_MAP} {{ type iface_index : mark; }}\n\
+		 add chain ip {NFT_TABLE} mangle_pre \
+		   {{ type filter hook prerouting priority mangle; policy accept; }}\n\
+		 add rule ip {NFT_TABLE} mangle_pre \
+		   iif @{NFT_VPP_SET} meta mark set iif map @{NFT_VPP_MAP}\n"
+	);
+	nft_batch(&rules).await.context("init nftables mangle table")?;
+	info!(table = NFT_TABLE, "nftables mangle table initialised");
+	Ok(())
+}
 
-/// Called on CHILD_SA UP.
-///
-/// Fetches the NAT record, installs VPP static NAT mappings, adds VPP
-/// per-device return-path routes, and sets up Linux policy routing so
-/// that inner traffic is intercepted by VPP.
-/// Also upgrades each global_ip route from blackhole (6c) to dev vpp-outer
-/// so that return traffic is received by VPP rather than dropped.
+// -- Per-CHILD_SA event handlers ----------------------------------------------
+
 pub async fn on_child_up(
 	conn:    &mut redis::aio::MultiplexedConnection,
 	peer_ip: &str,
-	taps:    &VppTaps,
-	cache:   &mut VppCache,
+	state:   &VppState,
+	cache:   &mut VrfCache,
+	alloc:   &mut VrfAllocator,
 ) {
-	// Re-keying: NAT entries already installed, just increment the refcount.
-	if let Some(state) = cache.get_mut(peer_ip) {
-		state.child_sa_count += 1;
-		debug!(peer_ip, child_sa_count = state.child_sa_count,
-			"VPP CHILD_SA UP: NAT already installed, incrementing refcount");
+	if let Some(s) = cache.get_mut(peer_ip) {
+		s.child_sa_count += 1;
+		debug!(peer_ip, count = s.child_sa_count, "VPP CHILD_SA UP: VRF active");
 		return;
 	}
+
+	let if_id = match if_id_from_peer(peer_ip) {
+		Some(id) => id,
+		None     => { warn!(peer_ip, "cannot derive VRF id -- skipping VPP"); return; }
+	};
 
 	let record = match get_nat_record(conn, peer_ip).await {
 		Some(r) => r,
 		None    => return,
 	};
 
-	let mut installed = Vec::new();
-	for entry in &record.device_nat {
-		let int_ip = &entry.internal_ip;
-		let glo_ip = &entry.global_ip;
+	let fwd_table = alloc.alloc_fwd();
+	let tap_idx   = alloc.alloc_tap();
+	let tap_ips   = tap_ips_from_idx(tap_idx);
+	let inner_if  = inner_tap_name(if_id);
 
-		if let Err(e) = install_device_nat(taps, int_ip, glo_ip).await {
-			warn!(peer_ip, int_ip, glo_ip, "VPP NAT install failed: {e:#}");
-			continue;
+	match setup_site_vrf(peer_ip, if_id, &inner_if, fwd_table, tap_idx,
+	                     &tap_ips, &record, state).await {
+		Ok(site) => {
+			info!(peer_ip, vrf = if_id, fwd_table,
+			      inner_if, tap_vpp = %site.vpp_tap, "VPP: per-site VRF active");
+			cache.insert(peer_ip.to_string(), site);
 		}
-
-		info!(
-			peer_ip,
-			internal_ip = int_ip,
-			global_ip   = glo_ip,
-			"VPP: NAT mapping + routing installed"
-		);
-		installed.push(VppDeviceEntry {
-			internal_ip: int_ip.clone(),
-			global_ip:   glo_ip.clone(),
-		});
-	}
-
-	if !installed.is_empty() {
-		cache.insert(peer_ip.to_string(), VppPeerState {
-			devices:        installed,
-			child_sa_count: 1,
-		});
+		Err(e) => {
+			warn!(peer_ip, "VRF setup failed: {e:#} -- freeing resources");
+			alloc.free_fwd(fwd_table);
+			alloc.free_tap(tap_idx);
+			teardown_partial(&inner_if, fwd_table, if_id).await;
+		}
 	}
 }
 
-/// Called on CHILD_SA DOWN.
-///
-/// Decrements the active CHILD_SA count.  When the count reaches zero,
-/// removes VPP NAT mappings, VPP return-path routes, and Linux policy rules.
-/// The global_ip kernel route is removed by nat::on_child_down; no need
-/// to explicitly delete it here.
-pub async fn on_child_down(peer_ip: &str, taps: &VppTaps, cache: &mut VppCache) {
-	let state = match cache.get_mut(peer_ip) {
+pub async fn on_child_down(
+	peer_ip: &str,
+	_state:  &VppState,
+	cache:   &mut VrfCache,
+	alloc:   &mut VrfAllocator,
+) {
+	let site = match cache.get_mut(peer_ip) {
 		Some(s) => s,
-		None    => {
-			debug!(peer_ip, "VPP CHILD_SA DOWN: no cached state -- nothing to remove");
-			return;
-		}
+		None    => { debug!(peer_ip, "VPP CHILD_SA DOWN: no VRF state"); return; }
 	};
 
-	state.child_sa_count = state.child_sa_count.saturating_sub(1);
-	if state.child_sa_count > 0 {
-		debug!(peer_ip, child_sa_count = state.child_sa_count,
-			"VPP CHILD_SA DOWN: other CHILD_SAs still active, keeping NAT");
+	site.child_sa_count = site.child_sa_count.saturating_sub(1);
+	if site.child_sa_count > 0 {
+		debug!(peer_ip, count = site.child_sa_count, "VPP CHILD_SA DOWN: other SAs active");
 		return;
 	}
 
-	let devices = cache.remove(peer_ip).unwrap().devices;
-	for d in &devices {
-		if let Err(e) = remove_device_nat(taps, &d.internal_ip, &d.global_ip).await {
-			warn!(peer_ip, internal_ip = %d.internal_ip, global_ip = %d.global_ip,
-				"VPP NAT remove failed (may already be gone): {e:#}");
-		} else {
-			info!(peer_ip, internal_ip = %d.internal_ip, global_ip = %d.global_ip,
-				"VPP: NAT mapping + routing removed");
+	let site = cache.remove(peer_ip).unwrap();
+	let (fwd, tap) = (site.fwd_table, site.tap_idx);
+	teardown_site_vrf(peer_ip, &site).await;
+	alloc.free_fwd(fwd);
+	alloc.free_tap(tap);
+}
+
+// -- Per-site VRF setup / teardown --------------------------------------------
+
+async fn setup_site_vrf(
+	peer_ip:   &str,
+	if_id:     u32,
+	inner_if:  &str,
+	fwd_table: u32,
+	tap_idx:   u32,
+	tap_ips:   &TapIps,
+	record:    &NatRecord,
+	state:     &VppState,
+) -> Result<SiteVrfState> {
+	let vrf_str = if_id.to_string();
+	let fwd_str = fwd_table.to_string();
+	let ret_str = RETURN_TABLE.to_string();
+	let xfrm_if = xfrm_if_name(if_id);
+
+	// 1. VPP fib table for this site.
+	vppctl(&["ip", "table", "add", &vrf_str]).await.context("VPP ip table add")?;
+
+	// 2. Per-site inside tap in the site VRF.
+	//    VRF assignment must precede NAT interface assignment.
+	let vpp_tap = create_tap(inner_if).await.context("create per-site VPP tap")?;
+	vppctl(&["set", "interface", "ip", "table", &vpp_tap, &vrf_str])
+		.await.context("assign VPP tap to site VRF")?;
+
+	// 3. IPs and link state.
+	vppctl(&["set", "interface", "ip", "address", &vpp_tap, &tap_ips.vpp_prefix])
+		.await.context("set VPP tap IP")?;
+	vppctl(&["set", "interface", "state", &vpp_tap, "up"])
+		.await.context("bring VPP tap up")?;
+	ip(&["addr", "add", &tap_ips.kern_prefix, "dev", inner_if])
+		.await.context("assign kernel tap IP")?;
+	ip(&["link", "set", inner_if, "up"]).await.context("bring kernel tap up")?;
+
+	// 4. NAT44 inside.  vpp-outer is already the outside interface.
+	vppctl(&["set", "interface", "nat44", "in", &vpp_tap, "out", &state.outer_tap])
+		.await.context("set NAT44 inside interface")?;
+
+	// 5. Kernel ifindex -- key in the nftables mangle map.
+	let ifindex  = get_ifindex(inner_if).await.context("read kernel tap ifindex")?;
+	let idx_str  = ifindex.to_string();
+	let mark_str = if_id.to_string();
+
+	// 6. nftables mangle map: mark return-path packets with if_id.
+	nft(&["add", "element", "ip", NFT_TABLE, NFT_VPP_SET, &format!("{{ {idx_str} }}")])
+		.await.context("nft: add to vpp_taps set")?;
+	nft(&["add", "element", "ip", NFT_TABLE, NFT_VPP_MAP,
+		  &format!("{{ {idx_str} : {mark_str} }}")])
+		.await.context("nft: add to vpp_mark map")?;
+
+	// 7. Forward routing: iif xfrm-{hex} -> fwd_table -> per-site tap.
+	ip(&["rule", "add", "iif", &xfrm_if, "prio", "100", "lookup", &fwd_str])
+		.await.context("ip rule add (forward)")?;
+	ip(&["route", "replace", "default",
+		 "via", &tap_ips.vpp_ip, "dev", inner_if, "table", &fwd_str])
+		.await.context("ip route default (forward table)")?;
+
+	// 8. Return routing: iif vpp-{hex} -> shared return table 9999.
+	ip(&["rule", "add", "iif", inner_if, "prio", "200", "lookup", &ret_str])
+		.await.context("ip rule add (return)")?;
+
+	// 9. VPP NAT static mappings, one per device_nat entry.
+	let mut devices = Vec::new();
+	for entry in &record.device_nat {
+		match install_device_nat(&vrf_str, &entry.internal_ip, &entry.global_ip).await {
+			Ok(()) => {
+				info!(peer_ip, internal_ip = %entry.internal_ip,
+				      global_ip = %entry.global_ip, vrf = if_id, "VPP: NAT mapping installed");
+				devices.push(DeviceVrfEntry {
+					internal_ip: entry.internal_ip.clone(),
+					global_ip:   entry.global_ip.clone(),
+				});
+			}
+			Err(e) => warn!(peer_ip, internal_ip = %entry.internal_ip,
+			                "VPP NAT install failed: {e:#}"),
 		}
 	}
+
+	Ok(SiteVrfState {
+		if_id, fwd_table, tap_idx, vpp_tap,
+		inner_if:        inner_if.to_string(),
+		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
+		tap_kern_prefix: tap_ips.kern_prefix.clone(),
+		ifindex, devices, child_sa_count: 1,
+	})
 }
 
-// -- Per-device NAT install / remove ------------------------------------------
+async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
+	let fwd_str = site.fwd_table.to_string();
+	let ret_str = RETURN_TABLE.to_string();
+	let vrf_str = site.if_id.to_string();
+	let xfrm_if = xfrm_if_name(site.if_id);
+	let idx_str = site.ifindex.to_string();
 
-async fn install_device_nat(
-	_taps:       &VppTaps,
-	internal_ip: &str,
-	global_ip:   &str,
-) -> Result<()> {
-	// 1. VPP static 1:1 NAT mapping (bidirectional: SNAT forward + DNAT return).
-	//    VPP NAT automatically manages the FIB entries for the internal and
-	//    external addresses -- do NOT add manual ip routes for internal_ip or
-	//    global_ip in VPP, as that creates ECMP with the NAT-internal routes.
-	vppctl(&[
-		"nat44", "add", "static", "mapping",
-		"local", internal_ip, "external", global_ip,
-	]).await.context("VPP nat44 add static mapping")?;
-
-	// 2. Linux policy rule: forward-path src=internal_ip --> table 200 --> vpp-inner.
-	let int_prefix = format!("{internal_ip}/32");
-	let table_str = VPP_INNER_TABLE.to_string();
-	ip(&["rule", "add", "from", &int_prefix, "lookup", &table_str]).await
-		.context("ip rule add from internal_ip")?;
-
-	// 3. Upgrade global_ip kernel route: blackhole (6c) --> dev vpp-outer.
-	//    nat::on_child_up installed a blackhole; replace it so return traffic
-	//    reaches VPP instead of being dropped.
-	let glo_prefix = format!("{global_ip}/32");
-	ip(&["route", "replace", &glo_prefix, "dev", VPP_OUTER_KERNEL]).await
-		.context("ip route replace global_ip dev vpp-outer")?;
-
-	Ok(())
-}
-
-async fn remove_device_nat(
-	_taps:       &VppTaps,
-	internal_ip: &str,
-	global_ip:   &str,
-) -> Result<()> {
-	// Revert global_ip route to blackhole so FRR signal remains until
-	// nat::on_child_down deletes it entirely.
-	ip_warn(&[
-		"route", "replace", &format!("{global_ip}/32"), "type", "blackhole",
-	]).await;
-
-	let int_prefix = format!("{internal_ip}/32");
-
-	// Remove Linux policy rule.
-	let table_str = VPP_INNER_TABLE.to_string();
-	ip_warn(&["rule", "del", "from", &int_prefix, "lookup", &table_str]).await;
-
-	// Remove VPP NAT static mapping.
-	// VPP NAT manages the internal FIB entries; no manual ip route del needed.
-	if let Err(e) = vppctl(&[
-		"nat44", "del", "static", "mapping",
-		"local", internal_ip, "external", global_ip,
-	]).await {
-		warn!(internal_ip, global_ip, "VPP nat44 del static mapping: {e:#}");
+	// 1. Remove VPP NAT mappings; revert global_ip routes to blackhole so
+	//    nat::on_child_down can then delete them entirely.
+	for d in &site.devices {
+		remove_device_nat(&vrf_str, &d.internal_ip, &d.global_ip).await;
+		info!(peer_ip, internal_ip = %d.internal_ip, global_ip = %d.global_ip,
+		      "VPP: NAT mapping removed");
 	}
 
+	// 2. ip rules and forward route.
+	ip_warn(&["rule", "del", "iif", &xfrm_if,      "prio", "100", "lookup", &fwd_str]).await;
+	ip_warn(&["rule", "del", "iif", &site.inner_if, "prio", "200", "lookup", &ret_str]).await;
+	ip_warn(&["route", "del", "default", "table", &fwd_str]).await;
+
+	// 3. nftables mangle map entries.
+	nft_warn(&["delete", "element", "ip", NFT_TABLE, NFT_VPP_SET,
+			   &format!("{{ {idx_str} }}")]).await;
+	nft_warn(&["delete", "element", "ip", NFT_TABLE, NFT_VPP_MAP,
+			   &format!("{{ {idx_str} }}")]).await;
+
+	// 4. Kernel-side tap.
+	ip_warn(&["link", "set", &site.inner_if, "down"]).await;
+	ip_warn(&["link", "del", &site.inner_if]).await;
+
+	// 5. VPP tap (also removes NAT inside assignment and FIB entries).
+	delete_vpp_tap(&site.vpp_tap).await;
+
+	// 6. VPP fib table (now empty after tap deletion).
+	vppctl_warn(&["ip", "table", "del", &vrf_str]).await;
+
+	info!(peer_ip, vrf = site.if_id, "VPP: per-site VRF torn down");
+}
+
+/// Best-effort cleanup after a partial setup_site_vrf failure.
+async fn teardown_partial(inner_if: &str, fwd_table: u32, if_id: u32) {
+	let fwd_str = fwd_table.to_string();
+	let ret_str = RETURN_TABLE.to_string();
+	let xfrm_if = xfrm_if_name(if_id);
+	ip_warn(&["rule", "del", "iif", &xfrm_if,  "prio", "100", "lookup", &fwd_str]).await;
+	ip_warn(&["rule", "del", "iif", inner_if,   "prio", "200", "lookup", &ret_str]).await;
+	ip_warn(&["link", "set", inner_if, "down"]).await;
+	ip_warn(&["link", "del", inner_if]).await;
+}
+
+// -- Per-device NAT -----------------------------------------------------------
+
+async fn install_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) -> Result<()> {
+	vppctl(&[
+		"nat44", "add", "static", "mapping",
+		"local", internal_ip, "external", global_ip, "vrf", vrf_str,
+	]).await.context("VPP nat44 add static mapping")?;
+
+	// Upgrade global_ip route: blackhole (6c) -> dev vpp-outer (return path).
+	ip(&["route", "replace", &format!("{global_ip}/32"), "dev", VPP_OUTER_KERNEL])
+		.await.context("ip route replace global_ip dev vpp-outer")?;
 	Ok(())
 }
 
-// -- Valkey helper (mirrors nat.rs) --------------------------------------------
+async fn remove_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) {
+	// Revert to blackhole; nat::on_child_down will then delete it.
+	ip_warn(&["route", "replace", &format!("{global_ip}/32"), "type", "blackhole"]).await;
+	if let Err(e) = vppctl(&[
+		"nat44", "del", "static", "mapping",
+		"local", internal_ip, "external", global_ip, "vrf", vrf_str,
+	]).await {
+		warn!(internal_ip, global_ip, "VPP nat44 del: {e:#}");
+	}
+}
+
+// -- VPP tap deletion ---------------------------------------------------------
+
+async fn delete_vpp_tap(vpp_tap_name: &str) {
+	if let Ok(out) = vppctl(&["show", "interface", vpp_tap_name]).await {
+		for line in out.lines() {
+			let p: Vec<&str> = line.split_whitespace().collect();
+			if p.len() >= 2 && p[0] == vpp_tap_name && p[1].parse::<u32>().is_ok() {
+				vppctl_warn(&["delete", "tap", "sw_if_index", p[1]]).await;
+				return;
+			}
+		}
+	}
+	warn!(vpp_tap = vpp_tap_name, "could not find sw_if_index to delete tap");
+}
+
+// -- Kernel helpers -----------------------------------------------------------
+
+async fn get_ifindex(iface: &str) -> Result<u32> {
+	let path = format!("/sys/class/net/{iface}/ifindex");
+	let s = tokio::fs::read_to_string(&path).await
+		.with_context(|| format!("read {path}"))?;
+	s.trim().parse::<u32>().with_context(|| format!("parse ifindex from {path}"))
+}
+
+// -- Valkey helper ------------------------------------------------------------
 
 async fn get_nat_record(
 	conn:    &mut redis::aio::MultiplexedConnection,

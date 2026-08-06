@@ -329,11 +329,22 @@ async fn load_device_conn(
 	let ike_proposals = proposals::build_ike_proposals(rec);
 	let esp_proposals = proposals::build_esp_proposals(rec);
 
-	debug!(
-		device_ip, %conn_name,
-		?ike_proposals, ?esp_proposals,
-		"issuing VICI load-conn"
-	);
+	// Compute if_id = IPv4 address as u32 (Architecture Decision #15).
+	// None if device_ip is not a valid IPv4 (should never happen in practice).
+	let if_id: Option<u32> = device_ip
+		.parse::<std::net::Ipv4Addr>()
+		.ok()
+		.map(u32::from);
+
+	// Create the per-site XFRM interface before loading the connection so
+	// it exists when StrongSwan installs the first XFRM state for this site.
+	if let Some(id) = if_id {
+		let xfrm_if = format!("xfrm-{id:08x}");
+		create_xfrm_if(&xfrm_if, id).await;
+	}
+
+	debug!(device_ip, %conn_name, ?ike_proposals, ?esp_proposals,
+		   if_id, "issuing VICI load-conn");
 
 	vici::load_conn(
 		vici_client,
@@ -346,6 +357,7 @@ async fn load_device_conn(
 		esp_proposals,
 		remote_ts,
 		local_ts,
+		if_id,
 	)
 	.await?;
 
@@ -358,20 +370,23 @@ async fn unload_one_device(
 	vici_client: &mut Client,
 	device_ip:   &str,
 ) -> Result<()> {
-	// Unload PSK.
 	let id = psk_id(device_ip);
 	vici::unload_shared(vici_client, &id)
 		.await
 		.with_context(|| format!("VICI unload-shared for {device_ip} failed"))?;
 
-	// Unload per-site connection (ignore error if it was never loaded;
-	// not all devices have custom config).
 	let conn_name = vici::conn_id(device_ip);
 	if let Err(e) = vici::unload_conn(vici_client, &conn_name).await {
-		debug!(device_ip, %conn_name, "unload-conn failed (may not have been loaded): {e:#}");
+		debug!(device_ip, %conn_name, "unload-conn (may not have been loaded): {e:#}");
 	}
 
-	debug!(device_ip, %id, "PSK removed from charon");
+	// Delete the per-site XFRM interface (best-effort; ignore if absent).
+	if let Some(id) = device_ip.parse::<std::net::Ipv4Addr>().ok().map(u32::from) {
+		let xfrm_if = format!("xfrm-{id:08x}");
+		delete_xfrm_if(&xfrm_if).await;
+	}
+
+	debug!(device_ip, %id, "PSK and XFRM interface removed");
 	Ok(())
 }
 
@@ -520,5 +535,51 @@ async fn handle_site_event(
 			}
 		}
 		Err(e) => error!(device_ip, "Valkey connect for device event failed: {e}"),
+	}
+}
+
+// -- XFRM interface lifecycle (Architecture Decision #15) --------------------
+
+/// Create the per-site XFRM kernel interface.
+/// Idempotent: if the interface already exists the error is silently ignored
+/// (handles ipsecnode restart without instance replacement).
+async fn create_xfrm_if(xfrm_if: &str, if_id: u32) {
+	let id_str = if_id.to_string();
+	let out = tokio::process::Command::new("ip")
+		.args(["link", "add", xfrm_if, "type", "xfrm",
+		       "dev", "ens5", "if_id", &id_str])
+		.output().await;
+
+	match out {
+		Ok(o) if o.status.success() => {
+			// Bring the interface up immediately.
+			let _ = tokio::process::Command::new("ip")
+				.args(["link", "set", xfrm_if, "up"])
+				.output().await;
+			info!(xfrm_if, if_id, "XFRM interface created");
+		}
+		Ok(o) => {
+			let stderr = String::from_utf8_lossy(&o.stderr);
+			// "RTNETLINK answers: File exists" means already present -- ok.
+			if stderr.contains("File exists") || stderr.contains("already exists") {
+				debug!(xfrm_if, "XFRM interface already exists (ok on restart)");
+			} else {
+				warn!(xfrm_if, if_id, "XFRM interface create failed: {}", stderr.trim());
+			}
+		}
+		Err(e) => warn!(xfrm_if, "failed to spawn ip link add: {e}"),
+	}
+}
+
+/// Delete the per-site XFRM kernel interface (best-effort).
+async fn delete_xfrm_if(xfrm_if: &str) {
+	let out = tokio::process::Command::new("ip")
+		.args(["link", "del", xfrm_if])
+		.output().await;
+	match out {
+		Ok(o) if o.status.success() => info!(xfrm_if, "XFRM interface deleted"),
+		Ok(o) => debug!(xfrm_if, "XFRM interface delete (non-fatal): {}",
+		                String::from_utf8_lossy(&o.stderr).trim()),
+		Err(e) => warn!(xfrm_if, "failed to spawn ip link del: {e}"),
 	}
 }

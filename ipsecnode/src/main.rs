@@ -68,14 +68,14 @@ async fn main() -> Result<()> {
 	// Creates tap interfaces, enables NAT44, sets VPP default route.
 	// If VPP is not running, continues in degraded mode (no data plane).
 	info!("initialising VPP data plane ...");
-	let vpp_taps = match vpp::init().await {
+	let vpp_state = match vpp::init().await {
 		Ok(taps) => taps,
 		Err(e)   => {
 			warn!("VPP init error: {e:#} -- continuing without VPP data plane");
 			None
 		}
 	};
-	if vpp_taps.is_some() {
+	if vpp_state.is_some() {
 		info!("VPP data plane ready");
 	} else {
 		warn!("VPP data plane unavailable -- 6d NAT/routing will be skipped");
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
 		evt_client,
 		child_updown_stream,
 		valkey_client.clone(),
-		vpp_taps,
+		vpp_state,
 	));
 
 	// Valkey pubsub listener drives incremental VICI credential updates.
