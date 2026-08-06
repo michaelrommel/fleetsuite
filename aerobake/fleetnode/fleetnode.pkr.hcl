@@ -178,7 +178,7 @@ build {
       "sudo mv /tmp/_etc_frr_frr.conf /etc/frr/frr.conf",
       "sudo chown root:frr /etc/frr/daemons /etc/frr/frr.conf",
       "sudo chmod 640     /etc/frr/daemons /etc/frr/frr.conf",
-      "sudo systemctl disable frr",
+      "sudo systemctl enable frr",
     ]
   }
 
