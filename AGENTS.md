@@ -8,15 +8,40 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-05):** T3 complete -- BGP sessions established, /32 routes propagate to Return GW, full forwarding path confirmed (master IPIP -> backup eth3 -> VPN concentrator ens5 -> VPP DNAT). **T3 PASSED.**
+**Last completed session (2026-08-06):** T4 PASSED -- full VPP NAT + return path via Return GW confirmed.
+Helena1 (62.238.96.148) established IKEv2+NAT-T tunnel, dummy0 simulating device
+192.168.13.133. VPP SNAT to 198.51.100.133, backend at 172.16.53.6 (Backend-a).
+HTTP response received end-to-end. Two bugs fixed during T4:
+- fleetnode Packer: `systemctl enable frr` (was disable -- FRR never started on concentrator).
+- fleetroute sysctl: `net.ipv4.conf.default.rp_filter=0` added (ipip-gw inherits
+  rp_filter=1 from conf/default at creation time; MAX(all=0,ipip-gw=1)=1 silently
+  dropped forwarded packets on the Return GW backup).
+Both fixes committed. Backend subnet infrastructure complete (Backend-a/b, rtb-backend,
+VPC endpoints). Routing model confirmed: 0.0.0.0/0 via Return GW master in rtb-backend;
+AWS services via VPC endpoints; global IP traffic via BGP automatically.
 
 ### What the next session should do
 
+**T4 is COMPLETE. Both AMI source fixes are committed. Rebuild both AMIs before
+the next instance cycle.**
 
-**Immediate next step: rebuild both AMIs and run T4.** T3 is COMPLETE.
+fleetnode rebuild needed (FRR enable fix):
+```bash
+cd aerobake/fleetnode && packer build fleetnode.pkr.hcl
+```
+Update `fleetipsec-lt-vpn` and cycle the VPN concentrator instance.
 
-All fixes are committed. Running instances are hand-configured and will not survive
-reboot. A clean AMI rebuild is the ONLY required next action before T4.
+fleetroute rebuild needed (rp_filter default fix):
+```bash
+cd aerobake/fleetroute && packer build fleetroute.pkr.hcl
+```
+Update LT and cycle both Return GW instances.
+
+**Open topic (not blocking further testing):** Initiating tunnels from the AWS
+side toward customer CPEs -- needed for the fleetshell use case where internal
+users drive the connection. Architecture not yet designed.
+
+**Next development work:** ipsecscale (Build Order step 8) -- LVS autoscaling daemon.
 
 ----------------------------------------------------------------------
 REBUILD SEQUENCE  <<<  DO THIS FIRST
@@ -56,13 +81,20 @@ REBUILD SEQUENCE  <<<  DO THIS FIRST
 
 7. Run T4: full VPP NAT + confirmed return path via Return GW.
    From koi: swanctl --initiate --child fleetipsec-ikev2
-   Ping from seagull (192.168.13.133) through tunnel to backend (194.138.39.18).
+   Test backend must be in Backend-a (`subnet-01a513292ea15ae83`) or Backend-b
+   (`subnet-08213d03f2940855c`) with `sg-backend` attached. The `fleetpulse
+   notify-master` call on Return GW VRRP election sets `0.0.0.0/0` in
+   rtb-backend pointing to the Return GW master ENI -- verify this route is
+   present before testing (`aws ec2 describe-route-tables --route-table-ids
+   rtb-0a446e715fc3ec757`).
+   Seed Valkey with a nat record mapping 198.51.100.133 -> <backend-container-ip>.
+   Ping from seagull (192.168.13.133) through tunnel to backend container.
 
 ----------------------------------------------------------------------
 STATE OF RUNNING INSTANCES (end of 2026-08-05 session)
 ----------------------------------------------------------------------
 
-Return GW master (i-02c098dca9fbe0b41, 172.16.51.23, AZ-a):
+Return GW master (i-0a6ed3e8056541c2e, 172.16.51.x, AZ-a):
   Running ami-0ce52bcbd3c5e7d17. All services UP, manually configured.
   eth3=172.16.49.4 (VPN-a), ipip-gw tunnel to backup. VRRP master.
   BGP Established with 172.16.50.119. rp_filter=0 set at runtime only.
@@ -336,6 +368,8 @@ IGW:       igw-0599736bc51a9ac5c
 | FleetShell-IPSec-ReturnGW-a | `subnet-017d5b3a6331e26a7` | 172.16.51.0/27 | eu-west-2a | PRIVATE | rtb-private |
 | FleetShell-IPSec-ReturnGW-b | `subnet-082703ab573f0f4e9` | 172.16.51.32/27 | eu-west-2b | PRIVATE | rtb-private |
 | FleetShell-IPSec-Management | `subnet-02387719b5b2c3352` | 172.16.52.0/24 | eu-west-2a | PRIVATE | rtb-private |
+| FleetShell-IPSec-Backend-a | `subnet-01a513292ea15ae83` | 172.16.53.0/24 | eu-west-2a | PRIVATE | rtb-backend |
+| FleetShell-IPSec-Backend-b | `subnet-08213d03f2940855c` | 172.16.54.0/24 | eu-west-2b | PRIVATE | rtb-backend |
 
 All four mgmt subnets (LVS-mgmt-a/b, ReturnGW-mgmt-a/b) are created and
 associated with rtb-private.
@@ -365,6 +399,7 @@ aws autoscaling describe-auto-scaling-groups \
 | FleetShell-IPSec-rtb-public | `rtb-0ca8eab40e09c76ae` | `0.0.0.0/0 -> igw-0599736bc51a9ac5c` | LVS-a, LVS-b |
 | FleetShell-IPSec-rtb-vpn | `rtb-01c3275faa537fcc1` | set by ipsecpulse notify-master | VPN-a, VPN-b |
 | FleetShell-IPSec-rtb-private | `rtb-0540e3736995912c5` | `0.0.0.0/0 -> nat-0fb75bf0679751582` | ReturnGW-a/b, Management, LVS-mgmt-a/b, ReturnGW-mgmt-a/b |
+| FleetShell-IPSec-rtb-backend | `rtb-0a446e715fc3ec757` | `0.0.0.0/0 -> Return GW master eth0 ENI` (set by `fleetpulse notify-master`) | Backend-a, Backend-b |
 
 ### Security Groups
 
@@ -374,6 +409,8 @@ aws autoscaling describe-auto-scaling-groups \
 | FleetShell-IPSec-sg-vpn | `sg-04dcc0342150eb53b` | IPSec from LVS; BGP from ReturnGW |
 | FleetShell-IPSec-sg-returngw | `sg-0516f1d2561c7754d` | BGP from VPN; all from VPC |
 | FleetShell-IPSec-sg-management | `sg-053524ea7dcdb64f1` | PostgreSQL from VPN; SSH from CLI_RemoteAccess |
+| FleetShell-IPSec-sg-backend | see `make_sg_backend.sh` | Inbound ICMP + TCP 80 + TCP 8080 from `198.51.100.0/24`; SSH from CLI_RemoteAccess. Attach to all backend server instances/tasks. |
+| FleetShell-IPSec-sg-endpoints | `sg-0438c989d6fe0f276` | TCP 443 inbound from `172.16.53.0/24` + `172.16.54.0/24`. Attached to VPC interface endpoint ENIs only. |
 
 ### Other resources
 
@@ -1113,7 +1150,7 @@ net.core.wmem_max                = 134217728
      VPP unavailability is non-fatal (degraded mode, no data plane).
      `nat.rs route_del` no longer specifies `blackhole` type (works for both
      blackhole and dev routes).
-     **Awaiting test** -- see "Next Session Starting Point" above.
+     **T4 PASSED (2026-08-06).** See T4 section and Next Session Starting Point.
    - 6e: ASG lifecycle hook heartbeat
    - 6f: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
@@ -1150,6 +1187,10 @@ executed have their output appended in the file after a `RESULT` marker.
 | `update_lt_vpn_ami.sh` | Done | LT v4: fleetnode skeleton AMI `ami-0e4b56716bd7d28f6` |
 | `make_tag_vip_inside.sh` | Done | `ipsec-vip-inside` ASG tags set (.10 and .40) |
 | `make_mgmt_eips.sh` | Done | Management EIPs allocated; `ipsec-mgmt-eip` ASG tags set |
+| `make_rtb_backend.sh` | Done | `FleetShell-IPSec-rtb-backend` (`rtb-0a446e715fc3ec757`). No default route -- set by `fleetpulse notify-master` on VRRP election. |
+| `make_sg_backend.sh` | Done | `FleetShell-IPSec-sg-backend` (`sg-0516f1d2561c7754d` -- check script for actual ID). Allows ICMP + TCP 80 + TCP 8080 inbound from `198.51.100.0/24`; SSH from `CLI_RemoteAccess`. |
+| `make_subnets_backend.sh` | Done | `FleetShell-IPSec-Backend-a` (`subnet-01a513292ea15ae83`, 172.16.53.0/24, AZ-a) + `FleetShell-IPSec-Backend-b` (`subnet-08213d03f2940855c`, 172.16.54.0/24, AZ-b). Both associated with `rtb-0a446e715fc3ec757`. |
+| `make_vpc_endpoints_backend.sh` | Done | S3 gateway endpoint (`vpce-0e96b7a35f98814ee`) on rtb-backend. Interface endpoints: ECR API (`vpce-0ce0b1dbd9132e371`), ECR DKR (`vpce-07e51ffc9257f76e2`), SSM (`vpce-007ba3bbe76f41014`), SSMMessages (`vpce-0e76ffe5b3bfa9533`), EC2Messages (`vpce-0d3947acf8d9bf3e5`). Endpoint SG: `sg-0438c989d6fe0f276` (`FleetShell-IPSec-sg-endpoints`). |
 
 ### Packer AMIs
 
@@ -1405,11 +1446,30 @@ appear in Return GW's BGP table on CHILD_SA UP.
 
 ### T4 -- VPP data plane
 
-**Pre-requisites:** VPP startup.conf in AMI (Build Order step 5).
-ipsecnode Increment 6d implemented.
+**Status: PASSED (2026-08-06).** Full VPP NAT + return path via Return GW confirmed.
 
-**What this proves:** VPP handles inner-traffic forwarding with per-customer
-VRF isolation and 1:1 NAT.
+Helena1 (62.238.96.148) IKEv2+NAT-T tunnel. dummy0 holds 192.168.13.133/32
+(simulated customer device). Traffic selector: local=192.168.13.133/32,
+remote=172.16.53.6/32 (backend container in Backend-a). VPP SNAT:
+192.168.13.133->198.51.100.133. HTTP GET to 172.16.53.6:8080 succeeded
+end-to-end. Return path: backend->rtb-backend->Return GW master->ipip-gw->
+Return GW backup->eth3->VPN concentrator ens5->vpp-outer->VPP reverse NAT->
+xfrm encrypt->helena1.
+
+Bugs found and fixed during T4:
+1. FRR disabled on VPN concentrator (Packer had `systemctl disable frr`).
+   Fixed: `systemctl enable frr` in fleetnode.pkr.hcl.
+2. `net.ipv4.conf.default.rp_filter=1` on Return GW backup caused ipip-gw to
+   silently drop forwarded packets (MAX(all=0, ipip-gw=1)=1, strict mode).
+   Fixed: `net.ipv4.conf.default.rp_filter=0` added to 50-fleetroute.conf.
+
+Client-side note: on the test gateway (helena1), a route with `src` prefsrc
+is required so curl uses the correct source IP without SO_BINDTODEVICE:
+`ip route add 172.16.53.6 via <gw> dev eth0 src 192.168.13.133`
+The test IP (192.168.13.133) must be assigned to a local interface (dummy0 or
+a secondary IP on eth0). SO_BINDTODEVICE must NOT be used -- decapsulated
+packets appear on eth0, not on dummy0, so a device-bound socket never receives
+the SYN-ACK.
 
 ---
 
