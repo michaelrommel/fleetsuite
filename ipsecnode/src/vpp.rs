@@ -277,6 +277,8 @@ async fn cleanup_stale_state() {
 	}
 	ip_warn(&["addr", "flush", "dev", VPP_OUTER_KERNEL]).await;
 	let _ = nft(&["delete", "table", "ip", NFT_TABLE]).await;
+	let _ = nft(&["delete", "table", "ip", NFT_BNAT_TABLE]).await;
+	let _ = nft(&["delete", "table", "ip", NFT_SVCROUTE_TABLE]).await;
 	// Flush old shared return table 9999 if left by a pre-6e deployment.
 	let _ = ip(&["route", "flush", "table", "9999"]).await;
 	for prio in ["100", "200"] {
@@ -328,6 +330,10 @@ pub async fn init() -> Result<Option<VppState>> {
 	// XFRM output policy (if_id) fires on the correct tunnel.
 
 	init_nftables_mangle().await?;
+	init_nftables_bnat().await?;
+	if let Err(e) = init_nftables_svcroute(&backend).await {
+		warn!("global service routing init failed: {e:#} -- traffic reaches real_ip directly");
+	}
 
 	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
 		  "VPP NAT44 initialised (per-site VRF mode)");
@@ -365,6 +371,71 @@ async fn init_nftables_mangle() -> Result<()> {
 	nft_batch(&rules).await.context("init nftables mangle table")?;
 	info!(table = NFT_TABLE, tcp_mss = TCP_MSS_CLAMP, "nftables mangle table initialised");
 	Ok(())
+}
+
+async fn init_nftables_bnat() -> Result<()> {
+	// POSTROUTING chain registers conntrack nat hooks required for the automatic
+	// reverse SNAT (real_ip -> customer_view_ip) on return packets.
+	// Per-site maps and PREROUTING rules are added per-site on CHILD_SA UP.
+	let rules = format!(
+		"add table ip {NFT_BNAT_TABLE}\n\
+		 add chain ip {NFT_BNAT_TABLE} prerouting \
+		   {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
+		 add chain ip {NFT_BNAT_TABLE} postrouting \
+		   {{ type nat hook postrouting priority srcnat; policy accept; }}\n"
+	);
+	nft_batch(&rules).await.context("init nftables bnat table")?;
+	info!(table = NFT_BNAT_TABLE, "nftables per-site backend DNAT table created");
+	Ok(())
+}
+
+async fn init_nftables_svcroute(backend: &BackendConfig) -> Result<()> {
+	// Global port-based service routing applied on vpp-outer after per-customer
+	// VPP SNAT.  POSTROUTING registers conntrack hooks for the reverse SNAT on
+	// return traffic from backend servers.
+	let header = format!(
+		"add table ip {NFT_SVCROUTE_TABLE}\n\
+		 add chain ip {NFT_SVCROUTE_TABLE} prerouting \
+		   {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
+		 add chain ip {NFT_SVCROUTE_TABLE} postrouting \
+		   {{ type nat hook postrouting priority srcnat; policy accept; }}\n"
+	);
+	nft_batch(&header).await.context("init svcroute table")?;
+
+	let mut rule_count = 0u32;
+	for role in ["access_server", "sd_server", "em_server"] {
+		if let Some(server) = backend.server_for(role) {
+			for split in &server.split {
+				match add_svcroute_rule(split).await {
+					Ok(())  => rule_count += 1,
+					Err(e)  => warn!(role, "svcroute rule add failed: {e:#}"),
+				}
+			}
+		}
+	}
+	info!(table = NFT_SVCROUTE_TABLE, rules = rule_count,
+		  "global service routing table initialised");
+	Ok(())
+}
+
+async fn add_svcroute_rule(split: &SplitRule) -> Result<()> {
+	let port_match = if !split.ports.is_empty() {
+		let p: Vec<String> = split.ports.iter().map(|n| n.to_string()).collect();
+		format!("tcp dport {{ {} }}", p.join(", "))
+	} else if !split.src_ports.is_empty() {
+		let p: Vec<String> = split.src_ports.iter().map(|n| n.to_string()).collect();
+		format!("tcp sport {{ {} }}", p.join(", "))
+	} else {
+		anyhow::bail!("split rule for {} has no ports or src_ports", split.dnat_to);
+	};
+	let rule = format!(
+		"add rule ip {NFT_SVCROUTE_TABLE} prerouting \
+		 iifname \"{VPP_OUTER_KERNEL}\" {port_match} dnat to {}\n",
+		split.dnat_to,
+	);
+	nft_batch(&rule)
+		.await
+		.with_context(|| format!("add svcroute rule: {port_match} -> {}", split.dnat_to))
 }
 
 // -- Per-CHILD_SA event handlers ----------------------------------------------
