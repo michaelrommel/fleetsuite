@@ -48,6 +48,7 @@ pub struct NatRecord {
 	/// -> the real backend IP.  Absent when the customer uses real addresses.
 	/// Used by VPP DNAT only (Increment 6d); ignored in Increment 6c.
 	#[serde(default)]
+	#[allow(dead_code)]
 	pub backend_nat: Vec<BackendNatEntry>,
 }
 
@@ -62,6 +63,7 @@ pub struct DeviceNatEntry {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct BackendNatEntry {
 	/// IP address the customer uses to reach the backend (their view).
 	pub customer_view_ip: String,

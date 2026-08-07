@@ -10,8 +10,8 @@
 //! Forward path: xfrm-{hex} -> ip rule prio 100 -> fwd_table -> vpp-{hex}
 //!   -> VPP SNAT in VRF if_id -> vpp-outer -> backend.
 //! Return path: vpp-outer -> VPP DNAT -> vpp-{hex} -> nftables mark=if_id
-//!   -> ip rule prio 200 -> ret_table default dev xfrm-{hex}
-//!   -> XFRM output policy (if_id) fires on xfrm-{hex}, encrypting the packet.
+//!   -> ip rule prio 200 -> table 9999 default dev ens5
+//!   -> XFRM mark_out=if_id selects the right tunnel.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use tracing::{debug, info, warn};
 
-use crate::nat::{BackendNatEntry, NAT_PREFIX, NatRecord};
+use crate::nat::{NAT_PREFIX, NatRecord};
 
 // -- Constants ----------------------------------------------------------------
 
@@ -34,10 +34,6 @@ const NFT_TABLE:       &str = "ipsecnode";
 const NFT_VPP_SET:     &str = "vpp_taps";
 /// nftables map: iface_index -> mark (if_id) for return-path XFRM selection.
 const NFT_VPP_MAP:     &str = "vpp_mark";
-/// nftables table for backend DNAT: customer_view_ip -> real backend IP.
-const NFT_BNAT_TABLE:  &str = "ipsecnode_bnat";
-/// Named map within NFT_BNAT_TABLE.
-const NFT_BNAT_MAP:    &str = "bnat_map";
 /// TCP MSS clamped to this value to fit inner payload within
 /// 1500-byte internet MTU after AES-256-GCM + UDP-NAT-T overhead (~100 bytes).
 const TCP_MSS_CLAMP:   u32  = 1380;
@@ -76,8 +72,6 @@ pub struct SiteVrfState {
 	pub ifindex:         u32,
 	/// Device NAT entries currently installed in VPP.
 	pub devices:         Vec<DeviceVrfEntry>,
-	/// Backend NAT entries installed in nftables bnat_map for this site.
-	pub bnat_entries:    Vec<BackendNatEntry>,
 	/// Active CHILD_SA count (re-keying guard).
 	pub child_sa_count:  u32,
 }
@@ -251,7 +245,6 @@ async fn cleanup_stale_state() {
 	}
 	ip_warn(&["addr", "flush", "dev", VPP_OUTER_KERNEL]).await;
 	let _ = nft(&["delete", "table", "ip", NFT_TABLE]).await;
-	let _ = nft(&["delete", "table", "ip", NFT_BNAT_TABLE]).await;
 	// Flush old shared return table 9999 if left by a pre-6e deployment.
 	let _ = ip(&["route", "flush", "table", "9999"]).await;
 	for prio in ["100", "200"] {
@@ -302,7 +295,6 @@ pub async fn init() -> Result<Option<VppState>> {
 	// XFRM output policy (if_id) fires on the correct tunnel.
 
 	init_nftables_mangle().await?;
-	init_nftables_bnat().await?;
 
 	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
 		  "VPP NAT44 initialised (per-site VRF mode)");
@@ -339,32 +331,6 @@ async fn init_nftables_mangle() -> Result<()> {
 	);
 	nft_batch(&rules).await.context("init nftables mangle table")?;
 	info!(table = NFT_TABLE, tcp_mss = TCP_MSS_CLAMP, "nftables mangle table initialised");
-	Ok(())
-}
-
-async fn init_nftables_bnat() -> Result<()> {
-	// The POSTROUTING chain is intentionally empty: it must be registered so
-	// the kernel creates conntrack nat hooks, which are required for the
-	// reverse SNAT on return traffic from the backend server.
-	//
-	// The PREROUTING rule has no iifname filter.  With 6e XFRM interfaces,
-	// decapsulated packets appear on xfrm-{hex} (not ens5), and there is one
-	// interface per site.  Filtering by interface would require per-site rule
-	// management.  Since customer_view_ip values are globally unique by design
-	// (Architecture Decision #16), matching on dst alone is safe.
-	let rules = format!(
-		"add table ip {NFT_BNAT_TABLE}\n\
-		 add map ip {NFT_BNAT_TABLE} {NFT_BNAT_MAP} \
-		   {{ type ipv4_addr : ipv4_addr; }}\n\
-		 add chain ip {NFT_BNAT_TABLE} prerouting \
-		   {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
-		 add rule ip {NFT_BNAT_TABLE} prerouting \
-		   dnat ip to ip daddr map @{NFT_BNAT_MAP}\n\
-		 add chain ip {NFT_BNAT_TABLE} postrouting \
-		   {{ type nat hook postrouting priority srcnat; policy accept; }}\n"
-	);
-	nft_batch(&rules).await.context("init nftables bnat table")?;
-	info!(table = NFT_BNAT_TABLE, "nftables backend DNAT table initialised");
 	Ok(())
 }
 
@@ -526,31 +492,12 @@ async fn setup_site_vrf(
 		}
 	}
 
-	// 10. Backend NAT: nftables PREROUTING DNAT for customer_view_ip -> real_ip.
-	let mut bnat = Vec::new();
-	for entry in &record.backend_nat {
-		match install_backend_nat(&entry.customer_view_ip, &entry.real_ip).await {
-			Ok(()) => {
-				info!(peer_ip,
-				      customer_view_ip = %entry.customer_view_ip,
-				      real_ip = %entry.real_ip,
-				      "backend NAT entry installed");
-				bnat.push(BackendNatEntry {
-					customer_view_ip: entry.customer_view_ip.clone(),
-					real_ip:          entry.real_ip.clone(),
-				});
-			}
-			Err(e) => warn!(peer_ip, customer_view_ip = %entry.customer_view_ip,
-			                "backend NAT install failed: {e:#}"),
-		}
-	}
-
 	Ok(SiteVrfState {
 		if_id, fwd_table, ret_table, tap_idx, vpp_tap,
 		inner_if:        inner_if.to_string(),
 		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
 		tap_kern_prefix: tap_ips.kern_prefix.clone(),
-		ifindex, devices, bnat_entries: bnat, child_sa_count: 1,
+		ifindex, devices, child_sa_count: 1,
 	})
 }
 
@@ -560,12 +507,6 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 	let vrf_str = site.if_id.to_string();
 	let xfrm_if = xfrm_if_name(site.if_id);
 	let idx_str = site.ifindex.to_string();
-
-	// 0. Remove backend NAT entries from nftables bnat_map.
-	for b in &site.bnat_entries {
-		remove_backend_nat_warn(&b.customer_view_ip).await;
-		info!(peer_ip, customer_view_ip = %b.customer_view_ip, "backend NAT entry removed");
-	}
 
 	// 1. Remove VPP NAT mappings; revert global_ip routes to blackhole so
 	//    nat::on_child_down can then delete them entirely.
@@ -663,25 +604,6 @@ async fn remove_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) {
 	]).await {
 		warn!(internal_ip, global_ip, "VPP nat44 del: {e:#}");
 	}
-}
-
-// -- Backend NAT helpers ------------------------------------------------------
-
-async fn install_backend_nat(customer_view_ip: &str, real_ip: &str) -> Result<()> {
-	nft(&[
-		"add", "element", "ip", NFT_BNAT_TABLE, NFT_BNAT_MAP,
-		&format!("{{ {customer_view_ip} : {real_ip} }}"),
-	])
-	.await
-	.with_context(|| format!("nft bnat_map add {customer_view_ip} -> {real_ip}"))
-}
-
-async fn remove_backend_nat_warn(customer_view_ip: &str) {
-	nft_warn(&[
-		"delete", "element", "ip", NFT_BNAT_TABLE, NFT_BNAT_MAP,
-		&format!("{{ {customer_view_ip} }}"),
-	])
-	.await;
 }
 
 // -- VPP tap deletion ---------------------------------------------------------
