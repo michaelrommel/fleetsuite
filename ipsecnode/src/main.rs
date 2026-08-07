@@ -41,6 +41,14 @@ async fn main() -> Result<()> {
 
 	let args = Args::parse_and_load();
 
+	// Load ipsecnode.toml config (backend server roles, port-split rules).
+	let cfg = nodeconfig::load().context("failed to load ipsecnode config")?;
+	info!(
+		has_access_server = cfg.backend.access_server.is_some(),
+		has_sd_server     = cfg.backend.sd_server.is_some(),
+		has_em_server     = cfg.backend.em_server.is_some(),
+		"backend config"
+	);
 	info!(
 		vici_socket     = %args.vici_socket,
 		valkey_url      = %args.valkey_url,
@@ -69,7 +77,7 @@ async fn main() -> Result<()> {
 	// Creates tap interfaces, enables NAT44, sets VPP default route.
 	// If VPP is not running, continues in degraded mode (no data plane).
 	info!("initialising VPP data plane ...");
-	let vpp_state = match vpp::init().await {
+	let vpp_state = match vpp::init(cfg.backend).await {
 		Ok(taps) => taps,
 		Err(e)   => {
 			warn!("VPP init error: {e:#} -- continuing without VPP data plane");

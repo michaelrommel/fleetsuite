@@ -318,8 +318,7 @@ async fn cleanup_stale_state() {
 
 // -- Startup initialisation ---------------------------------------------------
 
-pub async fn init() -> Result<Option<VppState>> {
-	let backend = BackendConfig::default(); // replaced in Step 7
+pub async fn init(backend: BackendConfig) -> Result<Option<VppState>> {
 	if let Err(e) = wait_for_vpp().await {
 		warn!("VPP not available: {e:#} -- running without data plane");
 		return Ok(None);
