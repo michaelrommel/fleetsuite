@@ -21,6 +21,7 @@ mod config;
 mod credentials;
 mod health;
 mod nat;
+mod nodeconfig;
 mod proposals;
 mod vici;
 mod vpp;
