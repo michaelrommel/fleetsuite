@@ -1837,6 +1837,33 @@ IKE phase is unaffected: IKE DH is mandatory and was enforced correctly
 
 ---
 
+## Open TODOs
+
+### FTP PASV reply IP -- aeroftp Rust code
+
+`nf_nat_ftp` rewrites the IP embedded in PASV responses to the address the
+kernel NAT layer sees as the post-SNAT source.  In our pipeline that is
+`global_ip` (after VPP SNAT), not `customer_view_ip`.  A device that
+strictly follows the PASV reply IP (rather than reusing the control-
+connection address as most modern clients do) will therefore try to open
+the FTP data connection to `global_ip:passive_port` instead of
+`customer_view_ip:passive_port` -- which may be blocked by the customer
+firewall.
+
+**TODO:** Investigate whether the aeroftp load-balancer (sister project
+`~/software/aerosuite`) exposes a Rust-level hook to override the IP
+address written into PASV replies.  If it does, ipsecnode could supply
+`customer_view_ip` (looked up from the Valkey backend_nat record for the
+current site) to aeroftp so the PASV response carries the correct address
+from the device's perspective, making `nf_nat_ftp` unnecessary for this
+specific rewrite.
+
+Entry point to look at: aeroftp's FTP proxy / ALG code in
+`~/software/aerosuite/aeroftp/src/` -- search for PASV handling or the
+place where the 227 response is constructed or forwarded.
+
+---
+
 ## Open Design Questions
 
 ### Return GW floating VIP -- cross-subnet problem
