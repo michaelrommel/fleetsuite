@@ -1,17 +1,20 @@
-//! VPP data-plane management for fleetnode (Increment 6e -- per-site VRFs).
+//! VPP data-plane management for fleetnode (Increment 6f-r -- per-site backend DNAT).
 //!
-//! See Architecture Decision #15 in AGENTS.md for the full design rationale.
+//! See Architecture Decision #15 (per-site VRFs) and #16 (backend DNAT) in AGENTS.md.
 //!
 //! Each active customer site gets its own VPP fib table (VRF), keyed by
 //! if_id = u32::from(peer_ip as Ipv4Addr).  Per-site NAT mappings use
 //! `vrf if_id` so two customers with the same internal_ip coexist without
 //! conflict.  The shared vpp-outer tap handles the NAT outside interface.
 //!
-//! Forward path: xfrm-{hex} -> ip rule prio 100 -> fwd_table -> vpp-{hex}
-//!   -> VPP SNAT in VRF if_id -> vpp-outer -> backend.
-//! Return path: vpp-outer -> VPP DNAT -> vpp-{hex} -> nftables mark=if_id
-//!   -> ip rule prio 200 -> table 9999 default dev ens5
-//!   -> XFRM mark_out=if_id selects the right tunnel.
+//! Forward path: xfrm-{hex} -> ipsecnode_bnat PREROUTING (customer_view_ip -> real_ip)
+//!   -> ip rule prio 100 -> fwd_table -> vpp-{hex}
+//!   -> VPP SNAT (internal_ip -> global_ip) in VRF if_id
+//!   -> vpp-outer -> ipsecnode_svcroute PREROUTING (port-based split) -> backend.
+//! Return path: vpp-outer -> VPP DNAT (global_ip -> internal_ip) -> vpp-{hex}
+//!   -> nftables mark=if_id -> ip rule prio 200 -> ret_table default dev xfrm-{hex}
+//!   -> conntrack reverse SNAT (real_ip -> customer_view_ip)
+//!   -> XFRM output policy (if_id) fires on xfrm-{hex}, encrypting the packet.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -20,7 +23,8 @@ use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use tracing::{debug, info, warn};
 
-use crate::nat::{NAT_PREFIX, NatRecord};
+use crate::nat::{BackendNatRecord, NAT_PREFIX, NatRecord};
+use crate::nodeconfig::{BackendConfig, SplitRule};
 
 // -- Constants ----------------------------------------------------------------
 
@@ -33,7 +37,11 @@ const NFT_TABLE:       &str = "ipsecnode";
 /// nftables set: iface_index values of active per-site taps.
 const NFT_VPP_SET:     &str = "vpp_taps";
 /// nftables map: iface_index -> mark (if_id) for return-path XFRM selection.
-const NFT_VPP_MAP:     &str = "vpp_mark";
+const NFT_VPP_MAP:        &str = "vpp_mark";
+/// nftables table for per-site backend DNAT: customer_view_ip -> real_ip.
+const NFT_BNAT_TABLE:     &str = "ipsecnode_bnat";
+/// nftables table for global port-based service routing on vpp-outer.
+const NFT_SVCROUTE_TABLE: &str = "ipsecnode_svcroute";
 /// TCP MSS clamped to this value to fit inner payload within
 /// 1500-byte internet MTU after AES-256-GCM + UDP-NAT-T overhead (~100 bytes).
 const TCP_MSS_CLAMP:   u32  = 1380;
@@ -46,6 +54,9 @@ const VPP_READY_SECS:  u64  = 30;
 pub struct VppState {
 	/// VPP-side name of the shared outside tap (e.g. "tap0").
 	pub outer_tap: String,
+	/// Global backend server config (real_ip + port-split rules per role).
+	/// Cloned from IpsecnodeConfig at startup; used in on_child_up.
+	pub backend: BackendConfig,
 }
 
 /// Per-site VRF state, created on CHILD_SA UP and destroyed on DOWN.
@@ -72,6 +83,8 @@ pub struct SiteVrfState {
 	pub ifindex:         u32,
 	/// Device NAT entries currently installed in VPP.
 	pub devices:         Vec<DeviceVrfEntry>,
+	/// Per-site backend DNAT state (nftables bnat map + PREROUTING rule).
+	pub bnat:            SiteBnatState,
 	/// Active CHILD_SA count (re-keying guard).
 	pub child_sa_count:  u32,
 }
@@ -84,6 +97,25 @@ pub struct DeviceVrfEntry {
 
 /// In-memory map: peer_ip -> per-site VRF state.  Owned by event_listener_task.
 pub type VrfCache = HashMap<String, SiteVrfState>;
+
+// -- SiteBnatState ------------------------------------------------------------
+
+/// Per-site backend DNAT state: one nftables map + one PREROUTING rule.
+/// An empty map_name means no backend NAT was configured for this site.
+pub struct SiteBnatState {
+	/// Per-site map name, e.g. "bnat_3eee6094".  Empty = nothing set up.
+	pub map_name:          String,
+	/// nftables PREROUTING rule handle; None if the rule was not added.
+	pub rule_handle:       Option<u64>,
+	/// customer_view_ips installed as map keys (for logging on teardown).
+	pub customer_view_ips: Vec<String>,
+}
+
+impl SiteBnatState {
+	fn empty() -> Self {
+		Self { map_name: String::new(), rule_handle: None, customer_view_ips: Vec::new() }
+	}
+}
 
 // -- VrfAllocator -------------------------------------------------------------
 
@@ -260,6 +292,7 @@ async fn cleanup_stale_state() {
 // -- Startup initialisation ---------------------------------------------------
 
 pub async fn init() -> Result<Option<VppState>> {
+	let backend = BackendConfig::default(); // replaced in Step 7
 	if let Err(e) = wait_for_vpp().await {
 		warn!("VPP not available: {e:#} -- running without data plane");
 		return Ok(None);
@@ -298,7 +331,7 @@ pub async fn init() -> Result<Option<VppState>> {
 
 	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
 		  "VPP NAT44 initialised (per-site VRF mode)");
-	Ok(Some(VppState { outer_tap }))
+	Ok(Some(VppState { outer_tap, backend }))
 }
 
 async fn create_tap(kernel_name: &str) -> Result<String> {
@@ -497,7 +530,7 @@ async fn setup_site_vrf(
 		inner_if:        inner_if.to_string(),
 		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
 		tap_kern_prefix: tap_ips.kern_prefix.clone(),
-		ifindex, devices, child_sa_count: 1,
+		ifindex, devices, bnat: SiteBnatState::empty(), child_sa_count: 1,
 	})
 }
 
