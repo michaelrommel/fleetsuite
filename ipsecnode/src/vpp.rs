@@ -129,7 +129,7 @@ fn if_id_from_peer(peer_ip: &str) -> Option<u32> {
 fn xfrm_if_name(if_id: u32)  -> String { format!("xfrm-{if_id:08x}") }
 fn inner_tap_name(if_id: u32) -> String { format!("vpp-{if_id:08x}")  }
 
-struct TapIps { vpp_ip: String, vpp_prefix: String, kern_prefix: String }
+struct TapIps { vpp_ip: String, vpp_prefix: String, kern_ip: String, kern_prefix: String }
 
 /// Derive tap /30 IPs from subnet index n within 10.127.0.0/16.
 /// Subnet n: base = 10.127.{n>>6}.{(n&63)*4}; VPP = base+1, kernel = base+2.
@@ -139,6 +139,7 @@ fn tap_ips_from_idx(n: u32) -> TapIps {
 	TapIps {
 		vpp_ip:      format!("10.127.{o3}.{}", b + 1),
 		vpp_prefix:  format!("10.127.{o3}.{}/30", b + 1),
+		kern_ip:     format!("10.127.{o3}.{}", b + 2),
 		kern_prefix: format!("10.127.{o3}.{}/30", b + 2),
 	}
 }
@@ -476,7 +477,8 @@ async fn setup_site_vrf(
 	// 9. VPP NAT static mappings, one per device_nat entry.
 	let mut devices = Vec::new();
 	for entry in &record.device_nat {
-		match install_device_nat(&vrf_str, &entry.internal_ip, &entry.global_ip).await {
+		match install_device_nat(&vrf_str, &entry.internal_ip, &entry.global_ip,
+		                         &tap_ips.kern_ip, &vpp_tap).await {
 			Ok(()) => {
 				info!(peer_ip, internal_ip = %entry.internal_ip,
 				      global_ip = %entry.global_ip, vrf = if_id, "VPP: NAT mapping installed");
@@ -554,11 +556,30 @@ async fn teardown_partial(inner_if: &str, fwd_table: u32, ret_table: u32, if_id:
 
 // -- Per-device NAT -----------------------------------------------------------
 
-async fn install_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) -> Result<()> {
+async fn install_device_nat(
+	vrf_str:     &str,
+	internal_ip: &str,
+	global_ip:   &str,
+	kern_ip:     &str,
+	vpp_tap:     &str,
+) -> Result<()> {
+	// NAT44 static 1:1 mapping in the per-site VRF.
+	// Note: VPP does NOT auto-insert a FIB entry for internal_ip in the VRF
+	// when using the `vrf` parameter; we must add it explicitly (see below).
 	vppctl(&[
 		"nat44", "add", "static", "mapping",
 		"local", internal_ip, "external", global_ip, "vrf", vrf_str,
 	]).await.context("VPP nat44 add static mapping")?;
+
+	// Explicit FIB route so VPP can forward the DNAT'd return packet
+	// (dst=internal_ip) to the kernel via the per-site tap.
+	// Without this VPP has no route for internal_ip in the VRF and drops it.
+	vppctl(&[
+		"ip", "route", "add",
+		&format!("{internal_ip}/32"),
+		"table", vrf_str,
+		"via", kern_ip, vpp_tap,
+	]).await.context("VPP FIB route for internal_ip in site VRF")?;
 
 	// Upgrade global_ip route: blackhole (6c) -> dev vpp-outer (return path).
 	ip(&["route", "replace", &format!("{global_ip}/32"), "dev", VPP_OUTER_KERNEL])
@@ -569,6 +590,14 @@ async fn install_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) -
 async fn remove_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) {
 	// Revert to blackhole; nat::on_child_down will then delete it.
 	ip_warn(&["route", "replace", &format!("{global_ip}/32"), "type", "blackhole"]).await;
+	// Remove explicit FIB route for internal_ip.
+	if let Err(e) = vppctl(&[
+		"ip", "route", "del",
+		&format!("{internal_ip}/32"),
+		"table", vrf_str,
+	]).await {
+		warn!(internal_ip, vrf = vrf_str, "VPP FIB route del: {e:#}");
+	}
 	if let Err(e) = vppctl(&[
 		"nat44", "del", "static", "mapping",
 		"local", internal_ip, "external", global_ip, "vrf", vrf_str,
