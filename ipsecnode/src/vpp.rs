@@ -159,6 +159,7 @@ fn if_id_from_peer(peer_ip: &str) -> Option<u32> {
 }
 
 fn xfrm_if_name(if_id: u32)  -> String { format!("xfrm-{if_id:08x}") }
+fn bnat_map_name(if_id: u32)  -> String { format!("bnat_{if_id:08x}")  }
 fn inner_tap_name(if_id: u32) -> String { format!("vpp-{if_id:08x}")  }
 
 struct TapIps { vpp_ip: String, vpp_prefix: String, kern_ip: String, kern_prefix: String }
@@ -222,6 +223,30 @@ async fn nft(args: &[&str]) -> Result<()> {
 
 async fn nft_warn(args: &[&str]) {
 	if let Err(e) = nft(args).await { warn!("nft {} (non-fatal): {e:#}", args.join(" ")); }
+}
+
+/// Run nft and return stdout (used when we need --echo --handle output).
+async fn nft_capture(args: &[&str]) -> Result<String> {
+	let out = tokio::process::Command::new("nft").args(args).output().await
+		.with_context(|| format!("spawn nft {}", args.join(" ")))?;
+	let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	if !out.status.success() {
+		anyhow::bail!("nft {} failed: {}", args.join(" "),
+			String::from_utf8_lossy(&out.stderr).trim());
+	}
+	Ok(stdout)
+}
+
+/// Parse the rule handle from `nft --echo --handle` output.
+/// The last token after `# handle ` on the output line is the handle number.
+fn parse_nft_handle(output: &str) -> Result<u64> {
+	output
+		.trim()
+		.rsplit_once("# handle ")
+		.and_then(|(_, tail)| tail.split_whitespace().next())
+		.ok_or_else(|| anyhow::anyhow!("no '# handle' in nft output: {output}"))?
+		.parse::<u64>()
+		.context("parse nft rule handle")
 }
 
 async fn nft_batch(rules: &str) -> Result<()> {
@@ -656,6 +681,96 @@ async fn teardown_partial(inner_if: &str, fwd_table: u32, ret_table: u32, if_id:
 	ip_warn(&["route", "del", "default", "table", &ret_str]).await;
 	ip_warn(&["link", "set", inner_if, "down"]).await;
 	ip_warn(&["link", "del", inner_if]).await;
+}
+
+// -- Per-site backend DNAT (nftables bnat) -----------------------------------
+
+async fn setup_site_bnat(
+	peer_ip:     &str,
+	if_id:       u32,
+	backend_nat: Option<&BackendNatRecord>,
+	backend:     &BackendConfig,
+) -> SiteBnatState {
+	let map_name = bnat_map_name(if_id);
+
+	// Build (customer_view_ip, real_ip) pairs from Valkey roles + config roles.
+	let mut pairs: Vec<(String, String)> = Vec::new();
+	if let Some(rec) = backend_nat {
+		for (role, view_ip) in rec.present_roles() {
+			match backend.real_ip_for(role) {
+				Some(real) => pairs.push((view_ip.to_string(), real.to_string())),
+				None => warn!(peer_ip, role,
+					"backend_nat role in Valkey has no real_ip in ipsecnode.toml -- skipping"),
+			}
+		}
+	}
+	if pairs.is_empty() {
+		return SiteBnatState::empty();
+	}
+
+	// Create the per-site nftables map.
+	if let Err(e) = nft(&[
+		"add", "map", "ip", NFT_BNAT_TABLE, &map_name,
+		"{ type ipv4_addr : ipv4_addr; }",
+	]).await {
+		warn!(peer_ip, "bnat map create failed: {e:#}");
+		return SiteBnatState::empty();
+	}
+
+	// Add (customer_view_ip : real_ip) elements.
+	let mut installed: Vec<String> = Vec::new();
+	for (view_ip, real_ip) in &pairs {
+		let elem = format!("{{ {view_ip} : {real_ip} }}");
+		match nft(&["add", "element", "ip", NFT_BNAT_TABLE, &map_name, &elem]).await {
+			Ok(()) => {
+				info!(peer_ip, %view_ip, %real_ip, "backend NAT entry installed");
+				installed.push(view_ip.clone());
+			}
+			Err(e) => warn!(peer_ip, %view_ip, "bnat element add failed: {e:#}"),
+		}
+	}
+	if installed.is_empty() {
+		nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &map_name]).await;
+		return SiteBnatState::empty();
+	}
+
+	// Add the PREROUTING rule scoped to xfrm-{hex}.
+	// ct state new: only new connections; conntrack handles ESTABLISHED replies
+	// automatically (also required for the 6g backend->device SNAT to work).
+	let xfrm_if = xfrm_if_name(if_id);
+	let map_ref = format!("@{map_name}");
+	let rule_out = nft_capture(&[
+		"--echo", "--handle",
+		"add", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
+		"iifname", &xfrm_if,
+		"ct", "state", "new",
+		"dnat", "ip", "to", "ip", "daddr", "map", &map_ref,
+	]).await;
+
+	let rule_handle = match rule_out {
+		Ok(out) => match parse_nft_handle(&out) {
+			Ok(h)  => { info!(peer_ip, handle = h, "bnat PREROUTING rule added"); Some(h) }
+			Err(e) => { warn!(peer_ip, "parse bnat rule handle: {e:#}"); None }
+		},
+		Err(e) => { warn!(peer_ip, "bnat PREROUTING rule add failed: {e:#}"); None }
+	};
+
+	SiteBnatState { map_name, rule_handle, customer_view_ips: installed }
+}
+
+async fn teardown_site_bnat(peer_ip: &str, bnat: &SiteBnatState) {
+	if bnat.map_name.is_empty() { return; }
+
+	// Delete rule first (releases the map reference), then the map itself.
+	if let Some(h) = bnat.rule_handle {
+		let h_str = h.to_string();
+		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
+				   "handle", &h_str]).await;
+		info!(peer_ip, handle = h, "bnat PREROUTING rule removed");
+	}
+	nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &bnat.map_name]).await;
+	info!(peer_ip, map = %bnat.map_name,
+		  entries = bnat.customer_view_ips.len(), "bnat map removed");
 }
 
 // -- Per-device NAT -----------------------------------------------------------
