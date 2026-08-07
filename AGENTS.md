@@ -8,49 +8,59 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-06):** T4 PASSED -- full VPP NAT + return path via Return GW confirmed.
-Helena1 (62.238.96.148) established IKEv2+NAT-T tunnel, dummy0 simulating device
-192.168.13.133. VPP SNAT to 198.51.100.133, backend at 172.16.53.6 (Backend-a).
-HTTP response received end-to-end. Two bugs fixed during T4:
-- fleetnode Packer: `systemctl enable frr` (was disable -- FRR never started on concentrator).
-- fleetroute sysctl: `net.ipv4.conf.default.rp_filter=0` added (ipip-gw inherits
-  rp_filter=1 from conf/default at creation time; MAX(all=0,ipip-gw=1)=1 silently
-  dropped forwarded packets on the Return GW backup).
-Both fixes committed. Backend subnet infrastructure complete (Backend-a/b, rtb-backend,
-VPC endpoints). Routing model confirmed: 0.0.0.0/0 via Return GW master in rtb-backend;
-AWS services via VPC endpoints; global IP traffic via BGP automatically.
+**Last completed session (2026-08-07):** Increment 6e COMPLETE -- per-customer
+VRF isolation working end-to-end. Two customers with identical internal_ip
+(192.168.13.133) connect simultaneously, each in their own VPP fib table,
+using independent XFRM interfaces and per-site routing. Full HTTP body
+confirmed via curl on both helena1 and helena2.
+
+Three bugs found and fixed during 6e testing:
+- Return routing must go via `xfrm-{hex}` (not `ens5` via shared table 9999)
+  because the XFRM output policy has `if_id` set -- the packet must exit
+  through the XFRM interface for the policy to fire and encrypt.
+- TCP MSS must be clamped to 1380 in nftables FORWARD chain. AES-256-GCM +
+  UDP-NAT-T adds ~100 bytes overhead; 1500-byte internet MTU limits inner
+  TCP segments to MSS 1400 (1380 used as conservative production value).
+- VPP `nat44 add static mapping local X external Y vrf N` does NOT auto-
+  insert a FIB route for X in VRF N. Without `ip route add X/32 table N
+  via <kern_ip> <vpp_tap>`, VPP DNAT succeeds but then silently drops the
+  packet (dpo-drop) in the VRF. All three fixes are committed.
+
+All code changes committed. Binary rebuilt (musl). Deployed manually on
+running concentrator (scp to /usr/local/bin/ipsecnode). AMI not yet rebuilt.
 
 ### What the next session should do
 
-**T4 is COMPLETE. AMI source fixes committed. Rebuild both AMIs when instance
-cycle is next needed (see Rebuild Sequence below).**
+**Increment 6e is COMPLETE. All fixes committed and tested.**
 
-**Current priority: Increment 6e -- per-customer VRF isolation in vpp.rs.**
-This is a correctness blocker: the current global VPP NAT table silently breaks
-when two customers share the same device internal_ip (e.g. 192.168.1.10).
-The fix uses XFRM interfaces (one per site, created at VICI load-conn time)
-and per-site VPP fib tables (created on CHILD_SA UP). See Architecture
-Decision #15 for the full design.
+**Next: Increment 6f -- per-site backend DNAT** (Architecture Decision #16).
 
-Files to change (in order):
-1. `ipsecnode/src/vici.rs`  -- add `if_id_in`, `if_id_out`, `mark_out` to
-   `ChildConnConfig` and `load_conn()` signature.
-2. `ipsecnode/src/vpp.rs`   -- major refactor: per-site VRFs, VrfAllocator,
-   nftables mangle map for return-path marking.
-3. `ipsecnode/src/credentials.rs` -- create/delete XFRM interface around
-   VICI load-conn/unload-conn.
-4. `ipsecnode/src/main.rs`  -- update `VppTaps` -> `VppState` type.
+The nftables PREROUTING DNAT approach is confirmed working (Step 1 manual test
+passed). The 6e VRF isolation is now in place, so per-site `customer_view_ip`
+mappings can be isolated correctly.
 
-After 6e: implement backend DNAT (Increment 6g) using nftables PREROUTING
-map (see Architecture Decision #16 -- Step 1 manually tested and confirmed).
+Implementation plan for 6f:
+- `vpp::init()`: create `ipsecnode_bnat` nftables table with named map
+  `bnat_map { type ipv4_addr : ipv4_addr }`, PREROUTING chain + rule
+  `iifname ens5 dnat ip to ip daddr map @bnat_map`, empty POSTROUTING chain.
+- `vpp::on_child_up()`: for each `backend_nat` entry in NatRecord, run
+  `nft add element ip ipsecnode_bnat bnat_map { customer_view_ip : real_ip }`.
+- `vpp::on_child_down()`: `nft delete element` for each entry.
+- Add `BackendNatCache` (peer_ip -> Vec<customer_view_ip>) for teardown.
+- Remove `#[allow(dead_code)]` from `NatRecord::backend_nat` and `BackendNatEntry`.
 
-**Open topic (not blocking 6e/6g):** Initiating tunnels from the AWS side
-toward customer CPEs. Architecture Decision #17 documents the design approach
-(`start_action = trap` + `inactivity` timeout). Implement after routing design
-for backend-to-device traffic is resolved.
+Constraint: `customer_view_ip` must be globally unique across all customers
+(same discipline as `global_ip`). Two customers using the same `customer_view_ip`
+but wanting different real_ips require VPP twice-nat (future increment).
 
-**After ipsecnode increments:** ipsecscale (Build Order step 8) -- see the
-ipsecscale section for concrete sizing and scale-out criteria.
+**AMI rebuild needed** before next instance cycle:
+```bash
+cd aerobake/fleetnode && packer build fleetnode.pkr.hcl
+```
+The deployed binary was scp'd manually. Commit hash: `7c07cf2`.
+
+**Ongoing open topic:** AWS-initiated tunnels (backend -> device).
+See Architecture Decision #17. Deferred until routing design is resolved.
 
 ----------------------------------------------------------------------
 REBUILD SEQUENCE  <<<  DO THIS FIRST
@@ -1356,24 +1366,24 @@ net.core.wmem_max                = 134217728
      **T4 PASSED (2026-08-06).** See T4 section and Next Session Starting Point.
      **KNOWN ISSUE:** global VPP NAT table breaks when two customers share the
      same device internal_ip. Fixed in Increment 6e.
-   - 6e: Per-customer VRF isolation -- **IN PROGRESS**.
-     Replaces global vpp-inner + table-200 with per-site XFRM interfaces,
-     per-site VPP fib tables, and per-site tap pairs. See Architecture
-     Decision #15 for full design. Key constants:
-       - Physical NIC: `ens5` (Nitro naming, Debian Bookworm AMI)
-       - XFRM interface name: `xfrm-{peer_ip_hex8}` (e.g. xfrm-3eee6094)
-       - Per-site tap kernel name: `vpp-{peer_ip_hex8}` (e.g. vpp-3eee6094)
-       - if_id = u32::from(peer_ip as Ipv4Addr) (unique, no allocator needed)
-       - Forward routing table: allocated 10000+ (VrfAllocator, task-local)
-       - Return routing table: allocated 60000+ (VrfAllocator, task-local)
-       - Tap /30 subnet: allocated from 10.127.0.0/16 (VrfAllocator)
-       - Shared return table 9999: `default dev ens5`
-       - nftables mangle map `ipsecnode/vpp_mark`: ifindex -> mark (if_id)
-     Production sysctl values (raise from dev defaults):
-       - `nat44 plugin enable sessions 500000` (was 65536 -- too low)
-       - `vm.nr_hugepages = 8192` (was 1024 = 2 GB; per-site taps need ~16 GB)
-   - 6f: Backend DNAT via nftables PREROUTING -- see Architecture Decision #16.
-     Tested manually (Step 1 PASSED). Implement in ipsecnode after 6e.
+   - 6e: Per-customer VRF isolation -- **COMPLETE (2026-08-07)**.
+     Each site gets its own VPP fib table (id = u32 from peer IPv4), XFRM
+     interface (`xfrm-{hex8}`), per-site inside tap (`vpp-{hex8}`) in
+     10.127.0.0/16 /30 space, forward table (10000+), return table (60000+).
+     Three bugs found and fixed during testing (all committed):
+     1. Return table must route `default dev xfrm-{hex}` (not `dev ens5`);
+        XFRM output policy requires `if_id` on the output interface.
+     2. TCP MSS clamped to 1380 via nftables FORWARD chain in `ipsecnode`
+        table (AES-256-GCM + UDP-NAT-T = ~100 bytes overhead per packet).
+     3. VPP `nat44 static mapping ... vrf N` does NOT auto-insert FIB entry
+        for `internal_ip` in VRF N; must explicitly add
+        `ip route add internal_ip/32 table N via kern_ip vpp_tap`.
+     XFRM interface MTU set to 1420 at creation (`credentials.rs`).
+     Confirmed: two customers with identical `internal_ip` (192.168.13.133)
+     coexist on the same concentrator with full HTTP traffic.
+   - 6f: Backend DNAT via nftables PREROUTING -- **NEXT**.
+     See Architecture Decision #16. Step 1 manually confirmed. Implementation
+     plan in "What the next session should do" above.
    - 6g: ASG lifecycle hook heartbeat
    - 6h: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
@@ -1702,6 +1712,35 @@ The test IP (192.168.13.133) must be assigned to a local interface (dummy0 or
 a secondary IP on eth0). SO_BINDTODEVICE must NOT be used -- decapsulated
 packets appear on eth0, not on dummy0, so a device-bound socket never receives
 the SYN-ACK.
+
+---
+
+### T5 -- Per-customer VRF isolation (Increment 6e)
+
+**Status: PASSED (2026-08-07).** Two customers (helena1 62.238.96.148,
+helena2 62.238.110.152) both using `internal_ip=192.168.13.133` connect
+simultaneously to the same concentrator. Each gets its own VPP fib table,
+XFRM interface, and per-site tap. Full HTTP (curl) confirmed on both.
+
+Bugs found during T5 (all fixed before passing):
+1. **Return routing via xfrm interface**: return table must route
+   `default dev xfrm-{hex}`. Routing via `dev ens5` causes the XFRM output
+   policy (which has `if_id` set) to never fire because the output interface
+   does not carry the required `if_id`. Diagnosis: `ip xfrm policy` showed
+   `if_id 0x3eee6094` on the outbound policy; `nft monitor trace` showed
+   the packet leaving via ens5 unencrypted.
+2. **TCP MSS clamping**: AES-256-GCM + UDP-NAT-T adds ~100 bytes per packet.
+   Backend VPC MSS=1440 still exceeded 1500 MTU after encapsulation. Fixed:
+   nftables FORWARD chain clamps to MSS=1380. Confirmed via tcpdump: large
+   HTTP responses now arrive; before fix only the last small segment got
+   through (SACK evidence: seq 5713:6294 received, 1:5713 dropped).
+3. **VPP FIB route for internal_ip**: `nat44 add static mapping local X
+   external Y vrf N` does NOT auto-insert X/32 in VRF N's FIB. After DNAT
+   (Y->X), VPP looked up X in VRF N, found no route, silently dropped
+   (dpo-drop). Diagnosis: `vppctl show ip fib table N | grep internal_ip`
+   returned nothing; ARP `who-has Y tell 10.255.0.5` on vpp-outer confirmed
+   VPP was not forwarding. Fix: `install_device_nat()` now explicitly adds
+   `vppctl ip route add X/32 table N via kern_ip vpp_tap`.
 
 ---
 
