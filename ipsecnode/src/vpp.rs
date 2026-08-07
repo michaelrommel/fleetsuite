@@ -25,15 +25,18 @@ use crate::nat::{NAT_PREFIX, NatRecord};
 // -- Constants ----------------------------------------------------------------
 
 const VPPCTL:          &str = "/usr/bin/vppctl";
-const TUNNEL_DEV:      &str = "ens5";
 pub const VPP_OUTER_KERNEL: &str = "vpp-outer";
 const OUTER_ADDR:      &str = "10.255.0.5/30";
 const OUTER_VPP_ADDR:  &str = "10.255.0.6/30";
 const OUTER_KERNEL_IP: &str = "10.255.0.5";
-const RETURN_TABLE:    u32  = 9999;
 const NFT_TABLE:       &str = "ipsecnode";
+/// nftables set: iface_index values of active per-site taps.
 const NFT_VPP_SET:     &str = "vpp_taps";
+/// nftables map: iface_index -> mark (if_id) for return-path XFRM selection.
 const NFT_VPP_MAP:     &str = "vpp_mark";
+/// TCP MSS clamped to this value to fit inner payload within
+/// 1500-byte internet MTU after AES-256-GCM + UDP-NAT-T overhead (~100 bytes).
+const TCP_MSS_CLAMP:   u32  = 1380;
 const VPP_READY_SECS:  u64  = 30;
 
 // -- Public types -------------------------------------------------------------
@@ -52,6 +55,9 @@ pub struct SiteVrfState {
 	pub if_id:           u32,
 	/// Linux forward routing table ID (range 10000+).
 	pub fwd_table:       u32,
+	/// Linux return routing table ID (range 60000+).
+	/// Routes `default dev xfrm-{hex}` so XFRM policy with if_id fires.
+	pub ret_table:       u32,
 	/// Tap /30 subnet index (for deallocation).
 	pub tap_idx:         u32,
 	/// VPP-side tap name (e.g. "tap1").
@@ -86,18 +92,28 @@ pub type VrfCache = HashMap<String, SiteVrfState>;
 pub struct VrfAllocator {
 	next_fwd: u32,
 	free_fwd: Vec<u32>,
+	next_ret: u32,
+	free_ret: Vec<u32>,
 	next_tap: u32,
 	free_tap: Vec<u32>,
 }
 
 impl VrfAllocator {
 	pub fn new() -> Self {
-		Self { next_fwd: 10_000, free_fwd: Vec::new(), next_tap: 0, free_tap: Vec::new() }
+		Self {
+			next_fwd: 10_000, free_fwd: Vec::new(),
+			next_ret: 60_000, free_ret: Vec::new(),
+			next_tap: 0,      free_tap: Vec::new(),
+		}
 	}
 	fn alloc_fwd(&mut self) -> u32 {
 		self.free_fwd.pop().unwrap_or_else(|| { let t = self.next_fwd; self.next_fwd += 1; t })
 	}
 	fn free_fwd(&mut self, t: u32) { self.free_fwd.push(t); }
+	fn alloc_ret(&mut self) -> u32 {
+		self.free_ret.pop().unwrap_or_else(|| { let t = self.next_ret; self.next_ret += 1; t })
+	}
+	fn free_ret(&mut self, t: u32) { self.free_ret.push(t); }
 	fn alloc_tap(&mut self) -> u32 {
 		self.free_tap.pop().unwrap_or_else(|| { let i = self.next_tap; self.next_tap += 1; i })
 	}
@@ -228,6 +244,8 @@ async fn cleanup_stale_state() {
 	}
 	ip_warn(&["addr", "flush", "dev", VPP_OUTER_KERNEL]).await;
 	let _ = nft(&["delete", "table", "ip", NFT_TABLE]).await;
+	// Flush old shared return table 9999 if left by a pre-6e deployment.
+	let _ = ip(&["route", "flush", "table", "9999"]).await;
 	for prio in ["100", "200"] {
 		loop {
 			let ok = tokio::process::Command::new("ip")
@@ -271,15 +289,14 @@ pub async fn init() -> Result<Option<VppState>> {
 	vppctl(&["set", "interface", "nat44", "out", &outer_tap]).await
 		.context("set NAT44 outside interface")?;
 
-	// Shared return table: all per-site return ip rules point here.
-	let ret_str = RETURN_TABLE.to_string();
-	ip(&["route", "replace", "default", "dev", TUNNEL_DEV, "table", &ret_str]).await
-		.context("create shared return routing table")?;
+	// Per-site return tables (range 60000+) are created per-site in
+	// setup_site_vrf and route `default dev xfrm-{hex}` so that the
+	// XFRM output policy (if_id) fires on the correct tunnel.
 
 	init_nftables_mangle().await?;
 
 	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
-		  return_table = RETURN_TABLE, "VPP NAT44 initialised (per-site VRF mode)");
+		  "VPP NAT44 initialised (per-site VRF mode)");
 	Ok(Some(VppState { outer_tap }))
 }
 
@@ -295,6 +312,7 @@ async fn create_tap(kernel_name: &str) -> Result<String> {
 }
 
 async fn init_nftables_mangle() -> Result<()> {
+	let mss = TCP_MSS_CLAMP.to_string();
 	let rules = format!(
 		"add table ip {NFT_TABLE}\n\
 		 add set ip {NFT_TABLE} {NFT_VPP_SET} {{ type iface_index; }}\n\
@@ -302,10 +320,16 @@ async fn init_nftables_mangle() -> Result<()> {
 		 add chain ip {NFT_TABLE} mangle_pre \
 		   {{ type filter hook prerouting priority mangle; policy accept; }}\n\
 		 add rule ip {NFT_TABLE} mangle_pre \
-		   iif @{NFT_VPP_SET} meta mark set iif map @{NFT_VPP_MAP}\n"
+		   iif @{NFT_VPP_SET} meta mark set iif map @{NFT_VPP_MAP}\n\
+		 add chain ip {NFT_TABLE} tcp_mss \
+		   {{ type filter hook forward priority mangle; policy accept; }}\n\
+		 add rule ip {NFT_TABLE} tcp_mss \
+		   tcp flags & (syn | rst) == syn \
+		   tcp option maxseg size > {mss} \
+		   tcp option maxseg size set {mss}\n"
 	);
 	nft_batch(&rules).await.context("init nftables mangle table")?;
-	info!(table = NFT_TABLE, "nftables mangle table initialised");
+	info!(table = NFT_TABLE, tcp_mss = TCP_MSS_CLAMP, "nftables mangle table initialised");
 	Ok(())
 }
 
@@ -335,22 +359,24 @@ pub async fn on_child_up(
 	};
 
 	let fwd_table = alloc.alloc_fwd();
+	let ret_table = alloc.alloc_ret();
 	let tap_idx   = alloc.alloc_tap();
 	let tap_ips   = tap_ips_from_idx(tap_idx);
 	let inner_if  = inner_tap_name(if_id);
 
-	match setup_site_vrf(peer_ip, if_id, &inner_if, fwd_table, tap_idx,
+	match setup_site_vrf(peer_ip, if_id, &inner_if, fwd_table, ret_table, tap_idx,
 	                     &tap_ips, &record, state).await {
 		Ok(site) => {
-			info!(peer_ip, vrf = if_id, fwd_table,
+			info!(peer_ip, vrf = if_id, fwd_table, ret_table,
 			      inner_if, tap_vpp = %site.vpp_tap, "VPP: per-site VRF active");
 			cache.insert(peer_ip.to_string(), site);
 		}
 		Err(e) => {
 			warn!(peer_ip, "VRF setup failed: {e:#} -- freeing resources");
 			alloc.free_fwd(fwd_table);
+			alloc.free_ret(ret_table);
 			alloc.free_tap(tap_idx);
-			teardown_partial(&inner_if, fwd_table, if_id).await;
+			teardown_partial(&inner_if, fwd_table, ret_table, if_id).await;
 		}
 	}
 }
@@ -373,9 +399,10 @@ pub async fn on_child_down(
 	}
 
 	let site = cache.remove(peer_ip).unwrap();
-	let (fwd, tap) = (site.fwd_table, site.tap_idx);
+	let (fwd, ret, tap) = (site.fwd_table, site.ret_table, site.tap_idx);
 	teardown_site_vrf(peer_ip, &site).await;
 	alloc.free_fwd(fwd);
+	alloc.free_ret(ret);
 	alloc.free_tap(tap);
 }
 
@@ -386,6 +413,7 @@ async fn setup_site_vrf(
 	if_id:     u32,
 	inner_if:  &str,
 	fwd_table: u32,
+	ret_table: u32,
 	tap_idx:   u32,
 	tap_ips:   &TapIps,
 	record:    &NatRecord,
@@ -393,7 +421,7 @@ async fn setup_site_vrf(
 ) -> Result<SiteVrfState> {
 	let vrf_str = if_id.to_string();
 	let fwd_str = fwd_table.to_string();
-	let ret_str = RETURN_TABLE.to_string();
+	let ret_str = ret_table.to_string();
 	let xfrm_if = xfrm_if_name(if_id);
 
 	// 1. VPP fib table for this site.
@@ -437,9 +465,13 @@ async fn setup_site_vrf(
 		 "via", &tap_ips.vpp_ip, "dev", inner_if, "table", &fwd_str])
 		.await.context("ip route default (forward table)")?;
 
-	// 8. Return routing: iif vpp-{hex} -> shared return table 9999.
+	// 8. Return routing: iif vpp-{hex} -> per-site return table -> xfrm-{hex}.
+	//    Routing via xfrm-{hex} is required: the XFRM output policy has
+	//    if_id set, so it only fires when the output interface carries that id.
 	ip(&["rule", "add", "iif", inner_if, "prio", "200", "lookup", &ret_str])
 		.await.context("ip rule add (return)")?;
+	ip(&["route", "replace", "default", "dev", &xfrm_if, "table", &ret_str])
+		.await.context("ip route default (return table via xfrm)")?;
 
 	// 9. VPP NAT static mappings, one per device_nat entry.
 	let mut devices = Vec::new();
@@ -459,7 +491,7 @@ async fn setup_site_vrf(
 	}
 
 	Ok(SiteVrfState {
-		if_id, fwd_table, tap_idx, vpp_tap,
+		if_id, fwd_table, ret_table, tap_idx, vpp_tap,
 		inner_if:        inner_if.to_string(),
 		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
 		tap_kern_prefix: tap_ips.kern_prefix.clone(),
@@ -469,7 +501,7 @@ async fn setup_site_vrf(
 
 async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 	let fwd_str = site.fwd_table.to_string();
-	let ret_str = RETURN_TABLE.to_string();
+	let ret_str = site.ret_table.to_string();
 	let vrf_str = site.if_id.to_string();
 	let xfrm_if = xfrm_if_name(site.if_id);
 	let idx_str = site.ifindex.to_string();
@@ -482,10 +514,11 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 		      "VPP: NAT mapping removed");
 	}
 
-	// 2. ip rules and forward route.
+	// 2. ip rules, forward route, and return route.
 	ip_warn(&["rule", "del", "iif", &xfrm_if,      "prio", "100", "lookup", &fwd_str]).await;
 	ip_warn(&["rule", "del", "iif", &site.inner_if, "prio", "200", "lookup", &ret_str]).await;
 	ip_warn(&["route", "del", "default", "table", &fwd_str]).await;
+	ip_warn(&["route", "del", "default", "table", &ret_str]).await;
 
 	// 3. nftables mangle map entries.
 	nft_warn(&["delete", "element", "ip", NFT_TABLE, NFT_VPP_SET,
@@ -507,12 +540,14 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 }
 
 /// Best-effort cleanup after a partial setup_site_vrf failure.
-async fn teardown_partial(inner_if: &str, fwd_table: u32, if_id: u32) {
+async fn teardown_partial(inner_if: &str, fwd_table: u32, ret_table: u32, if_id: u32) {
 	let fwd_str = fwd_table.to_string();
-	let ret_str = RETURN_TABLE.to_string();
+	let ret_str = ret_table.to_string();
 	let xfrm_if = xfrm_if_name(if_id);
 	ip_warn(&["rule", "del", "iif", &xfrm_if,  "prio", "100", "lookup", &fwd_str]).await;
 	ip_warn(&["rule", "del", "iif", inner_if,   "prio", "200", "lookup", &ret_str]).await;
+	ip_warn(&["route", "del", "default", "table", &fwd_str]).await;
+	ip_warn(&["route", "del", "default", "table", &ret_str]).await;
 	ip_warn(&["link", "set", inner_if, "down"]).await;
 	ip_warn(&["link", "del", inner_if]).await;
 }

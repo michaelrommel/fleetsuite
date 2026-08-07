@@ -552,11 +552,17 @@ async fn create_xfrm_if(xfrm_if: &str, if_id: u32) {
 
 	match out {
 		Ok(o) if o.status.success() => {
-			// Bring the interface up immediately.
+			// Bring the interface up.
 			let _ = tokio::process::Command::new("ip")
 				.args(["link", "set", xfrm_if, "up"])
 				.output().await;
-			info!(xfrm_if, if_id, "XFRM interface created");
+			// Set MTU to account for IPsec (AES-256-GCM) + UDP-NAT-T overhead
+			// (~80 bytes).  1420 = 1500 - 80; allows clamp-mss-to-pmtu to
+			// compute MSS = 1420 - 40 = 1380, matching TCP_MSS_CLAMP in vpp.rs.
+			let _ = tokio::process::Command::new("ip")
+				.args(["link", "set", xfrm_if, "mtu", "1420"])
+				.output().await;
+			info!(xfrm_if, if_id, "XFRM interface created (mtu 1420)");
 		}
 		Ok(o) => {
 			let stderr = String::from_utf8_lossy(&o.stderr);
