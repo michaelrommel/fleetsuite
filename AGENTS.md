@@ -8,56 +8,50 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-07):** Increment 6e COMPLETE -- per-customer
-VRF isolation working end-to-end. Two customers with identical internal_ip
-(192.168.13.133) connect simultaneously, each in their own VPP fib table,
-using independent XFRM interfaces and per-site routing. Full HTTP body
-confirmed via curl on both helena1 and helena2.
+**Last completed session (2026-08-07):** Increment 6f-r COMPLETE -- per-site
+backend DNAT working end-to-end with overlapping RFC 1918 customer_view_ip
+values. T6 PASSED (see T6 section in Testing Framework).
 
-Three bugs found and fixed during 6e testing:
-- Return routing must go via `xfrm-{hex}` (not `ens5` via shared table 9999)
-  because the XFRM output policy has `if_id` set -- the packet must exit
-  through the XFRM interface for the policy to fire and encrypt.
-- TCP MSS must be clamped to 1380 in nftables FORWARD chain. AES-256-GCM +
-  UDP-NAT-T adds ~100 bytes overhead; 1500-byte internet MTU limits inner
-  TCP segments to MSS 1400 (1380 used as conservative production value).
-- VPP `nat44 add static mapping local X external Y vrf N` does NOT auto-
-  insert a FIB route for X in VRF N. Without `ip route add X/32 table N
-  via <kern_ip> <vpp_tap>`, VPP DNAT succeeds but then silently drops the
-  packet (dpo-drop) in the VRF. All three fixes are committed.
+Key design decisions made during 6f-r:
+- Shelved the global-map approach (increment-6f branch) because customer_view_ip
+  values are not globally unique -- customers choose their own private addresses
+  with no coordination between sites.
+- Replaced with per-site nftables maps scoped to each `xfrm-{hex}` interface.
+  Two customers using the same customer_view_ip coexist because their decapsulated
+  traffic arrives on different xfrm interfaces.
+- `backend_nat` Valkey schema changed from a flat array to named roles
+  (access_server / sd_server / em_server). real_ip per role lives in
+  `/etc/ipsecnode/ipsecnode.toml` (global infrastructure config).
+- Global service routing table (`ipsecnode_svcroute`) splits port 8080 and
+  ports 21/22 off the access_server to dedicated backend servers.
+- `ct state new` guard on per-site PREROUTING rules prevents conflicts with
+  conntrack-established replies (also required for Increment 6g SNAT).
 
-All code changes committed. Binary rebuilt (musl). Deployed manually on
-running concentrator (scp to /usr/local/bin/ipsecnode). AMI not yet rebuilt.
+All code committed. Musl binary rebuilt. AMI baked with ipsecnode.toml.
 
 ### What the next session should do
 
-**Increment 6e is COMPLETE. All fixes committed and tested.**
+**Increment 6f-r is COMPLETE. T6 PASSED.**
 
-**Next: Increment 6f -- per-site backend DNAT** (Architecture Decision #16).
+**Next: Increment 6g -- backend-to-device SNAT** (remote access direction).
 
-The nftables PREROUTING DNAT approach is confirmed working (Step 1 manual test
-passed). The 6e VRF isolation is now in place, so per-site `customer_view_ip`
-mappings can be isolated correctly.
+When fleetshell (backend) initiates a connection to a device, the packet must
+arrive at the device with `src=customer_view_ip` (access_server role) so the
+customer firewall accepts it. Design is agreed:
+- In POSTROUTING on `oifname xfrm-{hex}` (just before xfrm encryption):
+  SNAT `src=fleetshell_ip -> backend_nat.access_server` for new connections
+  arriving from the backend direction (`iifname ens5 ct state new`).
+- `ct state new` guard already on the 6f-r PREROUTING DNAT rules prevents
+  the device reply (ct state established) from being re-DNAT'd.
+- Requires a new per-site POSTROUTING SNAT rule stored in SiteVrfState.
+- access_server role is implicitly the SNAT source (no extra field needed).
 
-Implementation plan for 6f:
-- `vpp::init()`: create `ipsecnode_bnat` nftables table with named map
-  `bnat_map { type ipv4_addr : ipv4_addr }`, PREROUTING chain + rule
-  `iifname ens5 dnat ip to ip daddr map @bnat_map`, empty POSTROUTING chain.
-- `vpp::on_child_up()`: for each `backend_nat` entry in NatRecord, run
-  `nft add element ip ipsecnode_bnat bnat_map { customer_view_ip : real_ip }`.
-- `vpp::on_child_down()`: `nft delete element` for each entry.
-- Add `BackendNatCache` (peer_ip -> Vec<customer_view_ip>) for teardown.
-- Remove `#[allow(dead_code)]` from `NatRecord::backend_nat` and `BackendNatEntry`.
+See Open TODOs for the aeroftp PASV reply IP question (related to 6g).
 
-Constraint: `customer_view_ip` must be globally unique across all customers
-(same discipline as `global_ip`). Two customers using the same `customer_view_ip`
-but wanting different real_ips require VPP twice-nat (future increment).
-
-**AMI rebuild needed** before next instance cycle:
-```bash
-cd aerobake/fleetnode && packer build fleetnode.pkr.hcl
-```
-The deployed binary was scp'd manually. Commit hash: `7c07cf2`.
+**Also needed before full production testing:**
+- Hook up real backend servers (172.16.53.6/7/8/9, aeroftp VIP 172.16.48.10)
+  and verify the reverse direction (backend -> device) with real traffic.
+- AMI rebuild sequence: see REBUILD SEQUENCE below.
 
 **Ongoing open topic:** AWS-initiated tunnels (backend -> device).
 See Architecture Decision #17. Deferred until routing design is resolved.
@@ -1408,11 +1402,18 @@ net.core.wmem_max                = 134217728
      XFRM interface MTU set to 1420 at creation (`credentials.rs`).
      Confirmed: two customers with identical `internal_ip` (192.168.13.133)
      coexist on the same concentrator with full HTTP traffic.
-   - 6f: Backend DNAT via nftables PREROUTING -- **NEXT**.
-     See Architecture Decision #16. Step 1 manually confirmed. Implementation
-     plan in "What the next session should do" above.
-   - 6g: ASG lifecycle hook heartbeat
-   - 6h: Valkey half-open IKE SA state
+   - 6f-r: Backend DNAT via per-site nftables xfrm-scoped maps -- **COMPLETE (T6 PASSED)**.
+     Named-role Valkey schema (access_server/sd_server/em_server). real_ip and
+     port-split rules in ipsecnode.toml. Global service routing table
+     (ipsecnode_svcroute) on vpp-outer splits port 8080 and 21/22. Tested with
+     helena1 (customer_view_ip=194.138.39.18) and helena2 (customer_view_ip=10.1.2.3
+     -- RFC 1918, proving xfrm isolation). Both simultaneous, full HTTP confirmed.
+     Shelved global-map approach kept in git branch `increment-6f`.
+   - 6g: Backend-to-device SNAT (remote access direction) -- **NEXT**.
+     POSTROUTING SNAT on oifname xfrm-{hex} using backend_nat.access_server
+     as the SNAT source so customer firewalls accept fleetshell connections.
+   - 6h: ASG lifecycle hook heartbeat
+   - 6i: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
 8. **`ipsecscale`** -- LVS autoscaling daemon. See ipsecscale section for
    concrete sizing and scale-out criteria.
@@ -1768,6 +1769,43 @@ Bugs found during T5 (all fixed before passing):
    returned nothing; ARP `who-has Y tell 10.255.0.5` on vpp-outer confirmed
    VPP was not forwarding. Fix: `install_device_nat()` now explicitly adds
    `vppctl ip route add X/32 table N via kern_ip vpp_tap`.
+
+---
+
+### T6 -- Per-site backend DNAT with overlapping customer_view_ip (Increment 6f-r)
+
+**Status: PASSED.**
+
+Test server: `172.16.53.126` (temporary, stood up for this test).
+ipsecnode.toml on concentrator set `access_server.real_ip = "172.16.53.126"`
+with port 8080 split to `172.16.53.6`.
+
+**helena1 (62.238.96.148) -- customer_view_ip = 194.138.39.18 (routable range):**
+```
+curl -s -k http://194.138.39.18:8080   -> <h1>Skulking Klebsiella</h1>   (port 8080 split to .6)
+curl -s -k https://194.138.39.18:8443  -> <h1>Obstinate Klebsiella</h1>  (stays on .126)
+```
+
+**helena2 (62.238.110.152) -- customer_view_ip = 10.1.2.3 (RFC 1918, overlapping):**
+```
+curl -s http://10.1.2.3:8080   -> <h1>Skulking Klebsiella</h1>   (port 8080 split to .6)
+curl -s -k https://10.1.2.3:8443 -> <h1>Obstinate Klebsiella</h1>  (stays on .126)
+```
+
+Both tunnels active simultaneously. The RFC 1918 address on helena2 (`10.1.2.3`)
+would have caused a key conflict in the shelved global-map approach but works
+correctly with per-`xfrm-{hex}` nftables isolation.
+
+Valkey nat record for helena2 during test:
+```json
+{"device_nat":[{"internal_ip":"192.168.13.133","global_ip":"198.51.100.134"}],
+ "backend_nat":{"access_server":"10.1.2.3","sd_server":"194.138.39.21","em_server":"194.138.39.19"}}
+```
+
+**Remaining to test (T6 continuation):**
+- Real backend hookup (172.16.53.6/7/8/9, aeroftp VIP 172.16.48.10).
+- Reverse direction: backend -> device (Increment 6g scope).
+- FTP passive data via nf_conntrack_ftp helper.
 
 ---
 
