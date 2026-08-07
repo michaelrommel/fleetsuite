@@ -621,16 +621,26 @@ async fn setup_site_vrf(
 		}
 	}
 
+	// 10. Per-site backend DNAT (nftables bnat map + PREROUTING rule).
+	let bnat = setup_site_bnat(
+		peer_ip,
+		if_id,
+		record.backend_nat.as_ref(),
+		&state.backend,
+	).await;
+
 	Ok(SiteVrfState {
 		if_id, fwd_table, ret_table, tap_idx, vpp_tap,
 		inner_if:        inner_if.to_string(),
 		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
 		tap_kern_prefix: tap_ips.kern_prefix.clone(),
-		ifindex, devices, bnat: SiteBnatState::empty(), child_sa_count: 1,
+		ifindex, devices, bnat, child_sa_count: 1,
 	})
 }
 
 async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
+	// 0. Remove per-site backend DNAT before touching VPP NAT.
+	teardown_site_bnat(peer_ip, &site.bnat).await;
 	let fwd_str = site.fwd_table.to_string();
 	let ret_str = site.ret_table.to_string();
 	let vrf_str = site.if_id.to_string();
