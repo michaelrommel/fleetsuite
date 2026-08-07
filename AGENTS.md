@@ -285,6 +285,33 @@ redis-cli -u rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.am
   '{"customer_id":"koi-test","static_ip":true}'
 ```
 
+### Valkey seed for T6 testing (helena1 + helena2, Increment 6f-r)
+
+helena1 and helena2 share the same `internal_ip` (proving 6e VRF isolation)
+but have **different** `global_ip` values (required: each /32 is a unique BGP
+route advertised to the Return GW).
+
+```bash
+VALKEY="rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379"
+
+# PSKs (unchanged from prior testing)
+redis-cli -u $VALKEY SET fleetipsec:psk:62.238.96.148  helena1psk
+redis-cli -u $VALKEY SET fleetipsec:psk:62.238.110.152 helena2psk
+
+# Site records
+redis-cli -u $VALKEY SET fleetipsec:site:62.238.96.148 \
+  '{"customer_id":"helena1","static_ip":true}'
+redis-cli -u $VALKEY SET fleetipsec:site:62.238.110.152 \
+  '{"customer_id":"helena2","static_ip":true}'
+
+# NAT records -- same internal_ip, different global_ip, same backend_nat view IPs
+# (6f-r: xfrm isolation means same customer_view_ip values are fine on both sites)
+redis-cli -u $VALKEY SET fleetipsec:nat:62.238.96.148 \
+  '{"device_nat":[{"internal_ip":"192.168.13.133","global_ip":"198.51.100.133"}],"backend_nat":{"access_server":"194.138.39.18","sd_server":"194.138.39.21","em_server":"194.138.39.19"}}'
+redis-cli -u $VALKEY SET fleetipsec:nat:62.238.110.152 \
+  '{"device_nat":[{"internal_ip":"192.168.13.133","global_ip":"198.51.100.134"}],"backend_nat":{"access_server":"194.138.39.18","sd_server":"194.138.39.21","em_server":"194.138.39.19"}}'
+```
+
 ---
 
 ## What This Project Is
