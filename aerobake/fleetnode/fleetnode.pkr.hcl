@@ -270,6 +270,10 @@ build {
     source      = "./_etc_systemd_system_ipsecnode.service"
     destination = "/tmp/_etc_systemd_system_ipsecnode.service"
   }
+  provisioner "file" {
+    source      = "./_etc_ipsecnode_ipsecnode.toml"
+    destination = "/tmp/_etc_ipsecnode_ipsecnode.toml"
+  }
   provisioner "shell" {
     inline = [
       "sudo mkdir -p /usr/local/bin",
@@ -280,8 +284,10 @@ build {
       "sudo chown root:root /etc/systemd/system/ipsecnode.service",
       # CA certificate directory -- ipsecnode loads CA certs from here (Inc 6a)
       "sudo mkdir -p /etc/ipsecnode/ca",
-      "sudo chown root:root /etc/ipsecnode /etc/ipsecnode/ca",
+      "sudo mv /tmp/_etc_ipsecnode_ipsecnode.toml /etc/ipsecnode/ipsecnode.toml",
+      "sudo chown root:root /etc/ipsecnode /etc/ipsecnode/ca /etc/ipsecnode/ipsecnode.toml",
       "sudo chmod 755 /etc/ipsecnode /etc/ipsecnode/ca",
+      "sudo chmod 644 /etc/ipsecnode/ipsecnode.toml",
       "sudo systemctl daemon-reload",
       "sudo systemctl enable ipsecnode",
     ]

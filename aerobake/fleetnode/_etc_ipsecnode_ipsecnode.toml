@@ -1,0 +1,54 @@
+# /etc/ipsecnode/ipsecnode.toml
+#
+# Global backend server configuration for ipsecnode.
+#
+# real_ip   -- the actual AWS IP of each server (same for all customers).
+# split     -- port-based DNAT rules applied after per-customer VPP SNAT,
+#              on the vpp-outer interface.  Top-down; first match wins.
+#
+# The customer_view_ip for each role (the IP the customer's devices use to
+# reach that server) is stored per-customer in Valkey:
+#   fleetipsec:nat:<peer_ip>  ->  backend_nat.access_server / .sd_server / .em_server
+#
+# Example Valkey record (all three roles):
+#   {
+#     "device_nat": [...],
+#     "backend_nat": {
+#       "access_server": "194.138.39.18",
+#       "sd_server":     "194.138.39.21",
+#       "em_server":     "194.138.39.19"
+#     }
+#   }
+
+# -- Remote-access / connection-management server -----------------------------
+#
+# Receives all traffic not explicitly split below.
+# Port 8080 (HTTP proxy) is redirected to a dedicated proxy server.
+# Ports 21 and 22 (FTP control + SFTP) are redirected to the aeroftp VIP;
+# passive FTP data connections are tracked automatically by nf_conntrack_ftp.
+# Active FTP data (backend port 20 -> device) travels the backend->device
+# path and is not handled here (Increment 6g scope).
+[backend.access_server]
+real_ip = "172.16.53.6"
+
+[[backend.access_server.split]]
+ports   = [8080]
+dnat_to = "172.16.53.7"     # HTTP proxy server
+
+[[backend.access_server.split]]
+ports   = [21, 22]
+dnat_to = "172.16.48.10"    # aeroftp LVS VIP (active AZ)
+
+# Uncomment if non-RFC-conformant FTP clients use source port 20 for passive
+# data connections (see Open TODOs in AGENTS.md):
+# [[backend.access_server.split]]
+# src_ports = [20]
+# dnat_to   = "172.16.48.10"
+
+# -- Software-distribution server ---------------------------------------------
+[backend.sd_server]
+real_ip = "172.16.53.8"
+
+# -- Event-management server --------------------------------------------------
+[backend.em_server]
+real_ip = "172.16.53.9"
