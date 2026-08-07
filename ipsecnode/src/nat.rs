@@ -44,12 +44,12 @@ pub struct NatRecord {
 	/// One /32 blackhole route is installed per entry (Increment 6c).
 	/// VPP SNAT rules are built from these entries (Increment 6d).
 	pub device_nat: Vec<DeviceNatEntry>,
-	/// Optional per-backend DNAT mappings: customer's view of a backend IP
-	/// -> the real backend IP.  Absent when the customer uses real addresses.
-	/// Used by VPP DNAT only (Increment 6d); ignored in Increment 6c.
+	/// Optional named-role backend DNAT mappings.  Each field holds the
+	/// customer_view_ip for that service role.  The corresponding real_ip
+	/// is in ipsecnode.toml (BackendConfig).  Absent when the customer does
+	/// not use backend NAT.
 	#[serde(default)]
-	#[allow(dead_code)]
-	pub backend_nat: Vec<BackendNatEntry>,
+	pub backend_nat: Option<BackendNatRecord>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -62,13 +62,29 @@ pub struct DeviceNatEntry {
 	pub global_ip: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-pub struct BackendNatEntry {
-	/// IP address the customer uses to reach the backend (their view).
-	pub customer_view_ip: String,
-	/// Real backend IP address (our infrastructure).
-	pub real_ip: String,
+/// Named-role backend server addresses from the customer's perspective.
+/// Each field is the customer_view_ip -- the IP their devices use to reach
+/// that backend service role.  The corresponding real_ip is in ipsecnode.toml.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BackendNatRecord {
+	/// Customer's view IP for the remote-access / connection-management server.
+	/// This role is used for backend->device SNAT (Increment 6g).
+	pub access_server: Option<String>,
+	/// Customer's view IP for the software-distribution server.
+	pub sd_server: Option<String>,
+	/// Customer's view IP for the event-management server.
+	pub em_server: Option<String>,
+}
+
+impl BackendNatRecord {
+	/// Returns (role_name, customer_view_ip) for each role that is present.
+	pub fn present_roles(&self) -> Vec<(&'static str, &str)> {
+		let mut v = Vec::new();
+		if let Some(ref ip) = self.access_server { v.push(("access_server", ip.as_str())); }
+		if let Some(ref ip) = self.sd_server     { v.push(("sd_server",     ip.as_str())); }
+		if let Some(ref ip) = self.em_server     { v.push(("em_server",     ip.as_str())); }
+		v
+	}
 }
 
 // ── Per-peer route state ──────────────────────────────────────────────────────
