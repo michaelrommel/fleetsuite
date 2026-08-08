@@ -1,0 +1,234 @@
+
+FORWARD PATH  (device → backend)
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+  Identities used in this trace
+    peer_ip / customer GW  = 62.238.96.148         if_id = u32(62.238.96.148) = 0x3eee6094
+    internal_ip            = 192.168.13.133         global_ip         = 198.51.100.133
+    customer_view_ip       = 194.138.39.18          real_ip           = 172.16.53.126  (access_server)
+    port-split target (8080) = 172.16.53.7
+
+  Inner packet (before encryption at customer GW):
+    src=192.168.13.133  dst=194.138.39.18  TCP dport=8080
+
+  On the wire to concentrator ens5:
+    UDP 4500  src=62.238.96.148  dst=<concentrator EIP>  (ESP payload encrypted)
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+                                                                                      INSPECT WITH
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │  ens5   physical NIC                                                       │
+  │  Receives all inbound: IPsec/NAT-T (UDP 500, UDP 4500, ESP) +              │
+  │  backend server replies                                                    │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │ outer UDP 4500 packet
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  PREROUTING  (outer encrypted packet — no NAT matches)                     │  nft list tables
+  │  ipsecnode_bnat:      no match (dst is concentrator EIP)                   │
+  │  ipsecnode_svcroute:  no match                                             │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  XFRM kernel subsystem                                                     │  ip xfrm state
+  │  · Inbound XFRM policy matched: if_id 0x3eee6094                           │  ip xfrm policy
+  │  · Decapsulates UDP 4500 → ESP → inner IP packet                           │
+  │  · Injects inner packet on xfrm-3eee6094 (MTU 1420)                        │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │ inner: src=192.168.13.133  dst=194.138.39.18  TCP dport=8080
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  xfrm-3eee6094   per-site XFRM virtual interface                           │  ip -d link show xfrm-3eee6094
+  │  One per active customer site; if_id derived from peer public IP           │
+  │                                                                            │
+  │  ┄ Customer A: xfrm-3eee6094 ┄┄┄ Customer B: xfrm-aaaabbbb ┄┄┄ ...         │
+  │    (fully independent tracks — same internal_ip is fine in each)           │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  PREROUTING — ipsecnode_bnat  (nat hook, priority dstnat)                  │  nft list table ip ipsecnode_bnat
+  │                                                                            │
+  │  rule:  iifname \"xfrm-3eee6094\"  ct state new                            │
+  │         dnat ip to ip daddr map @bnat_3eee6094                             │
+  │                                                                            │
+  │  map bnat_3eee6094: { 194.138.39.18 : 172.16.53.126 }                      │
+  │                                                                            │
+  │  dst: 194.138.39.18  ──→  172.16.53.126                                    │
+  │  conntrack entry #1 created  (enables reverse SNAT on return path)         │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │ src=192.168.13.133  dst=172.16.53.126  TCP dport=8080
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  Policy routing                                                            │  ip rule show
+  │  ip rule:    iif xfrm-3eee6094  prio 100  lookup 10042  (fwd_table)        │  ip route show table 10042
+  │  table 10042: default via 10.127.0.1 dev vpp-3eee6094                      │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  FORWARD — ipsecnode  (mangle hook, priority mangle)                       │  nft list table ip ipsecnode
+  │  chain tcp_mss:                                                            │
+  │    tcp flags & (syn|rst) == syn                                            │
+  │    tcp option maxseg size > 1380                                           │
+  │    → tcp option maxseg size set 1380                                       │
+  │  (AES-256-GCM + UDP-NAT-T overhead ~100 B; internet MTU 1500 B)            │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  vpp-3eee6094   kernel side of per-site tap  (10.127.0.2/30)               │  ip addr show vpp-3eee6094
+  ╞╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╡
+  │  VPP inside interface  (10.127.0.1/30)               ← tap boundary        │  vppctl show interface
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  VPP — per-site VRF  (fib_table = 0x3eee6094)                              │
+  │                                                                            │
+  │  NAT44 static mapping (inside, VRF 0x3eee6094):                            │  vppctl show nat44 static mappings
+  │    local 192.168.13.133  external 198.51.100.133                           │
+  │    src: 192.168.13.133  ──→  198.51.100.133   (SNAT)                       │
+  │                                                                            │
+  │  FIB lookup (VRF 0x3eee6094):                                              │  vppctl show ip fib table 0x3eee6094
+  │    172.16.53.126/32  via 10.255.0.5  tap-outer    ← explicit entry         │
+  │    0.0.0.0/0         via 10.255.0.5  tap-outer    ← default                │
+  │    192.168.13.133/32 via 10.127.0.2  tap-inner    ← auto (NAT plugin)      │
+  │                                                                            │
+  │  Exits via NAT44 outside interface:                                        │
+  │    src=198.51.100.133  dst=172.16.53.126  TCP dport=8080                   │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │              ← tap boundary
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  vpp-outer   kernel side of shared outside tap  (10.255.0.5/30)            │  ip addr show vpp-outer
+  │  Shared by ALL customer sites — NAT outside interface                      │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  PREROUTING — ipsecnode_svcroute  (nat hook, priority dstnat)              │  nft list table ip ipsecnode_svcroute
+  │                                                                            │
+  │  iifname \"vpp-outer\"  tcp dport { 8080 }   dnat to 172.16.53.7   ← HIT   │
+  │  iifname \"vpp-outer\"  tcp dport { 21, 22 }  dnat to 172.16.48.10         │
+  │  (other ports: no match → dst stays 172.16.53.126)                         │
+  │                                                                            │
+  │  dst: 172.16.53.126  ──→  172.16.53.7                                      │
+  │  conntrack entry #2 created                                                │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │ src=198.51.100.133  dst=172.16.53.7  TCP dport=8080
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  Kernel routing + ens5 output                                              │  ip route show
+  │  default route → ens5 → VPC fabric                                         │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+                          172.16.53.7  (HTTP proxy server)
+                          src=198.51.100.133  dst=172.16.53.7  TCP dport=8080
+
+---
+
+RETURN PATH  (backend → device)
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+  172.16.53.7 replies:  src=172.16.53.7  dst=198.51.100.133  TCP sport=8080
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+                                                                                      INSPECT WITH
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │  ens5   receives backend reply                                             │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  PREROUTING  (ens5)                                                        │  conntrack -L
+  │  conntrack: packet identified as REPLY to entry #2 (svcroute DNAT)         │
+  │  No explicit rule fires here; reverse translation applied in POSTROUTING   │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  Kernel routing decision                                                   │  ip route show 198.51.100.133
+  │  198.51.100.133/32  dev vpp-outer                                          │
+  │  (host route installed by ipsecnode on CHILD_SA UP;                        │
+  │   upgraded from blackhole when VPP NAT mapping is installed)               │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  FORWARD — ipsecnode  (tcp_mss clamp, same chain as forward path)          │  nft list table ip ipsecnode
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  POSTROUTING  (oifname vpp-outer)                                          │  conntrack -L
+  │  conntrack entry #2 REPLY direction (svcroute):                            │
+  │    src: 172.16.53.7  ──→  172.16.53.126   (restores real_ip)               │
+  │  Fires before kernel writes packet to tap — VPP sees the restored value    │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │              ← tap boundary
+                                       │ src=172.16.53.126  dst=198.51.100.133
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  VPP — outside interface (vpp-outer)                                       │
+  │                                                                            │
+  │  NAT44 outside→inside session lookup by dst=198.51.100.133:                │  vppctl show nat44 sessions
+  │    static mapping: external 198.51.100.133 → local 192.168.13.133          │
+  │    dst: 198.51.100.133  ──→  192.168.13.133   (reverse SNAT)               │
+  │                                                                            │
+  │  FIB lookup (VRF 0x3eee6094):                                              │  vppctl show ip fib table 0x3eee6094
+  │    192.168.13.133/32  via 10.127.0.2  tap-inner                            │
+  │    → routes to per-site inside tap                                         │
+  │                                                                            │
+  │  src=172.16.53.126  dst=192.168.13.133  TCP sport=8080                     │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │              ← tap boundary
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  vpp-3eee6094   kernel side of per-site tap                                │  ip addr show vpp-3eee6094
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  PREROUTING — ipsecnode  (mangle_pre, mark for XFRM tunnel selection)      │  nft list table ip ipsecnode
+  │  chain mangle_pre:                                                         │
+  │    iif @vpp_taps  meta mark set  iif map @vpp_mark                         │
+  │    ifindex(vpp-3eee6094) → mark = 0x3eee6094                               │
+  │  (mark tells XFRM output policy which tunnel to encrypt into)              │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  Policy routing                                                            │  ip rule show
+  │  ip rule:    iif vpp-3eee6094  prio 200  lookup 60017  (ret_table)         │  ip route show table 60017
+  │  table 60017: default dev xfrm-3eee6094                                    │
+  │  (route via xfrm interface — XFRM output policy requires it)               │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  POSTROUTING  (oifname xfrm-3eee6094)                                      │  conntrack -L
+  │  conntrack entry #1 REPLY direction (bnat):                                │
+  │    src: 172.16.53.126  ──→  194.138.39.18   (restores customer_view_ip)    │
+  │                                                                            │
+  │  Final inner packet:                                                       │
+  │    src=194.138.39.18  dst=192.168.13.133  TCP sport=8080                   │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  XFRM output  (xfrm-3eee6094)                                              │  ip xfrm policy show dir out
+  │  Output policy matches: mark 0x3eee6094  if_id 0x3eee6094                  │  ip xfrm state show
+  │  Selects XFRM SA for tunnel to 62.238.96.148                               │
+  │  Encapsulates: inner packet → ESP → UDP 4500  dst=62.238.96.148            │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+  ┌────────────────────────────────────▼───────────────────────────────────────┐
+  │  ens5   sends encrypted packet back to device                              │
+  └────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+                          Device  (192.168.13.133)
+                          decrypts and sees:
+                          src=194.138.39.18  dst=192.168.13.133  TCP sport=8080
+
+
+**Two customers simultaneously — what changes per track:**
+
+                  Customer A  (62.238.96.148)          Customer B  (62.238.110.152)
+  if_id           0x3eee6094                            0x3eee60 98  (different peer IP)
+  xfrm interface  xfrm-3eee6094                         xfrm-3eee6098
+  per-site map    bnat_3eee6094                         bnat_3eee6098
+  fwd_table       10042                                 10043
+  ret_table       60017                                 60018
+  tap (kernel)    vpp-3eee6094  10.127.0.2/30           vpp-3eee6098  10.127.0.6/30
+  VRF             0x3eee6094                            0x3eee6098
+  global_ip       198.51.100.133                        198.51.100.134
+  customer_view   194.138.39.18   ← may be identical →  10.1.2.3
+  vpp-outer       shared (10.255.0.5)                   shared (same interface)
+
+The two tracks are fully isolated through VRF (`nat44 vrf`) and xfrm interface (`iifname` match in bnat rules). The only shared resources are `vpp-outer` (the NAT outside interface) and `ens5`. `conntrack -L` at steady state will show one entry per active TCP connection, each with a distinct 5-tuple.
+
