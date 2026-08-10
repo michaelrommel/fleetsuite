@@ -15,6 +15,14 @@
 //!   -> nftables mark=if_id -> ip rule prio 200 -> ret_table default dev xfrm-{hex}
 //!   -> conntrack reverse SNAT (real_ip -> customer_view_ip)
 //!   -> XFRM output policy (if_id) fires on xfrm-{hex}, encrypting the packet.
+//!
+//! Backend-initiated path (Increment 6g): backend -> ens5 -> route global_ip/32
+//!   dev vpp-outer -> VPP static DNAT (global_ip -> internal_ip, o2i-first
+//!   session) -> vpp-{hex} -> ret_table dev xfrm-{hex}
+//!   -> POSTROUTING SNAT (backend_ip -> access_server customer_view_ip, ct new)
+//!   -> XFRM encrypt -> device.  The device reply (i2o) is un-SNAT'd by
+//!   conntrack and re-looked-up in the site VRF, which carries a default route
+//!   via vpp-outer so the reply can egress (setup_site_vrf step 4b).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -107,13 +115,19 @@ pub struct SiteBnatState {
 	pub map_name:          String,
 	/// nftables PREROUTING rule handle; None if the rule was not added.
 	pub rule_handle:       Option<u64>,
+	/// nftables POSTROUTING backend->device SNAT rule handle (Increment 6g);
+	/// None if no access_server role was configured for this site.
+	pub snat_handle:       Option<u64>,
 	/// customer_view_ips installed as map keys (for logging on teardown).
 	pub customer_view_ips: Vec<String>,
 }
 
 impl SiteBnatState {
 	fn empty() -> Self {
-		Self { map_name: String::new(), rule_handle: None, customer_view_ips: Vec::new() }
+		Self {
+			map_name: String::new(), rule_handle: None, snat_handle: None,
+			customer_view_ips: Vec::new(),
+		}
 	}
 }
 
@@ -512,7 +526,7 @@ pub async fn on_child_up(
 
 pub async fn on_child_down(
 	peer_ip: &str,
-	_state:  &VppState,
+	state:   &VppState,
 	cache:   &mut VrfCache,
 	alloc:   &mut VrfAllocator,
 ) {
@@ -529,7 +543,7 @@ pub async fn on_child_down(
 
 	let site = cache.remove(peer_ip).unwrap();
 	let (fwd, ret, tap) = (site.fwd_table, site.ret_table, site.tap_idx);
-	teardown_site_vrf(peer_ip, &site).await;
+	teardown_site_vrf(peer_ip, &site, &state.outer_tap).await;
 	alloc.free_fwd(fwd);
 	alloc.free_ret(ret);
 	alloc.free_tap(tap);
@@ -574,6 +588,17 @@ async fn setup_site_vrf(
 	// 4. NAT44 inside.  vpp-outer is already the outside interface.
 	vppctl(&["set", "interface", "nat44", "in", &vpp_tap, "out", &state.outer_tap])
 		.await.context("set NAT44 inside interface")?;
+
+	// 4b. Outside default route in the site VRF (Increment 6g).
+	//     Backend-initiated (o2i-first) NAT sessions re-look-up the device
+	//     reply's destination in THIS VRF after i2o SNAT.  Without a route to
+	//     the backend the reply hits null-node (dpo-drop) and is silently lost.
+	//     Route via vpp-outer so i2o replies egress.  The more-specific
+	//     internal_ip/32 route (added per device below) still wins for the
+	//     forward o2i direction, so device-initiated traffic is unaffected.
+	vppctl(&["ip", "route", "add", "0.0.0.0/0", "table", &vrf_str,
+	         "via", OUTER_KERNEL_IP, &state.outer_tap])
+		.await.context("VPP site-VRF default route via vpp-outer")?;
 
 	// 5. Kernel ifindex -- key in the nftables mangle map.
 	let ifindex  = get_ifindex(inner_if).await.context("read kernel tap ifindex")?;
@@ -637,7 +662,7 @@ async fn setup_site_vrf(
 	})
 }
 
-async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
+async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState, outer_tap: &str) {
 	// 0. Remove per-site backend DNAT before touching VPP NAT.
 	teardown_site_bnat(peer_ip, &site.bnat).await;
 	let fwd_str = site.fwd_table.to_string();
@@ -673,7 +698,13 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 	// 5. VPP tap (also removes NAT inside assignment and FIB entries).
 	delete_vpp_tap(&site.vpp_tap).await;
 
-	// 6. VPP fib table (now empty after tap deletion).
+	// 5b. Site-VRF outside default route (added in setup_site_vrf step 4b).
+	//     Must be removed before `ip table del` -- it is via vpp-outer, not the
+	//     per-site tap, so tap deletion above does not clear it.
+	vppctl_warn(&["ip", "route", "del", "0.0.0.0/0", "table", &vrf_str,
+	              "via", OUTER_KERNEL_IP, outer_tap]).await;
+
+	// 6. VPP fib table (now empty after tap + default-route deletion).
 	vppctl_warn(&["ip", "table", "del", &vrf_str]).await;
 
 	info!(peer_ip, vrf = site.if_id, "VPP: per-site VRF torn down");
@@ -764,13 +795,49 @@ async fn setup_site_bnat(
 		Err(e) => { warn!(peer_ip, "bnat PREROUTING rule add failed: {e:#}"); None }
 	};
 
-	SiteBnatState { map_name, rule_handle, customer_view_ips: installed }
+	// 6g: backend->device SNAT.  A backend server initiating a NEW connection
+	// to a device produces a packet egressing xfrm-{hex} (after VPP DNAT
+	// global_ip->internal_ip and the per-site return routing).  SNAT its source
+	// to the customer's access_server customer_view_ip so the customer firewall
+	// accepts the connection.  Discriminator: `oifname xfrm-{hex} ct state new`.
+	//   - Device-originated forward NEW connections egress vpp-{hex}, not
+	//     xfrm-{hex}, so oifname excludes them.
+	//   - Device-originated replies to a backend-initiated flow are ct-established
+	//     and reversed by conntrack, so `ct state new` excludes them.
+	let snat_handle = match backend_nat.and_then(|r| r.access_server.as_deref()) {
+		Some(access_view) => {
+			let snat_out = nft_capture(&[
+				"--echo", "--handle",
+				"add", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
+				"oifname", &xfrm_if,
+				"ct", "state", "new",
+				"snat", "ip", "to", access_view,
+			]).await;
+			match snat_out {
+				Ok(out) => match parse_nft_handle(&out) {
+					Ok(h)  => { info!(peer_ip, handle = h, %access_view,
+						"6g backend->device SNAT rule added"); Some(h) }
+					Err(e) => { warn!(peer_ip, "parse 6g SNAT handle: {e:#}"); None }
+				},
+				Err(e) => { warn!(peer_ip, "6g SNAT rule add failed: {e:#}"); None }
+			}
+		}
+		None => None,
+	};
+
+	SiteBnatState { map_name, rule_handle, snat_handle, customer_view_ips: installed }
 }
 
 async fn teardown_site_bnat(peer_ip: &str, bnat: &SiteBnatState) {
 	if bnat.map_name.is_empty() { return; }
 
-	// Delete rule first (releases the map reference), then the map itself.
+	// Delete rules first (releases the map reference), then the map itself.
+	if let Some(h) = bnat.snat_handle {
+		let h_str = h.to_string();
+		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
+				   "handle", &h_str]).await;
+		info!(peer_ip, handle = h, "6g backend->device SNAT rule removed");
+	}
 	if let Some(h) = bnat.rule_handle {
 		let h_str = h.to_string();
 		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
