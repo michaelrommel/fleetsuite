@@ -8,9 +8,56 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-07):** Increment 6f-r COMPLETE -- per-site
-backend DNAT working end-to-end with overlapping RFC 1918 customer_view_ip
-values. T6 PASSED (see T6 section in Testing Framework).
+**Last completed session (2026-08-10):** Increment 6g PHASE 1 COMPLETE --
+backend-to-device connections work end-to-end for tunnels that are ALREADY
+established. Validated on two independent tunnels (helena2, koi): full TCP
+handshake backend -> device, reproduced automatically by the daemon with no
+manual vppctl/nft steps. Code committed (791f7ef + 62a2c97), NOT yet in any AMI.
+
+Key facts / lessons from 6g phase 1 (all in `ipsecnode/src/vpp.rs`):
+- Two per-site additions, both keyed to the customer's `access_server` role:
+  1. POSTROUTING SNAT (`setup_site_bnat` / `SiteBnatState.snat_handle`):
+       `oifname xfrm-{hex} ct state new snat ip to <access_server view_ip>`
+     Rewrites the backend source into the tunnel's negotiated `local_ts` so the
+     outbound XFRM policy matches. WITHOUT it: XfrmOutNoStates -> ICMP host
+     unreachable (the source IP was not in the policy selector).
+     NOTE: the correct discriminator is `oifname xfrm-{hex} ct state new`, NOT
+     `iifname ens5` as the original 6g design note said -- the kernel<->VPP
+     userspace hop resets the input interface to `vpp-{hex}`.
+  2. Site-VRF outside return route (`setup_site_vrf` step 9b):
+       `ip route add 0.0.0.0/0 table {if_id} via lookup in table 0`
+     Backend-initiated NAT sessions are o2i-FIRST, so VPP re-looks-up the device
+     reply's destination in the SITE VRF (fib N) after i2o SNAT. The site VRF
+     only had `internal_ip/32` + the tap /30, so the reply hit `null-node`
+     (dpo-drop) and was silently lost.
+     CRITICAL: this route MUST be `via lookup in table 0` (a recursive lookup
+     DPO). Do NOT use `via <ip> <vpp-outer>`: a cross-VRF next-hop adjacency
+     (route in fib N via an interface living in fib 0) SIGSEGVs VPP 26.06 on
+     adjacency creation --
+       adj_nbr_add_or_lock -> adj_delegate_adj_created -> ip_pmtu_get_ip
+       -> fib_table_get_table_id_for_sw_if_index  (null deref).
+     A manual test of the crashing form survived only by luck (the adjacency
+     already existed, so it was locked not created). The lookup DPO creates no
+     adjacency, so the pmtu delegate never fires.
+- VPP FIB table-ids are `u32::from(peer_ip)` and VPP `show ip fib` prints them
+  as SIGNED int32, so ids > 2^31 appear negative (koi 185.17.205.91 =
+  0xb911cd5b = 3104951643 displays as -1190015653). Same table; cosmetic only.
+- Client-side gotcha found during koi testing: the customer gateway must have
+  `net.ipv4.ip_forward=1`, else it drops the device's reply before it re-enters
+  the tunnel (looks like: forward SYNs reach the device, no reply comes back).
+
+**Next: Increment 6g PHASE 2 -- dynamic tunnel bring-up** when a backend tries
+to reach a device whose tunnel is NOT currently established. See
+"Increment 6g phase 2" note in the increment list and Architecture Decision #17.
+Two candidate mechanisms were discussed (StrongSwan trap policies pre-provisioned
+vs. ipsecnode-driven on-demand VICI initiate); leaning toward the latter, but
+NOT yet decided. The hard shared sub-problem is P2: the concentrator that
+initiates the outbound tunnel MUST be the LVS jhash(customer_public_ip) owner,
+or the customer's IKE reply lands on the wrong node. Prove P2 in isolation first.
+
+----- earlier (2026-08-07) -----
+Increment 6f-r COMPLETE -- per-site backend DNAT working end-to-end with
+overlapping RFC 1918 customer_view_ip values. T6 PASSED.
 
 Key design decisions made during 6f-r:
 - Shelved the global-map approach (increment-6f branch) because customer_view_ip
@@ -31,20 +78,19 @@ All code committed. Musl binary rebuilt. AMI baked with ipsecnode.toml.
 
 ### What the next session should do
 
-**Increment 6f-r is COMPLETE. T6 PASSED.**
+**Increment 6g PHASE 1 is COMPLETE** (established-tunnel backend -> device).
+Code committed (791f7ef + 62a2c97). Musl binary + AMI rebuild still pending.
 
-**Next: Increment 6g -- backend-to-device SNAT** (remote access direction).
+**Next: Increment 6g PHASE 2 -- dynamic tunnel bring-up.**
 
-When fleetshell (backend) initiates a connection to a device, the packet must
-arrive at the device with `src=customer_view_ip` (access_server role) so the
-customer firewall accepts it. Design is agreed:
-- In POSTROUTING on `oifname xfrm-{hex}` (just before xfrm encryption):
-  SNAT `src=fleetshell_ip -> backend_nat.access_server` for new connections
-  arriving from the backend direction (`iifname ens5 ct state new`).
-- `ct state new` guard already on the 6f-r PREROUTING DNAT rules prevents
-  the device reply (ct state established) from being re-DNAT'd.
-- Requires a new per-site POSTROUTING SNAT rule stored in SiteVrfState.
-- access_server role is implicitly the SNAT source (no extra field needed).
+When a backend server initiates traffic to a device whose tunnel is DOWN, the
+tunnel must be established on demand. Nothing is implemented yet -- this is a
+design decision to make first. See the "Increment 6g phase 2" entry in the
+increment list (Build Order step 6) for the two candidate mechanisms and the
+shared prerequisites (P1 routing attraction, P2 jhash-owner selection, P3
+local_ts scoping). Recommended first move: prove P2 in isolation (force a
+concentrator to initiate outbound IKE and confirm the customer's reply returns
+to the SAME node through the LVS jhash).
 
 See Open TODOs for the aeroftp PASV reply IP question (related to 6g).
 
@@ -1409,9 +1455,49 @@ net.core.wmem_max                = 134217728
      helena1 (customer_view_ip=194.138.39.18) and helena2 (customer_view_ip=10.1.2.3
      -- RFC 1918, proving xfrm isolation). Both simultaneous, full HTTP confirmed.
      Shelved global-map approach kept in git branch `increment-6f`.
-   - 6g: Backend-to-device SNAT (remote access direction) -- **NEXT**.
-     POSTROUTING SNAT on oifname xfrm-{hex} using backend_nat.access_server
-     as the SNAT source so customer firewalls accept fleetshell connections.
+   - 6g: Backend-to-device (remote access direction).
+     - PHASE 1 (established tunnel) -- **COMPLETE (2026-08-10)**, committed
+       791f7ef + 62a2c97, not yet in AMI. Two per-site additions in vpp.rs,
+       both keyed to the `access_server` role:
+       1. POSTROUTING SNAT `oifname xfrm-{hex} ct state new snat to
+          <access_server view_ip>` (`setup_site_bnat`). Puts the backend
+          source into the tunnel's negotiated `local_ts` so the outbound XFRM
+          policy matches (else XfrmOutNoStates -> ICMP host unreachable).
+          The discriminator is `oifname xfrm-{hex} ct state new`, NOT
+          `iifname ens5` -- the kernel<->VPP userspace hop resets the input
+          interface to `vpp-{hex}`.
+       2. Site-VRF return route `ip route add 0.0.0.0/0 table {if_id} via
+          lookup in table 0` (`setup_site_vrf` step 9b). Backend-initiated NAT
+          sessions are o2i-FIRST, so VPP re-looks-up the device reply's dst in
+          the site VRF after i2o SNAT; without a route it hits null-node
+          (dpo-drop). MUST be a recursive lookup DPO (`via lookup in table 0`)
+          -- a cross-VRF next-hop adjacency (`via <ip> vpp-outer`) SIGSEGVs
+          VPP 26.06 (ip_pmtu_get_ip / fib_table_get_table_id_for_sw_if_index).
+       Validated on helena2 + koi (full TCP handshake, reproduced by the
+       daemon with no manual steps). Client gateway needs ip_forward=1.
+     - PHASE 2 (tunnel DOWN -- dynamic bring-up) -- **NEXT / design pending**.
+       When a backend initiates to a device whose tunnel is not established,
+       the tunnel must come up on demand. See Architecture Decision #17.
+       Two candidate mechanisms discussed (not yet decided):
+         (a) StrongSwan trap policies pre-provisioned per site (xfrm-{hex} +
+             local_ts=global_ip + start_action=trap installed even while down);
+             a backend packet auto-initiates IKE. Cost: idle state for all
+             sites; and coupling to the LVS jhash ring (must re-migrate trap
+             state on scale events), which fights the stateless-LVS design.
+         (b) ipsecnode-driven on-demand VICI initiate: advertise a covering
+             aggregate, punt un-provisioned global_ip packets to ipsecnode
+             (nfqueue), which looks up the site in Valkey and initiates.
+             Zero idle state; ownership decision centralised in ipsecnode.
+             Leaning toward (b).
+       SHARED hard prerequisites (true for both):
+         P1 -- attract the backend packet to a concentrator while the tunnel is
+               down (always-advertise /32, or a covering aggregate).
+         P2 -- the initiating concentrator MUST be jhash(customer_public_ip)%N,
+               else the customer's IKE reply (returning via the stateless LVS)
+               lands on the wrong node and the handshake never completes.
+               PROVE P2 IN ISOLATION FIRST before building anything.
+         P3 -- local_ts scoped to global_ip (not 0.0.0.0/0) so the trap/initiate
+               targets exactly one customer.
    - 6h: ASG lifecycle hook heartbeat
    - 6i: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
@@ -1804,7 +1890,9 @@ Valkey nat record for helena2 during test:
 
 **Remaining to test (T6 continuation):**
 - Real backend hookup (172.16.53.6/7/8/9, aeroftp VIP 172.16.48.10).
-- Reverse direction: backend -> device (Increment 6g scope).
+- Reverse direction: backend -> device (Increment 6g) -- PHASE 1 DONE
+  (established tunnel, validated helena2 + koi 2026-08-10). Phase 2 (dynamic
+  bring-up when tunnel is down) still to design/test.
 - FTP passive data via nf_conntrack_ftp helper.
 
 ---
