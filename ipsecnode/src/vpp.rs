@@ -21,8 +21,9 @@
 //!   session) -> vpp-{hex} -> ret_table dev xfrm-{hex}
 //!   -> POSTROUTING SNAT (backend_ip -> access_server customer_view_ip, ct new)
 //!   -> XFRM encrypt -> device.  The device reply (i2o) is un-SNAT'd by
-//!   conntrack and re-looked-up in the site VRF, which carries a default route
-//!   via vpp-outer so the reply can egress (setup_site_vrf step 4b).
+//!   conntrack and re-looked-up in the site VRF, which carries a recursive
+//!   "lookup in table 0" default route so the reply can egress via vpp-outer
+//!   (setup_site_vrf step 9b).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -526,7 +527,7 @@ pub async fn on_child_up(
 
 pub async fn on_child_down(
 	peer_ip: &str,
-	state:   &VppState,
+	_state:  &VppState,
 	cache:   &mut VrfCache,
 	alloc:   &mut VrfAllocator,
 ) {
@@ -543,7 +544,7 @@ pub async fn on_child_down(
 
 	let site = cache.remove(peer_ip).unwrap();
 	let (fwd, ret, tap) = (site.fwd_table, site.ret_table, site.tap_idx);
-	teardown_site_vrf(peer_ip, &site, &state.outer_tap).await;
+	teardown_site_vrf(peer_ip, &site).await;
 	alloc.free_fwd(fwd);
 	alloc.free_ret(ret);
 	alloc.free_tap(tap);
@@ -588,17 +589,6 @@ async fn setup_site_vrf(
 	// 4. NAT44 inside.  vpp-outer is already the outside interface.
 	vppctl(&["set", "interface", "nat44", "in", &vpp_tap, "out", &state.outer_tap])
 		.await.context("set NAT44 inside interface")?;
-
-	// 4b. Outside default route in the site VRF (Increment 6g).
-	//     Backend-initiated (o2i-first) NAT sessions re-look-up the device
-	//     reply's destination in THIS VRF after i2o SNAT.  Without a route to
-	//     the backend the reply hits null-node (dpo-drop) and is silently lost.
-	//     Route via vpp-outer so i2o replies egress.  The more-specific
-	//     internal_ip/32 route (added per device below) still wins for the
-	//     forward o2i direction, so device-initiated traffic is unaffected.
-	vppctl(&["ip", "route", "add", "0.0.0.0/0", "table", &vrf_str,
-	         "via", OUTER_KERNEL_IP, &state.outer_tap])
-		.await.context("VPP site-VRF default route via vpp-outer")?;
 
 	// 5. Kernel ifindex -- key in the nftables mangle map.
 	let ifindex  = get_ifindex(inner_if).await.context("read kernel tap ifindex")?;
@@ -645,6 +635,26 @@ async fn setup_site_vrf(
 		}
 	}
 
+	// 9b. Outside default route in the site VRF (Increment 6g).
+	//     Backend-initiated (o2i-first) NAT sessions re-look-up the device
+	//     reply's destination in THIS VRF after i2o SNAT.  Without a route to
+	//     the backend the reply hits null-node (dpo-drop) and is silently lost.
+	//     Use a recursive "lookup in table 0" DPO -- do NOT use
+	//     "via <ip> <vpp-outer>".  A cross-VRF next-hop adjacency (a route in
+	//     fib N via an interface that lives in fib 0) SIGSEGVs VPP 26.06:
+	//       adj_nbr_add_or_lock -> adj_delegate_adj_created -> ip_pmtu_get_ip
+	//       -> fib_table_get_table_id_for_sw_if_index  (null deref)
+	//     The lookup DPO does a second lookup in fib 0 instead, so no
+	//     adjacency is created and the pmtu delegate never fires.
+	//     The more-specific internal_ip/32 route (installed above by
+	//     install_device_nat) still wins for the forward o2i direction, so
+	//     device-initiated traffic is unaffected.
+	if let Err(e) = vppctl(&["ip", "route", "add", "0.0.0.0/0", "table", &vrf_str,
+	                        "via", "lookup", "in", "table", "0"]).await {
+		warn!(peer_ip, vrf = if_id,
+		      "site-VRF lookup route add failed: {e:#} -- backend->device replies will drop");
+	}
+
 	// 10. Per-site backend DNAT (nftables bnat map + PREROUTING rule).
 	let bnat = setup_site_bnat(
 		peer_ip,
@@ -662,7 +672,7 @@ async fn setup_site_vrf(
 	})
 }
 
-async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState, outer_tap: &str) {
+async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 	// 0. Remove per-site backend DNAT before touching VPP NAT.
 	teardown_site_bnat(peer_ip, &site.bnat).await;
 	let fwd_str = site.fwd_table.to_string();
@@ -698,11 +708,11 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState, outer_tap: &str) 
 	// 5. VPP tap (also removes NAT inside assignment and FIB entries).
 	delete_vpp_tap(&site.vpp_tap).await;
 
-	// 5b. Site-VRF outside default route (added in setup_site_vrf step 4b).
-	//     Must be removed before `ip table del` -- it is via vpp-outer, not the
+	// 5b. Site-VRF recursive default route (added in setup_site_vrf step 9b).
+	//     Must be removed before `ip table del` -- it references fib 0, not the
 	//     per-site tap, so tap deletion above does not clear it.
 	vppctl_warn(&["ip", "route", "del", "0.0.0.0/0", "table", &vrf_str,
-	              "via", OUTER_KERNEL_IP, outer_tap]).await;
+	              "via", "lookup", "in", "table", "0"]).await;
 
 	// 6. VPP fib table (now empty after tap + default-route deletion).
 	vppctl_warn(&["ip", "table", "del", &vrf_str]).await;
