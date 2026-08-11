@@ -544,6 +544,12 @@ type LoadConnMsg = HashMap<String, IkeConnConfig>;
 #[derive(Serialize)]
 struct LocalAuth {
 	auth: &'static str,  // always "psk"
+	/// Local IKE identity (IDi/IDr) presented to the peer.
+	/// Set to the customer-facing EIP when this node INITIATES, so CPE that key
+	/// their PSK to our public IP (Cisco `crypto isakmp key ... address <EIP>`)
+	/// can find it.  None = StrongSwan falls back to the node's own IP.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -623,6 +629,10 @@ struct IkeConnConfig {
 ///                    When Some, sets if_id_in, if_id_out, and mark_out on the
 ///                    child SA for per-customer VRF isolation (AD #15).
 ///                    None = legacy global-table mode (dev/test only).
+/// `local_id`      -- optional stable local IKE identity (customer-facing EIP)
+///                    presented as IDi when this node INITIATES.  Required for
+///                    standard CPE that key their PSK to our public IP.
+///                    None = StrongSwan falls back to the node's own IP.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_conn(
 	client:          &mut Client,
@@ -636,6 +646,7 @@ pub async fn load_conn(
 	remote_ts:       Vec<String>,
 	local_ts:        Vec<String>,
 	if_id:           Option<u32>,
+	local_id:        Option<&str>,
 ) -> Result<()> {
 	let remote_addrs = if static_ip {
 		vec![device_ip.to_string()]
@@ -668,10 +679,18 @@ pub async fn load_conn(
 		proposals: ike_proposals,
 		encap,
 		dpd_delay: 30,
-		local:  LocalAuth { auth: "psk" },
+		local:  LocalAuth {
+			auth: "psk",
+			id:   local_id.map(str::to_string),
+		},
 		remote: RemoteAuth {
 			auth: "psk",
-			id:   ike_identity.map(str::to_string),
+			// Pin remote.id so PSK lookup on OUTBOUND initiate resolves the
+			// per-customer key by the peer identity (owner = customer IP),
+			// exactly as the responder path does.  ike_identity wins when set;
+			// otherwise a static-IP customer is identified by its public IP.
+			id:   ike_identity.map(str::to_string)
+				.or_else(|| if static_ip { Some(device_ip.to_string()) } else { None }),
 		},
 		children,
 	};

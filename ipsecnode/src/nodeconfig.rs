@@ -9,6 +9,12 @@
 //! # Example
 //!
 //! ```toml
+//! # [node].local_ike_id is an OPTIONAL override; normally the customer-facing
+//! # EIP is discovered via DescribeAddresses using the VIP EIP's Name tag.
+//! # [node]
+//! # local_ike_id = "3.11.124.22"
+//! # vip_name_tag = "FleetShell-IPSec-VIP"
+//!
 //! [backend.access_server]
 //! real_ip = "172.16.53.6"
 //!
@@ -34,12 +40,37 @@ use tracing::info;
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/ipsecnode/ipsecnode.toml";
 pub const CONFIG_ENV_VAR:      &str = "IPSECNODE_CONFIG";
 
+/// Default Name tag of the customer-facing VIP EIP (DescribeAddresses filter).
+pub const DEFAULT_VIP_NAME_TAG: &str = "FleetShell-IPSec-VIP";
+
 // ── Config types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct IpsecnodeConfig {
 	#[serde(default)]
 	pub backend: BackendConfig,
+	#[serde(default)]
+	pub node: NodeConfig,
+}
+
+/// Node-wide identity/config not specific to any backend role.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct NodeConfig {
+	/// Stable local IKE identity (IDi) this concentrator presents when it
+	/// INITIATES a tunnel toward a customer.  Must be the customer-facing EIP,
+	/// because standard CPE (Cisco `crypto isakmp key <psk> address <EIP>`, etc.)
+	/// key their PSK to our public IP.  Presenting the node's private IP makes
+	/// every such device answer AUTHENTICATION_FAILED.
+	///
+	/// OPTIONAL per-host override.  Normally left unset: the EIP is discovered
+	/// at startup via DescribeAddresses, filtered by the VIP EIP's Name tag
+	/// (vip_name_tag), so a new regional deployment needs no file edit.
+	/// Absent from BOTH = responder-only (node falls back to its own IP).
+	pub local_ike_id: Option<String>,
+
+	/// Name tag of the customer-facing VIP EIP, looked up via DescribeAddresses
+	/// when local_ike_id is not set.  Defaults to DEFAULT_VIP_NAME_TAG.
+	pub vip_name_tag: Option<String>,
 }
 
 /// Global backend server roles.

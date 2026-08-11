@@ -8,7 +8,69 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-10):** Increment 6g PHASE 1 COMPLETE --
+**Last completed session (2026-08-11):** Increment 6g PHASE 2 -- P2 PROVEN in
+isolation (backend-initiated dynamic tunnel bring-up). Ran a two-node (N=2)
+concentrator test against helena2/helena1 through the LVS. Findings and FOUR
+code fixes below; code committed, NOT yet in any AMI. The LVS was patched by
+hand during testing; the ipsecpulse changes bake those patches into the AMI.
+
+P2 verdict and findings (2026-08-11):
+- P2 (the customer's IKE reply returning to the INITIATING concentrator through
+  the stateless LVS) WORKS. The LVS conntrack entry created by the outbound SNAT
+  reverses the reply to the initiator regardless of jhash ownership, so
+  jhash-ownership is NOT required for basic establishment. It IS still the right
+  design for robustness: conntrack expiry (idle on-demand tunnels), LVS failover
+  (the backup has no conntrack -- Decision #3), and the SNAT tuple collision
+  below all break a non-owner-initiated return path but are correct when the
+  initiator is the jhash owner.
+- LVS DNAT hijack (FIX 1): the PREROUTING jhash DNAT was unscoped, so a
+  concentrator's OWN outbound IKE (transiting the LVS) matched it and was
+  DNAT'd back into the concentrator pool instead of egressing to the customer.
+  helena saw nothing; the initiator got a reply from a looped-back concentrator.
+  Fix: scope all three DNAT rules to `ip daddr <secondary_ip>` (customer VIP).
+- jhash random per-rule seed (FIX 2, CRITICAL): nftables `jhash` with no `seed`
+  picks a RANDOM seed PER RULE, so the proto-50 / UDP-500 / UDP-4500 rules hash
+  the same source IP to DIFFERENT nodes at N>1. IKE_SA_INIT landed on one node,
+  IKE_AUTH on another -> `IKE_SA checkout not successful` -> ALL customer tunnels
+  broke at N=2. Latent until now because every prior data-plane test ran N=1
+  (mod 1 -> index 0 regardless of seed). Fix: emit a FIXED shared `seed` on all
+  three jhash rules (see Architecture Decision #1).
+- Initiator PSK lookup (FIX 3): on outbound initiate StrongSwan looked up the
+  PSK as (my_ip, %any) and found none (PSKs are owned by the customer IP). Fix:
+  set the conn `remote.id = <customer public IP>` for static-IP sites so the
+  lookup resolves the per-customer VICI PSK by the peer identity -- the SAME key
+  store the responder path uses. No per-node secret; scales to 25k distinct
+  PSKs. (A hand-typed secret keyed to the node IP appeared to work in test only
+  because helena1/helena2 shared one PSK -- a dead end that cannot scale.)
+- Local identity / Cisco compat (FIX 4): the concentrator presented its PRIVATE
+  IP as IDi, which every standard CPE rejects -- Cisco et al. key the PSK to the
+  peer's PUBLIC IP (`crypto isakmp key <psk> address <EIP>`). Confirmed on
+  helena: `no shared key found for '%any' - '172.16.50.162'`. Fix: present
+  `local.id = <customer-facing EIP>`, plumbed via ipsecnode.toml `[node]
+  local_ike_id`. REQUIRED for compatibility with the installed base.
+- SNAT tuple collision (design note, no code fix): through the single-VIP
+  stateless LVS a given customer cannot have a concentrator-initiated AND a
+  customer-initiated IKE flow at once -- both collapse to
+  src=<customer_ip> <-> <VIP> on 500/4500 and collide in conntrack (the stale
+  entry hijacks the other direction). Phase-2 on-demand MUST guarantee a single
+  active initiator per customer and flush conntrack on direction changes.
+
+The FOUR fixes (all committed this session):
+  1. ipsecpulse::render_nft_nat -- scope DNAT to `ip daddr <secondary_ip>`.
+  2. ipsecpulse::render_nft_nat -- fixed `seed` (JHASH_SEED) on all jhash rules.
+  3. vici::load_conn -- `remote.id = device_ip` for static-IP sites.
+  4. vici::load_conn -- `local.id = <EIP>` discovered via DescribeAddresses by
+     the VIP EIP's Name tag (default `FleetShell-IPSec-VIP`); ipsecnode.toml
+     [node] local_ike_id / vip_name_tag are optional overrides. Plumbed through
+     credentials::bulk_load / pubsub_task / load_one_device.
+OPERATIONAL: no new infra tag -- each region just needs its VIP EIP named
+`FleetShell-IPSec-VIP`. Rebuild the fleetscale (LVS) AMI for fixes 1+2 and the
+fleetnode AMI for fixes 3+4. Remaining phase-2 work:
+choose/implement mechanism (b) (ipsecnode-driven on-demand initiate) with the
+jhash owner as initiator, and the single-initiator/conntrack-cleanup discipline.
+
+----- earlier (2026-08-10) -----
+**Increment 6g PHASE 1 COMPLETE** --
 backend-to-device connections work end-to-end for tunnels that are ALREADY
 established. Validated on two independent tunnels (helena2, koi): full TCP
 handshake backend -> device, reproduced automatically by the daemon with no
@@ -169,6 +231,27 @@ VPN concentrator (172.16.50.119, AZ-b):
 ----------------------------------------------------------------------
 FIXES COMMITTED BUT NOT YET IN ANY DEPLOYED AMI
 ----------------------------------------------------------------------
+
+ipsecpulse / fleetscale LVS (need rebuild -- P2, 2026-08-11):
+  - render_nft_nat: PREROUTING jhash DNAT scoped to `ip daddr <secondary_ip>`
+    (stops concentrator-initiated outbound IKE being hijacked back into the pool).
+  - render_nft_nat: fixed `seed` (JHASH_SEED) on all three jhash rules so
+    proto-50/500/4500 from one source IP hash to the SAME node at N>1 (was a
+    random per-rule seed -> IKE split across nodes).
+
+ipsecnode / fleetnode (need musl rebuild -- P2, 2026-08-11):
+  - vici::load_conn: remote.id = device_ip for static-IP sites (initiator PSK
+    lookup resolves the per-customer VICI PSK by peer identity).
+  - vici::load_conn: local.id = <EIP> so this node presents the customer-facing
+    EIP as IDi (required for Cisco/standard CPE that key their PSK to our public
+    IP). Plumbed through credentials.rs. The EIP is discovered at startup via
+    DescribeAddresses filtered by the VIP EIP's Name tag (default
+    `FleetShell-IPSec-VIP`, aws::fetch_vip_public_ip), so a new regional
+    deployment needs no file edit -- it just needs its VIP EIP named that.
+    ipsecnode.toml [node] local_ike_id / vip_name_tag are optional overrides.
+  - nodeconfig: new optional [node] local_ike_id + vip_name_tag.
+
+NO new infra tag needed: ipsecnode reads the existing VIP EIP by its Name tag.
 
 fleetroute (need rebuild):
   - rp_filter=0 (was 2) -- critical for IPIP forwarding
@@ -595,6 +678,15 @@ be forced to use NAT-T (UDP 4500 encapsulation), so raw ESP must be handled.
 LVS with nftables `jhash ip saddr` hashes on source IP only, giving identical
 routing decisions for UDP 500, UDP 4500, and proto 50 from the same customer.
 
+IMPLEMENTATION NOTE (2026-08-11): the three jhash rules MUST carry the SAME
+explicit `seed`. With no seed, nftables assigns a random seed per rule, so at
+N>1 the 500/4500/ESP rules hash one source IP to DIFFERENT nodes and IKE splits
+across concentrators (IKE_SA_INIT on one, IKE_AUTH on another ->
+`IKE_SA checkout not successful`). ipsecpulse now emits a fixed shared seed
+(JHASH_SEED) on all three rules. The DNAT rules are also scoped to
+`ip daddr <secondary_ip>` so they only match customer inbound traffic and never
+hijack concentrator-initiated outbound IKE (P2).
+
 ### 2. Two NICs on LVS nodes -- data plane and management/heartbeat separated
 
 Each LVS node has two ENIs:
@@ -796,7 +888,8 @@ fleetipsec:site:<tunnel_gw_ip>
     All fields except customer_id are optional with strong defaults.
     {
         "customer_id":  "acme-corp",
-        "ike_identity": "10.5.0.1",     // optional; see Decision #13
+        "ike_identity": "10.5.0.1",     // optional; see Decision #13 and the
+                                        //   "When to set ike_identity" note below
         "static_ip":    true,
         "ike_version":  2,
 
@@ -880,6 +973,29 @@ stated IKE identity (two entries in the VICI `owners` list). The device
 registration process must capture the IKE identity for any aggressive-mode
 device that does not identify by public IP. Devices without this field
 are treated as Main Mode / public-IP-identity devices.
+
+**When to set `ike_identity` (portal / provisioning reminder):**
+`ike_identity` is the CUSTOMER device's own IKE identity (its IDi, our
+`remote.id`).  It is the OPPOSITE direction from `local_ike_id` (which is OUR
+identity -- the EIP -- that we present, discovered via DescribeAddresses).
+
+Set `ike_identity` whenever the device presents an identity that is NOT its
+public IP, e.g.:
+  - IKEv2 or IKEv1 Aggressive Mode devices configured with an FQDN, a
+    user-FQDN/email, or a key-id (Cisco `identity hostname` / `identity key-id`).
+  - devices that identify by an internal/LAN IP (common behind their own NAT).
+  - any CPE where the installer set a local identity that differs from the WAN IP.
+
+Leave it unset for the common case: a static-IP device that identifies by its
+public IP (IKEv1 Main Mode default; most CPE using `identity address`).  Then
+`remote.id` defaults to the public IP.
+
+Effect (with the P2 initiator fix, 2026-08-11): `remote.id = ike_identity` when
+set, else the public IP for static-IP sites.  This means the P2 fix TIGHTENED
+the static-IP responder from `remote.id = %any` to the public IP -- so a device
+that presents a non-IP identity WITHOUT `ike_identity` set will now be rejected.
+The portal `ike_identity` field is exactly that escape hatch: populate it for
+such devices and both the responder and node-initiated directions work.
 
 **Certificate-based clients:**
 VPN nodes do NOT need individual client certificates. The client sends its
@@ -1475,7 +1591,12 @@ net.core.wmem_max                = 134217728
           VPP 26.06 (ip_pmtu_get_ip / fib_table_get_table_id_for_sw_if_index).
        Validated on helena2 + koi (full TCP handshake, reproduced by the
        daemon with no manual steps). Client gateway needs ip_forward=1.
-     - PHASE 2 (tunnel DOWN -- dynamic bring-up) -- **NEXT / design pending**.
+     - PHASE 2 (tunnel DOWN -- dynamic bring-up) -- **IN PROGRESS**. P2 PROVEN
+       in isolation (2026-08-11, N=2 test vs helena1/helena2). Four blocking
+       bugs found and fixed along the way (see "Next Session Starting Point"):
+       (1) LVS DNAT scoped to `ip daddr <secondary_ip>`; (2) fixed jhash `seed`
+       on all rules; (3) `remote.id = customer_ip` for initiator PSK lookup;
+       (4) `local.id = EIP` for Cisco/standard-CPE PSK compatibility.
        When a backend initiates to a device whose tunnel is not established,
        the tunnel must come up on demand. See Architecture Decision #17.
        Two candidate mechanisms discussed (not yet decided):
@@ -1492,10 +1613,14 @@ net.core.wmem_max                = 134217728
        SHARED hard prerequisites (true for both):
          P1 -- attract the backend packet to a concentrator while the tunnel is
                down (always-advertise /32, or a covering aggregate).
-         P2 -- the initiating concentrator MUST be jhash(customer_public_ip)%N,
-               else the customer's IKE reply (returning via the stateless LVS)
-               lands on the wrong node and the handshake never completes.
-               PROVE P2 IN ISOLATION FIRST before building anything.
+         P2 -- the initiating concentrator SHOULD be jhash(customer_public_ip)%N.
+               PROVEN (2026-08-11): the customer's IKE reply DOES return to the
+               initiator even from a non-owner, because the LVS conntrack entry
+               from the outbound SNAT reverses it. So jhash-ownership is NOT
+               required for establishment -- but IS required for robustness
+               (conntrack expiry on idle tunnels, LVS failover with no conntrack
+               sync, and the SNAT tuple collision all break a non-owner return
+               path). Mechanism (b) must still pick the jhash owner as initiator.
          P3 -- local_ts scoped to global_ip (not 0.0.0.0/0) so the trap/initiate
                targets exactly one customer.
    - 6h: ASG lifecycle hook heartbeat

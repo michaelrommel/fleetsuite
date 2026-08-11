@@ -197,8 +197,9 @@ fn build_owners(device_ip: &str, record: Option<&SiteRecord>) -> Vec<String> {
 ///
 /// Called once at startup before the pubsub listener is started.
 pub async fn bulk_load(
-	vici_client: &mut Client,
-	valkey:      &mut redis::aio::MultiplexedConnection,
+	vici_client:  &mut Client,
+	valkey:       &mut redis::aio::MultiplexedConnection,
+	local_ike_id: Option<&str>,
 ) -> Result<usize> {
 	info!("scanning Valkey for {PSK_PREFIX}* keys ...");
 
@@ -226,7 +227,7 @@ pub async fn bulk_load(
 				.unwrap_or(&key)
 				.to_string();
 
-			match load_one_device(vici_client, valkey, &device_ip).await {
+			match load_one_device(vici_client, valkey, &device_ip, local_ike_id).await {
 				Ok(())  => loaded += 1,
 				Err(e)  => {
 					warn!(device_ip, "failed to load PSK: {e:#}");
@@ -257,9 +258,10 @@ pub async fn bulk_load(
 /// with the same id/name, so this is safe to call on both initial bulk load
 /// and on pubsub update events.
 async fn load_one_device(
-	vici_client: &mut Client,
-	valkey:      &mut redis::aio::MultiplexedConnection,
-	device_ip:   &str,
+	vici_client:  &mut Client,
+	valkey:       &mut redis::aio::MultiplexedConnection,
+	device_ip:    &str,
+	local_ike_id: Option<&str>,
 ) -> Result<()> {
 	let psk_key = format!("{PSK_PREFIX}{device_ip}");
 	let psk: Option<String> = valkey.get(&psk_key).await
@@ -292,7 +294,7 @@ async fn load_one_device(
 			has_remote_ts = rec.remote_ts.is_some(),
 			"loading per-site VICI connection"
 		);
-		load_device_conn(vici_client, device_ip, rec).await
+		load_device_conn(vici_client, device_ip, rec, local_ike_id).await
 			.with_context(|| format!("VICI load-conn for {device_ip} failed"))?;
 	}
 
@@ -316,9 +318,10 @@ fn device_local_ts(rec: &SiteRecord) -> Vec<String> {
 }
 
 async fn load_device_conn(
-	vici_client: &mut Client,
-	device_ip:   &str,
-	rec:         &SiteRecord,
+	vici_client:  &mut Client,
+	device_ip:    &str,
+	rec:          &SiteRecord,
+	local_ike_id: Option<&str>,
 ) -> Result<()> {
 	let conn_name   = vici::conn_id(device_ip);
 	let static_ip   = rec.static_ip.unwrap_or(false);
@@ -358,6 +361,7 @@ async fn load_device_conn(
 		remote_ts,
 		local_ts,
 		if_id,
+		local_ike_id,
 	)
 	.await?;
 
@@ -406,6 +410,7 @@ pub async fn pubsub_task(
 	mut vici_client: Client,
 	valkey_client:   redis::Client,
 	pubsub:          redis::aio::PubSub,
+	local_ike_id:    Option<String>,
 ) {
 	// First run uses the pubsub connection passed from main; on reconnect
 	// we open a fresh one from valkey_client.
@@ -427,7 +432,7 @@ pub async fn pubsub_task(
 			}
 		};
 
-		match run_pubsub_loop(&mut vici_client, &valkey_client, ps).await {
+		match run_pubsub_loop(&mut vici_client, &valkey_client, ps, local_ike_id.as_deref()).await {
 			Ok(())  => warn!("Valkey pubsub stream ended -- reconnecting in 5 s"),
 			Err(e)  => error!("Valkey pubsub error: {e:#} -- reconnecting in 5 s"),
 		}
@@ -441,6 +446,7 @@ async fn run_pubsub_loop(
 	vici_client:   &mut Client,
 	valkey_client: &redis::Client,
 	mut pubsub:    redis::aio::PubSub,
+	local_ike_id:  Option<&str>,
 ) -> Result<()> {
 	// Subscribe to SET and DEL keyevent notifications for all keys.
 	// We filter by prefix in the handler.
@@ -474,12 +480,12 @@ async fn run_pubsub_loop(
 
 		if key.starts_with(PSK_PREFIX) {
 			let device_ip = &key[PSK_PREFIX.len()..];
-			handle_psk_event(vici_client, valkey_client, device_ip, is_set, is_del).await;
+			handle_psk_event(vici_client, valkey_client, device_ip, is_set, is_del, local_ike_id).await;
 		} else if key.starts_with(SITE_PREFIX) {
 			let device_ip = &key[SITE_PREFIX.len()..];
 			// Device record changed: re-register the PSK with updated owners.
 			// This handles ike_identity changes (Architecture Decision #13).
-			handle_site_event(vici_client, valkey_client, device_ip).await;
+			handle_site_event(vici_client, valkey_client, device_ip, local_ike_id).await;
 		}
 		// Keys outside our namespaces are silently ignored.
 	}
@@ -495,12 +501,13 @@ async fn handle_psk_event(
 	device_ip:     &str,
 	is_set:        bool,
 	is_del:        bool,
+	local_ike_id:  Option<&str>,
 ) {
 	if is_set {
 		info!(device_ip, "PSK created/updated -- reloading into charon");
 		match valkey_client.get_multiplexed_async_connection().await {
 			Ok(mut conn) => {
-				if let Err(e) = load_one_device(vici_client, &mut conn, device_ip).await {
+				if let Err(e) = load_one_device(vici_client, &mut conn, device_ip, local_ike_id).await {
 					error!(device_ip, "PSK reload failed: {e:#}");
 				}
 			}
@@ -518,6 +525,7 @@ async fn handle_site_event(
 	vici_client:   &mut Client,
 	valkey_client: &redis::Client,
 	device_ip:     &str,
+	local_ike_id:  Option<&str>,
 ) {
 	// Unload the old per-site connection first (if any), then reload.
 	// This handles the case where a device loses its custom config fields
@@ -530,7 +538,7 @@ async fn handle_site_event(
 	info!(device_ip, "site record updated -- refreshing PSK owners and connection");
 	match valkey_client.get_multiplexed_async_connection().await {
 		Ok(mut conn) => {
-			if let Err(e) = load_one_device(vici_client, &mut conn, device_ip).await {
+			if let Err(e) = load_one_device(vici_client, &mut conn, device_ip, local_ike_id).await {
 				error!(device_ip, "PSK/conn refresh failed: {e:#}");
 			}
 		}

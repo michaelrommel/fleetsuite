@@ -5,6 +5,10 @@
 //!
 //! Required so that inner packets (customer src IP, mapped global dst IP)
 //! are not dropped by AWS after VPP decapsulates them.
+//!
+//! Also exposes fetch_vip_public_ip() which discovers the customer-facing VIP
+//! EIP (by its Name tag) via DescribeAddresses -- used as the local IKE
+//! identity this node presents when it INITIATES a tunnel.
 
 use anyhow::{Context, Result};
 use tracing::debug;
@@ -17,6 +21,28 @@ use aerocore::{
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
+
+/// Discover the customer-facing VIP EIP public IP via DescribeAddresses,
+/// filtered by the EIP's Name tag (e.g. "FleetShell-IPSec-VIP").
+///
+/// Used as the local IKE identity (IDi) this node presents when it INITIATES a
+/// tunnel, so standard CPE that key their PSK to our public IP authenticate us.
+/// Runs in the node's own region, so it returns this region's VIP.  Returns
+/// None on any error or if the tag matches no address -- the caller decides
+/// whether that is fatal.
+pub async fn fetch_vip_public_ip(region: &str, name_tag: &str) -> Option<String> {
+	let creds: AwsCredentials = fetch_imds_credentials().await.ok()?;
+	let host = format!("ec2.{region}.amazonaws.com");
+	let xml = aws_query(&host, "ec2", region, &creds, &[
+		("Action",           "DescribeAddresses"),
+		("Version",          "2016-11-15"),
+		("Filter.1.Name",    "tag:Name"),
+		("Filter.1.Value.1", name_tag),
+	])
+	.await
+	.ok()?;
+	extract_scalar(&xml, "publicIp").map(str::to_string)
+}
 
 /// Discover the eth0 ENI ID from IMDS and disable its src/dest check.
 /// Returns the ENI ID on success for logging.

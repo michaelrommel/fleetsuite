@@ -49,6 +49,27 @@ async fn main() -> Result<()> {
 		has_em_server     = cfg.backend.em_server.is_some(),
 		"backend config"
 	);
+
+	// Stable local IKE identity for node-INITIATED tunnels (the customer-facing
+	// EIP).  Priority: ipsecnode.toml [node] local_ike_id (per-host override) >
+	// DescribeAddresses lookup of the VIP EIP by its Name tag (per-region) > None.
+	let local_ike_id = match cfg.node.local_ike_id.clone() {
+		Some(id) => Some(id),
+		None     => {
+			let name_tag = cfg.node.vip_name_tag.as_deref()
+				.unwrap_or(nodeconfig::DEFAULT_VIP_NAME_TAG);
+			aws::fetch_vip_public_ip(&args.region, name_tag).await
+		}
+	};
+	match &local_ike_id {
+		Some(id) => info!(%id, "node IKE identity for initiated tunnels"),
+		None     => warn!(
+			"no local IKE identity (ipsecnode.toml [node] local_ike_id or a VIP \
+			 EIP with Name tag '{}'); node-INITIATED tunnels will fail against \
+			 CPE that key their PSK to our public IP",
+			cfg.node.vip_name_tag.as_deref().unwrap_or(nodeconfig::DEFAULT_VIP_NAME_TAG)
+		),
+	}
 	info!(
 		vici_socket     = %args.vici_socket,
 		valkey_url      = %args.valkey_url,
@@ -110,7 +131,7 @@ async fn main() -> Result<()> {
 	// KEg$: Keyspace + Keyevent, generic commands (DEL) + string commands (SET/GETSET).
 	credentials::enable_keyspace_notifications(&mut valkey_cmd).await?;
 
-	let loaded = credentials::bulk_load(&mut cmd_client, &mut valkey_cmd).await
+	let loaded = credentials::bulk_load(&mut cmd_client, &mut valkey_cmd, local_ike_id.as_deref()).await
 		.context("Bulk PSK load from Valkey failed")?;
 	info!(count = loaded, "PSKs loaded into charon via VICI");
 
@@ -149,6 +170,7 @@ async fn main() -> Result<()> {
 		cmd_client,
 		valkey_client.clone(),
 		valkey_pubsub,
+		local_ike_id.clone(),
 	));
 
 	// Health + metrics HTTP endpoint.
