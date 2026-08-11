@@ -65,9 +65,21 @@ The FOUR fixes (all committed this session):
      credentials::bulk_load / pubsub_task / load_one_device.
 OPERATIONAL: no new infra tag -- each region just needs its VIP EIP named
 `FleetShell-IPSec-VIP`. Rebuild the fleetscale (LVS) AMI for fixes 1+2 and the
-fleetnode AMI for fixes 3+4. Remaining phase-2 work:
-choose/implement mechanism (b) (ipsecnode-driven on-demand initiate) with the
-jhash owner as initiator, and the single-initiator/conntrack-cleanup discipline.
+fleetnode AMI for fixes 3+4.
+
+NEXT SESSION -- build phase-2 on-demand bring-up (mechanism b).  See the full
+plan in Build Order step 6, "NEXT-SESSION PLAN" under the 6g phase 2 entry.
+Two things learned/decided this session feed into it:
+- INITIATE THE CHILD, NOT THE IKE: a data-driven bring-up must raise the
+  CHILD_SA (VICI initiate targeting the child / a trap policy), not just the
+  IKE_SA -- `--initiate --ike` fires no child-updown event, so no VPP VRF / /32
+  / device route is installed and backend->device fails.  on_child_up is
+  direction-agnostic, so once the child is up the data plane is identical to a
+  site-initiated tunnel.
+- OWNER SELECTION is the open decision: (a) any node initiates and relies on LVS
+  conntrack to return the IKE reply (proven; recommended to try first) vs
+  (b) initiate from the jhash owner by self-computing a kernel-bit-exact jhash
+  (seed JHASH_SEED, sorted pool ring published to Valkey by ipsecscale).
 
 ----- earlier (2026-08-10) -----
 **Increment 6g PHASE 1 COMPLETE** --
@@ -1623,6 +1635,55 @@ net.core.wmem_max                = 134217728
                path). Mechanism (b) must still pick the jhash owner as initiator.
          P3 -- local_ts scoped to global_ip (not 0.0.0.0/0) so the trap/initiate
                targets exactly one customer.
+
+     NEXT-SESSION PLAN (phase 2 build, mechanism (b)):
+       1. TRIGGER + ATTRACTION (P1): advertise a covering aggregate (or
+          always-advertise the /32) so a backend packet to an un-provisioned
+          global_ip reaches SOME concentrator while the tunnel is down.  Punt
+          that packet to ipsecnode via nfqueue; ipsecnode reverse-maps
+          global_ip -> peer_ip (site) in Valkey and decides whether/where to
+          initiate.
+       2. INITIATE THE CHILD, NOT THE IKE (lesson 2026-08-11): a data-driven
+          bring-up must raise the CHILD_SA, not just the IKE_SA.  `swanctl
+          --initiate --ike` establishes ONLY the IKE_SA -- no child-updown event
+          fires, so ipsecnode installs NO VPP VRF / /32 / device route and the
+          backend cannot reach the device (this fooled us during P2 testing:
+          the IKE_AUTH had no SA/TSi/TSr payloads and `ip r` showed no
+          vpp-{hex} tap or global_ip route).  Use a VICI initiate that targets
+          the CHILD (equivalent of `swanctl --initiate --child site-<ip>`); a
+          StrongSwan trap policy does this automatically on the first data
+          packet.  on_child_up is DIRECTION-AGNOSTIC (handle_child_updown keys
+          off the `up` flag + remote-host only), so once the child is up the
+          full data plane is installed exactly as for a site-initiated tunnel --
+          no initiator-specific code is needed.
+       3. OWNER SELECTION (P2) -- the open design decision:
+          (a) SIMPLE / proven: any node that catches the trigger initiates; the
+              customer's IKE reply returns to it via the LVS conntrack entry
+              (proven 2026-08-11).  After an LVS failover or conntrack expiry the
+              customer's ESP re-hashes to the jhash owner and DPD re-establishes
+              there -- self-healing with a blip; no hash math in ipsecnode.
+              RECOMMENDED to build and measure FIRST.
+          (b) ROBUST: initiate from the jhash owner so the return path is correct
+              even cold.  ipsecnode must self-compute the SAME decision nftables
+              makes: owner = sorted_pool[ jhash(customer_ip, JHASH_SEED) mod N ].
+              Requirements:
+                - a Rust jhash BIT-EXACT with the kernel jhash nftables uses
+                  (Jenkins lookup3 over the 4 IPv4 bytes in network order,
+                  len 4, seed = JHASH_SEED = 0xa5a5a5a5).  Validate empirically
+                  against observed mappings (helena1/helena2 -> node) before
+                  trusting it; put it in ONE shared place used by BOTH the nft-map
+                  builder (ipsecpulse/ipsecscale) and ipsecnode.
+                - the current ring: seed (constant), the ORDERED concentrator IP
+                  list (ipsecpulse's numerically-sorted vpn_ips) and N.  The LVS
+                  master (ipsecscale) owns the map, so publish the ring to Valkey
+                  (e.g. fleetipsec:lvsring = {seed, nodes:[...]}) on every pool
+                  change; ipsecnode subscribes and recomputes.
+                - if the trigger lands on a non-owner, hand off to the owner
+                  (Valkey message / direct signal) so the OWNER initiates.
+          Either way: the SNAT tuple collision (a concentrator-initiated and a
+          customer-initiated IKE flow for the same customer collapse to one
+          5-tuple at the LVS) means enforce a SINGLE active initiator per
+          customer and flush the LVS conntrack on direction changes.
    - 6h: ASG lifecycle hook heartbeat
    - 6i: Valkey half-open IKE SA state
 7. **`aerobake/fleetroute/`** -- Return GW AMI (Alpine): FRR BGP + keepalived. **COMPLETE (code written, not yet deployed).** New `fleetpulse` binary (workspace member). Fixed IPs 172.16.51.4 (master) and 172.16.51.36 (backup). `bgp listen range` accepts dynamic VPN node pool. Route-table failover approach (no floating IP). Infrastructure scripts: `make_enis_returngw.sh`, `make_rtb_backend.sh`, `make_lt_returngw.sh`, `make_asg_returngw.sh`.
