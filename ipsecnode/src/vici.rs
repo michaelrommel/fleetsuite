@@ -390,8 +390,12 @@ pub async fn event_listener_task(
 	valkey_client: redis::Client,
 	vpp_state:     Option<crate::vpp::VppState>,
 ) {
-	// One multiplexed Valkey connection shared for all NAT record lookups.
-	let mut valkey_conn = match valkey_client.get_multiplexed_async_connection().await {
+	// One auto-reconnecting Valkey connection shared for all NAT record lookups.
+	// ConnectionManager transparently re-establishes the underlying multiplexed
+	// connection after a drop (Connection reset by peer / broken pipe), so a
+	// Valkey blip no longer permanently breaks NAT/route installation on
+	// subsequent CHILD_SA UP events.
+	let mut valkey_conn = match redis::aio::ConnectionManager::new(valkey_client).await {
 		Ok(c)  => c,
 		Err(e) => {
 			error!("event_listener_task: Valkey connect failed: {e} -- exiting");
@@ -450,7 +454,7 @@ fn find_child_sa(ike: &ViciRawValue) -> Option<&ViciRawValue> {
 
 async fn handle_child_updown(
 	raw:         ViciRawValue,
-	conn:        &mut redis::aio::MultiplexedConnection,
+	conn:        &mut redis::aio::ConnectionManager,
 	route_cache: &mut crate::nat::RouteCache,
 	vpp_state:   Option<&crate::vpp::VppState>,
 	vrf_cache:   &mut crate::vpp::VrfCache,
@@ -646,6 +650,7 @@ pub async fn load_conn(
 	remote_ts:       Vec<String>,
 	local_ts:        Vec<String>,
 	if_id:           Option<u32>,
+	mark_out:        Option<u32>,
 	local_id:        Option<&str>,
 ) -> Result<()> {
 	let remote_addrs = if static_ip {
@@ -667,7 +672,7 @@ pub async fn load_conn(
 		dpd_action:    "restart",
 		if_id_in:  if_id,
 		if_id_out: if_id,
-		mark_out:  if_id,
+		mark_out,
 	};
 
 	let mut children = HashMap::new();

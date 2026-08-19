@@ -8,7 +8,102 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-11):** Increment 6g PHASE 2 -- P2 PROVEN in
+**Last completed session (2026-08-18):** Identity-NAT breakage ROOT-CAUSED and
+FIXED by design (Option 1 -- per-site VPP bypass).  Cross-project work spanning
+fleetsuite (ipsecnode) + ~/software/fleetshell (MDM schema, Valkey spooler,
+portal UI).  Code committed; NOT yet in any AMI (musl + fleetnode rebuild
+pending).
+
+WHAT WAS BROKEN (whole fleet): backend->device remote access (SSH/RDP/HTTPS all
+hang after the first packet) whenever a site uses IDENTITY device NAT
+(global_ip == internal_ip).  The device receives the SYN and replies, the reply
+is decapsulated and reaches vpp-outer, but the backend never sees it.  ROOT
+CAUSE (proven by `nft monitor trace` + `conntrack -L`): the backend<->device
+flow hairpins the kernel conntrack stack twice (outside ens5/vpp-outer + inside
+xfrm-*/vpp-*), and with identity NAT VPP changes NOTHING, so the forward and
+return collapse onto mirror-image conntrack tuples.  nf_nat resolves the
+collision by REWRITING the device's source port (observed 8443 -> 11765/4997),
+so the reply egresses ens5 from the wrong port and the backend drops it.  The
+earlier ct-zone fix (2026-08-12) only ever leaked the FIRST (pre-binding) packet
+-- it does NOT fix identity NAT: a single flow ingresses different interfaces
+per direction, so no static per-interface zoning can separate the colliding
+same-zone tuples.  That ct-zone table (ipsecnode_ctzone) has now been REMOVED
+entirely -- it was only ever needed for identity-NAT-through-VPP, which no
+longer happens (identity -> bypass), and it actively BROKE customer mode: its
+`iifname "xfrm-*" ct zone set 1` put the decapsulated return in zone 1 while the
+bypass forward SYN ingresses ens5 in zone 0, so conntrack could not associate
+them and the 6g SNAT was never reversed (device SYN-ACK egressed ens5 with
+dst=customer_view instead of the backend).  PROVEN live: `nft delete table ip
+ipsecnode_ctzone` + `conntrack -F` -> full bidirectional HTTPS immediately.
+
+FLEET REALITY (queried live on the global DB): device.nat_mode was 100%
+'customer' (177,723 devices), 0 'platform'.  So identity NAT is what EVERY
+production tunnel uses and the bug hit the entire installed base.
+gateway.nat_type was the constant '1' on all 20,121 gateways (decoded by
+nothing, read by nothing) -- DROPPED.
+
+THE FIX (Option 1): NAT44 in VPP exists ONLY to disambiguate DUPLICATE
+internal_ips across customers.  When addresses are already unique in our view
+(customer's own range, or they NAT before the tunnel -- the entire fleet), VPP
+NAT is a no-op identity mapping = the bug.  So do NOT run VPP for such sites:
+- 'customer' mode: NO VPP VRF/tap/NAT44.  Decapsulated traffic on xfrm-{hex} is
+  forwarded straight out ens5 (device->backend, after the bnat DNAT); backend->
+  device is routed `dst=global_ip/32 dev xfrm-{hex}`.  SINGLE kernel pass per
+  direction -> no hairpin, no tuple collision.  The 6g SNAT + backend DNAT still
+  apply (now single-pass).  mark_out is OMITTED from the conn (SA selected by
+  the xfrm interface's if_id alone).
+- 'backend' mode (rare escape hatch, currently nobody): unchanged VPP VRF path.
+NAT mode is now a per-SITE (gateway) property, not per-device.  Mixed sites are
+handled by policy (allocate distinct global_ips for the colliding subset), not
+per-address splitting -- that would break the per-customer xfrm/vpp model.
+
+VALKEY SHAPE (new): nat_mode is emitted on BOTH records (spooler writes both
+atomically); it DEFAULTS to 'customer' when absent, so NO mass re-spool is
+needed (existing keys route the bypass immediately; the portal writes the
+explicit flag on the next gateway save):
+  fleetipsec:site:<ip>  { ..., nat_mode: "customer"|"backend" }  (read by credentials.rs)
+  fleetipsec:nat:<ip>   { nat_mode: "customer"|"backend", device_nat[], backend_nat? }  (read by vpp.rs)
+
+CODE CHANGES THIS SESSION (all committed, NOT in any AMI):
+  fleetsuite/ipsecnode:
+    - nat.rs: NatRecord.nat_mode + is_customer_mode() (Some("backend")=VPP; else bypass).
+    - credentials.rs: SiteRecord.nat_mode; load_device_conn computes mark_out =
+      Some(if_id) only for backend, else None.
+    - vici.rs: load_conn takes explicit mark_out: Option<u32> (was always if_id).
+    - vpp.rs: SiteVrfState.bypass; on_child_up branches to setup_site_bypass for
+      customer mode (global_ip/32 dev xfrm-{hex} + setup_site_bnat, no alloc/VRF);
+      on_child_down branches to teardown_site_bypass; added setup/teardown_site_bypass.
+    - vpp.rs: REMOVED the ipsecnode_ctzone table (init_nftables_ctzone + const)
+      -- obsolete and broke customer mode (see above). init() now just runs a
+      one-time conntrack -F; cleanup_stale_state() deletes any stale
+      ipsecnode_ctzone so an upgraded-in-place node self-heals. Single default
+      conntrack zone everywhere now (backend/real-NAT never collided).
+  ~/software/fleetshell (MDM + portal):
+    - infrastructure/sql/migrate_gateway_nat_mode.sql (validated live, rolled back):
+      gateway.nat_mode ('customer'|'backend', default customer); backfill 'backend'
+      where any device was 'platform' (=> none); DROP gateway.nat_type; DROP
+      device.nat_mode.  Folded into schema_global.sql.
+    - src/lib/server/gateway_spool.ts: reads gateway.nat_mode; emits nat_mode into
+      both site+nat records; per-device internal_ip = backend?(ip_real||global):global.
+    - Gateway Edit UI: NAT mode select under Tunnel/IPsec; nat_type field removed.
+    - Device Edit UI: NAT-mode field removed; gateway picker moved before the IPs;
+      chips after "IP address" (INFORMATIVE=customer, TRANSLATED=backend/orange);
+      global-uniqueness warning via api/devices/ip-in-use (service-level, boolean
+      only, privacy-preserving).  EntityPicker gained onPick; gateways search API
+      returns nat_mode; device load joins gw.nat_mode AS gateway_nat_mode.
+
+DEPLOY ORDERING: apply migrate_gateway_nat_mode.sql TOGETHER WITH the portal
+deploy (old spooler reads device.nat_mode; new spooler needs gateway.nat_mode).
+Then musl rebuild + fleetnode AMI.
+
+NEXT: musl release build (ipsecnode) + fleetnode AMI bake, cycle the VPN
+concentrator, then live-test on an identity site: full HTTPS AND SSH transfer
+completing BOTH directions (verify a SINGLE conntrack entry, NO source-port
+remap -- not just a handshake), plus a backend-mode regression.  Leftover portal
+polish: docs/valkey_spool.md still documents the old per-device nat_mode.
+
+----- earlier (2026-08-11) -----
+**Increment 6g PHASE 2** -- P2 PROVEN in
 isolation (backend-initiated dynamic tunnel bring-up). Ran a two-node (N=2)
 concentrator test against helena2/helena1 through the LVS. Findings and FOUR
 code fixes below; code committed, NOT yet in any AMI. The LVS was patched by
@@ -2200,6 +2295,168 @@ specific rewrite.
 Entry point to look at: aeroftp's FTP proxy / ALG code in
 `~/software/aerosuite/aeroftp/src/` -- search for PASV handling or the
 place where the 227 response is constructed or forwarded.
+
+### Backend membership + backend->device SNAT is static in ipsecnode.toml (2026-08-12)
+
+Parked during a live 6g backend->device debug session (site 80.143.171.111,
+Cisco FlexVPN, device 80.80.100.2/32, access_server view 194.138.39.18).
+Three related gaps, to pick up in the coming days:
+
+1. **NAT_PREFIX is not subscribed -- live nat-record edits do not apply.**
+   `credentials::run_pubsub_loop` only reacts to `fleetipsec:psk:*`
+   (`PSK_PREFIX`) and `fleetipsec:site:*` (`SITE_PREFIX`). A change to
+   `fleetipsec:nat:*` does nothing until the CHILD_SA re-establishes, because
+   the bnat map + 6g SNAT rule are built ONLY by `vpp::on_child_up` ->
+   `setup_site_bnat`, which reads the nat record at child-up time. Symptom hit
+   this session: `backend_nat.access_server` was added to Valkey AFTER the
+   tunnel came up, so `setup_site_bnat` saw `backend_nat == None`, returned
+   `SiteBnatState::empty()`, and `nft list table ip ipsecnode_bnat` stayed
+   empty (no map, no PREROUTING dnat, no POSTROUTING snat).
+   FIX: add a `NAT_PREFIX` handler that routes the event into the task owning
+   `VrfCache` (via a channel) and rebuilds `site.bnat` there (tear down old
+   handles from `SiteBnatState`, install new, update state). Note every name
+   is deterministic from peer_ip (`xfrm-{if_id:08x}`, `bnat_{if_id:08x}`,
+   `vpp-{if_id:08x}` where `if_id = u32::from(peer_ip)`), so the interface is
+   always known from the key -- no discovery needed.
+
+2. **backend_nat real_ip / membership is static in ipsecnode.toml and will
+   drift as the ECS backend fleet scales.** The DNAT direction
+   (device->backend, `customer_view_ip -> real_ip`) is fine if `real_ip` is a
+   STABLE VIP -- aeroftp and fleetshell-proxy already front their fleets with
+   an NLB VIP, so keep those in config/Valkey as stable per-role VIPs.
+   The SNAT direction (backend->device) is the real gap: when a container
+   INITIATES to a device the packet carries the container's own task IP (an
+   NLB only rewrites INBOUND/DNAT, never egress-initiated flows), and ALL
+   three roles (access_server / sd_server / em_server) dial devices, each
+   needing a DIFFERENT customer_view source. So the blanket per-site SNAT
+   (`oifname xfrm-{hex} ct state new snat to <access_view>`) must become
+   source-matched: `snat ip to ip saddr map @bnat_snat_{hex}` where the map is
+   `{ member_ip : that_site's_view_for_that_role }` for each role in the
+   site's backend_nat. That requires the live per-role task-IP membership.
+   APPROACH (agreed): a scaler (natural home: `ipsecscale`, master-only
+   singleton) reconciles ECS membership -- trigger via EventBridge "ECS Task
+   State Change" (or container self-register on startup) as a fast path, but
+   the AUTHORITATIVE source is a `DescribeTasks`/Cloud Map query, plus a
+   periodic full reconcile (~30-60 s) to GC ungracefully-dead tasks. Scaler
+   writes `fleetipsec:backend:<role> -> [ips]` (snapshot, keyspace-notified);
+   every `ipsecnode` subscribes (new `BACKEND_PREFIX`), keeps a `role ->
+   set<member_ip>` index and applies incremental `nft add/delete element`
+   deltas to every active site's `bnat_snat_{hex}` map (build from snapshot at
+   site-up). Debounce/coalesce bursts; prefer element deltas over full
+   rewrites (fan-out is O(sites x members)). Do it all in the `VrfCache`-owning
+   task so child-updown / nat-record / membership events are serialized.
+
+3. **Derive `local_ts` / `remote_ts` from the nat record instead of hand
+   entry.** The portal that spools to Valkey has no `local_ts` field yet;
+   without it `device_local_ts` / `device_remote_ts` default to `0.0.0.0/0`,
+   which works as RESPONDER (StrongSwan narrows to the peer's proposal) but
+   fails as INITIATOR against a picky CPE -> `TS_UNACCEPTABLE`, no CHILD_SA
+   (confirmed this session: IKE_SA established, CHILD_SA rejected; the
+   customer-initiated SA showed the Cisco ACL is exactly
+   `local 194.138.39.18/32 <-> remote 80.80.100.2/32`).
+   Both selectors are fully derivable from the nat record and should be, to
+   avoid drift (esp. the multi-role case where `local_ts` must be the UNION of
+   all present-role view IPs):
+     - `remote_ts` = `device_nat[].internal_ip` (the device address the
+       customer's ACL references -- internal_ip, NOT global_ip).
+     - `local_ts`  = union of `backend_nat` present-role `customer_view_ip`s.
+   Keep the explicit site-record `local_ts`/`remote_ts` fields as an OVERRIDE
+   for genuine subnet cases (customer ACL permits a range, not a host).
+   Wrinkle: `load_device_conn` in `credentials.rs` currently reads only the
+   `SiteRecord`; deriving TS means also fetching the `NatRecord`
+   (`fleetipsec:nat:*`) at conn-load time -- which dovetails with the
+   NAT_PREFIX reload handler in (1) (a nat-record change must then also reload
+   the conn's TS, not just the bnat map).
+
+### 6g backend->device SNAT fails when internal_ip == global_ip (identity device NAT) (2026-08-12)
+
+PROVEN root cause, same debug session (site 80.143.171.111, no device NAT so
+`internal_ip == global_ip == 80.80.100.2`, access_server view 194.138.39.18).
+The bnat map + POSTROUTING SNAT rule were correctly installed:
+  `postrouting oifname "xfrm-508fab6f" ct state new snat to 194.138.39.18`
+yet a backend SYN (172.16.54.218 -> 80.80.100.2:22) still egressed
+`xfrm-508fab6f` with source 172.16.54.218 (NOT SNAT'd).
+
+WHY: the backend->device packet hairpins through VPP and crosses the kernel
+netfilter stack TWICE:
+  Pass 1 (outside): arrives on ens5, kernel routes it out `dev vpp-outer`
+    (the `global_ip/32 dev vpp-outer` route) into VPP. POSTROUTING runs with
+    `oif=vpp-outer` -- the `oifname xfrm-{hex}` rule does NOT match.
+    nf_nat sets a NULL (no-op) source-NAT binding and conntrack confirms it.
+  Pass 2 (inside): VPP applies the device DNAT `80.80.100.2 -> 80.80.100.2`
+    (an IDENTITY no-op), returns the packet on `vpp-{hex}`, kernel routes it
+    out `xfrm-{hex}`. POSTROUTING runs with `oif=xfrm-{hex}` and the rule now
+    matches -- but nf_nat sees source-NAT is already "done" for this ct entry
+    and applies the stored NULL binding. The rule is never re-evaluated.
+Because the device DNAT is identity, the 5-tuple is IDENTICAL on both passes,
+so the kernel treats them as ONE conntrack flow and the SNAT decision is made
+once -- on the pass where the rule cannot match.
+Phase-1 (helena2) worked ONLY because `global_ip != internal_ip`: VPP changed
+the destination inside the hop, so the two passes were different 5-tuples ->
+two separate conntrack entries -> the inside entry got a fresh SNAT eval.
+Proof: `conntrack -L` showed a single entry whose reply tuple was
+`src=80.80.100.2 dst=172.16.54.218` (plain reverse, null binding); a working
+SNAT would show the reply tuple as `... dst=194.138.39.18`.
+
+FIX (design task -- do NOT hack live), two candidates:
+  (a) CONNTRACK ZONES: assign `ct zone` by input interface in the `raw` table
+      so the outside segment (ens5 / vpp-outer) and the inside segment
+      (xfrm-* / vpp-*) are distinct conntrack flows. The inside flow then gets
+      its own SNAT eval on xfrm egress, and the device reply (arriving on
+      xfrm-{hex}, inside zone) still reverses it. Must stay consistent with the
+      existing device->backend `svcroute` DNAT, which today relies on the
+      5-tuple difference.
+  (b) COMMIT SNAT ON THE OUTSIDE PASS: replace the rule with
+      `oifname "vpp-outer" ct state new ip daddr <global_ip> snat to <access_view>`
+      keyed on the device global_ip (discriminates backend->device, whose dst is
+      the device, from device->backend, whose dst is the backend real_ip). The
+      binding is then set on pass 1 and inherited by pass 2 -> no zones needed.
+      Has its own return-path subtleties to validate; may be simpler than (a).
+NOTE: there is NO clean live workaround for the identity case -- a distinct
+`global_ip` (real device NAT) is what makes it "just work", but that is exactly
+what the no-device-NAT requirement forbids (backends must address the device
+as 80.80.100.2, so global_ip must equal internal_ip).
+
+VALIDATED (2026-08-12): approach (a) conntrack zones works live. Put the inside
+hops (xfrm-* / per-site vpp-{hex} taps) in ct zone 1 and leave the outside
+(ens5 / vpp-outer) in the default zone 0, set in a raw-priority PREROUTING
+chain (raw = -300, before the conntrack hook at -200). Exact validated table
+(both the per-site and the wildcard form were confirmed; the wildcard form is
+preferred -- it auto-covers every site with no per-site churn, and `ct zone
+set` is non-terminating so the final `vpp-outer` rule pulls it back to zone 0
+even though `vpp-*` matched it):
+    table ip ipsecnode_ctzone {
+        chain prerouting {
+            type filter hook prerouting priority raw; policy accept;
+            iifname "xfrm-*"    ct zone set 1
+            iifname "vpp-*"     ct zone set 1
+            iifname "vpp-outer" ct zone set 0
+        }
+    }
+Then `conntrack -F` once to clear stale null-binding (zone 0) entries.
+Result confirmed: backend SYN egressed xfrm-{hex} as src=194.138.39.18 and a
+full TCP handshake completed to the Cisco device (SSH-2.0-Cisco-1.25). conntrack
+then shows a zone=1 entry whose reply tuple is `src=80.80.100.2
+dst=194.138.39.18` (SNAT bound) plus a separate zone=0 entry for the outside
+hop. A single inside zone (1) is sufficient -- global_ip uniqueness (BGP /32)
+guarantees inside 5-tuples never collide across sites, and ct zones are u16 so
+per-site if_id (u32) would not fit anyway. Bonus: the zone split also gives the
+device->backend `svcroute` port-split a fresh dst-NAT evaluation on the outside
+hop, which the identity case otherwise breaks (dst-NAT already "done" on the
+inside pass) -- retest that direction when wiring this in.
+INSTALL POINT: this is a ONE-TIME static table, so add it in `vpp::init()`
+(next to the `ipsecnode` mangle-table setup), NOT per-site in setup_site_vrf --
+the `xfrm-*` / `vpp-*` wildcards cover all current and future sites. Do NOT put
+it in the static AMI file `aerobake/fleetnode/_etc_nftables_fleetnode.nft`: that
+file begins with `flush ruleset` and owns only the management `inet filter`
+plane, so a `systemctl reload nftables` would wipe every `ipsecnode_*` data-plane
+table. Keeping ctzone in `vpp::init()` gives it the same recover-on-restart
+lifecycle as ipsecnode_mangle / ipsecnode_bnat / ipsecnode_svcroute.
+READY CODE (parked, not yet applied): add `const NFT_CTZONE_TABLE:
+&str = "ipsecnode_ctzone";`, an `init_nftables_ctzone()` fn mirroring
+`init_nftables_svcroute` (emits the table above via `nft_batch`), and a single
+`init_nftables_ctzone().await?;` call in `vpp::init()` right after
+`init_nftables_bnat()`.
 
 ---
 

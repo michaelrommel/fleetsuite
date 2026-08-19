@@ -1,0 +1,40 @@
+tcpdump -n -nn -i ens5 port 8443
+tcpdump -n -nn -i vpp-outer port 8443
+ip route show 198.51.100.134
+vppctl show nat44 sessions
+ip -br link | grep -E 'xfrm-|vpp-'
+cat /proc/net/xfrm_stat
+ip xfrm policy
+ip xfrm state
+tcpdump -ni vpp-3eee6e98
+tcpdump -ni xfrm-3eee6e98
+ip rule show | grep 'vpp-3eee6e98'
+ip route show table 60001
+tcpdump -ni vpp-3eee6e98 port 8443
+tcpdump -ni vpp-outer 'host 172.16.54.22 or host 198.51.100.134'
+tcpdump -ni ens5 'host 172.16.54.22 and tcp port 8443'
+vppctl show errors
+vppctl show nat44 sessions
+vppctl show nat44 sessions |grep -A6 56016
+vppctl show ip fib table 2 | grep -E 'default|172.16|0.0.0.0'
+vppctl clear trace
+vppctl trace add virtio-input 40
+vppctl show trace
+vppctl show ip fib
+vppctl show ip fib table 1055813272
+vppctl show interface addr | grep -B1 10.255.0.6
+vppctl show ip fib table 1055813272 | grep 0.0.0.0/0
+tcpdump -ni vpp-outer 'host 198.51.100.134 and host 172.16.54.22'
+vppctl show version verbose
+journalctl -u vpp --since '30 minutes ago' --no-pager
+vppctl show ip fib table 1055813272
+
+# add tracing
+sudo nft add table ip trace_tmp
+sudo nft 'add chain ip trace_tmp t { type filter hook prerouting priority -350; policy accept; }'
+sudo nft 'add rule ip trace_tmp t iifname "vpp-outer" ip saddr 192.168.13.133 tcp sport 8443 meta nftrace set 1'
+# reproduce the browser connect, watch:
+sudo nft monitor trace
+# then clean up:
+sudo nft delete table ip trace_tmp
+

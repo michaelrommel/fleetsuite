@@ -40,6 +40,13 @@ pub const NAT_PREFIX: &str = "fleetipsec:nat:";
 /// Deserialized value of fleetipsec:nat:<peer_ip>.
 #[derive(Debug, Deserialize)]
 pub struct NatRecord {
+	/// Per-site NAT ownership (Option 1). 'customer' (default) = device addresses
+	/// are already unique in our view -> ipsecnode forwards straight through with
+	/// NO VPP NAT44 (VPP bypass). 'backend' = we translate (internal_ip = ip_real)
+	/// -> the per-site VPP VRF + NAT44 is installed. Absent = 'customer' (matches
+	/// the entire installed base and the identity-NAT sites the bypass fixes).
+	#[serde(default)]
+	pub nat_mode: Option<String>,
 	/// Per-device SNAT mappings: internal device IP -> globally routable IP.
 	/// One /32 blackhole route is installed per entry (Increment 6c).
 	/// VPP SNAT rules are built from these entries (Increment 6d).
@@ -87,6 +94,15 @@ impl BackendNatRecord {
 	}
 }
 
+impl NatRecord {
+	/// True when this site needs NO VPP NAT44 (Option 1 bypass): explicit
+	/// nat_mode = 'customer', or absent (the installed-base default). Only an
+	/// explicit 'backend' selects the VPP VRF path.
+	pub fn is_customer_mode(&self) -> bool {
+		self.nat_mode.as_deref() != Some("backend")
+	}
+}
+
 // ── Per-peer route state ──────────────────────────────────────────────────────
 
 /// Route state held in memory for one peer (one VPN site).
@@ -108,7 +124,7 @@ pub type RouteCache = HashMap<String, PeerRouteState>;
 /// Fetch and deserialize the NAT record for `peer_ip` from Valkey.
 /// Returns `None` if the key does not exist or the JSON cannot be parsed.
 pub async fn get_nat_record(
-	conn:    &mut redis::aio::MultiplexedConnection,
+	conn:    &mut redis::aio::ConnectionManager,
 	peer_ip: &str,
 ) -> Option<NatRecord> {
 	let key = format!("{NAT_PREFIX}{peer_ip}");
@@ -186,7 +202,7 @@ async fn route_del(global_ip: &str) -> Result<()> {
 /// If no NAT record exists the function is a no-op (not all sites have
 /// NAT mappings configured yet).
 pub async fn on_child_up(
-	conn:    &mut redis::aio::MultiplexedConnection,
+	conn:    &mut redis::aio::ConnectionManager,
 	peer_ip: &str,
 	cache:   &mut RouteCache,
 ) {

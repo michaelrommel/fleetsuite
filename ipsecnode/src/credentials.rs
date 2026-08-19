@@ -72,6 +72,11 @@ pub struct SiteRecord {
 	/// true = device has a stable public IP; false = dynamic (CGNAT, etc.).
 	/// Dynamic-IP devices use remote_addrs = "%any" in their connection.
 	pub static_ip:    Option<bool>,
+	/// Per-site NAT ownership (Option 1). 'backend' = we translate -> the VPP VRF
+	/// path needs a return-path packet mark (mark_out = if_id). 'customer'/absent
+	/// = VPP bypass; the return is routed straight to xfrm-{hex}, so mark_out is
+	/// omitted and the SA is selected by if_id alone.
+	pub nat_mode:     Option<String>,
 	/// IKE protocol version: 1 or 2.  Absent = accept both (version=0).
 	pub ike_version:  Option<u8>,
 
@@ -339,6 +344,13 @@ async fn load_device_conn(
 		.ok()
 		.map(u32::from);
 
+	// Return-path packet mark: only the 'backend' (VPP VRF) path needs it -- the
+	// nftables mangle sets it from the vpp-{hex} tap so the right tunnel is chosen
+	// when two customers share an internal_ip. In 'customer' bypass mode the return
+	// is routed straight to xfrm-{hex} (dst=global_ip/32), so the SA is selected by
+	// the interface's if_id alone; a mark_out requirement would then never match.
+	let mark_out: Option<u32> = if rec.nat_mode.as_deref() == Some("backend") { if_id } else { None };
+
 	// Create the per-site XFRM interface before loading the connection so
 	// it exists when StrongSwan installs the first XFRM state for this site.
 	if let Some(id) = if_id {
@@ -361,6 +373,7 @@ async fn load_device_conn(
 		remote_ts,
 		local_ts,
 		if_id,
+		mark_out,
 		local_ike_id,
 	)
 	.await?;

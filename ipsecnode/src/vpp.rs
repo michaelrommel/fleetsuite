@@ -94,6 +94,10 @@ pub struct SiteVrfState {
 	pub devices:         Vec<DeviceVrfEntry>,
 	/// Per-site backend DNAT state (nftables bnat map + PREROUTING rule).
 	pub bnat:            SiteBnatState,
+	/// True = 'customer' bypass site (no VPP VRF/tap/NAT44; only bnat + a
+	/// per-device `global_ip/32 dev xfrm-{hex}` return route). fwd_table/
+	/// ret_table/tap_idx/vpp_tap/inner_if/ifindex are unused when set.
+	pub bypass:          bool,
 	/// Active CHILD_SA count (re-keying guard).
 	pub child_sa_count:  u32,
 }
@@ -319,6 +323,11 @@ async fn cleanup_stale_state() {
 	let _ = nft(&["delete", "table", "ip", NFT_TABLE]).await;
 	let _ = nft(&["delete", "table", "ip", NFT_BNAT_TABLE]).await;
 	let _ = nft(&["delete", "table", "ip", NFT_SVCROUTE_TABLE]).await;
+	// Remove the obsolete conntrack-zone table from a prior deployment. It forced
+	// xfrm-* ingress into zone 1, which breaks 'customer' bypass sites (the
+	// forward SYN ingresses ens5 in zone 0, so the return could not associate).
+	// Identity NAT is now handled by VPP bypass, so no zoning is needed.
+	let _ = nft(&["delete", "table", "ip", "ipsecnode_ctzone"]).await;
 	// Flush old shared return table 9999 if left by a pre-6e deployment.
 	let _ = ip(&["route", "flush", "table", "9999"]).await;
 	for prio in ["100", "200"] {
@@ -370,6 +379,13 @@ pub async fn init(backend: BackendConfig) -> Result<Option<VppState>> {
 
 	init_nftables_mangle().await?;
 	init_nftables_bnat().await?;
+	// Clear any stale conntrack entries (e.g. zone-tagged bindings left by a prior
+	// deployment's ipsecnode_ctzone) so every flow is tracked in the single
+	// default zone. Safe here: init() runs at startup before ipsecnode loads any
+	// connection, so there is no active data flow yet.
+	if let Err(e) = conntrack_flush().await {
+		warn!("conntrack flush at init failed: {e:#} -- stale entries persist until they expire");
+	}
 	if let Err(e) = init_nftables_svcroute(&backend).await {
 		warn!("global service routing init failed: {e:#} -- traffic reaches real_ip directly");
 	}
@@ -428,6 +444,16 @@ async fn init_nftables_bnat() -> Result<()> {
 	Ok(())
 }
 
+async fn conntrack_flush() -> Result<()> {
+	let out = tokio::process::Command::new("conntrack")
+		.arg("-F")
+		.output().await.context("spawn conntrack -F")?;
+	if !out.status.success() {
+		anyhow::bail!("conntrack -F failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+	}
+	Ok(())
+}
+
 async fn init_nftables_svcroute(backend: &BackendConfig) -> Result<()> {
 	// Global port-based service routing applied on vpp-outer after per-customer
 	// VPP SNAT.  POSTROUTING registers conntrack hooks for the reverse SNAT on
@@ -480,7 +506,7 @@ async fn add_svcroute_rule(split: &SplitRule) -> Result<()> {
 // -- Per-CHILD_SA event handlers ----------------------------------------------
 
 pub async fn on_child_up(
-	conn:    &mut redis::aio::MultiplexedConnection,
+	conn:    &mut redis::aio::ConnectionManager,
 	peer_ip: &str,
 	state:   &VppState,
 	cache:   &mut VrfCache,
@@ -501,6 +527,24 @@ pub async fn on_child_up(
 		Some(r) => r,
 		None    => return,
 	};
+
+	// Option 1: 'customer' sites need NO VPP NAT44 -- decapsulated traffic is
+	// forwarded straight through (single kernel pass), which also sidesteps the
+	// identity-NAT conntrack collision. Only 'backend' sites build the VPP VRF.
+	if record.is_customer_mode() {
+		match setup_site_bypass(peer_ip, if_id, &record, state).await {
+			Ok(site) => {
+				info!(peer_ip, vrf = if_id, devices = site.devices.len(),
+				      "VPP bypass: customer-mode site active (no VRF/NAT44)");
+				cache.insert(peer_ip.to_string(), site);
+			}
+			Err(e) => {
+				warn!(peer_ip, "customer-mode setup failed: {e:#} -- freeing partial state");
+				teardown_site_bypass_routes(if_id, &record).await;
+			}
+		}
+		return;
+	}
 
 	let fwd_table = alloc.alloc_fwd();
 	let ret_table = alloc.alloc_ret();
@@ -543,6 +587,10 @@ pub async fn on_child_down(
 	}
 
 	let site = cache.remove(peer_ip).unwrap();
+	if site.bypass {
+		teardown_site_bypass(peer_ip, &site).await;
+		return;
+	}
 	let (fwd, ret, tap) = (site.fwd_table, site.ret_table, site.tap_idx);
 	teardown_site_vrf(peer_ip, &site).await;
 	alloc.free_fwd(fwd);
@@ -668,7 +716,7 @@ async fn setup_site_vrf(
 		inner_if:        inner_if.to_string(),
 		tap_vpp_ip:      tap_ips.vpp_ip.clone(),
 		tap_kern_prefix: tap_ips.kern_prefix.clone(),
-		ifindex, devices, bnat, child_sa_count: 1,
+		ifindex, devices, bnat, bypass: false, child_sa_count: 1,
 	})
 }
 
@@ -718,6 +766,83 @@ async fn teardown_site_vrf(peer_ip: &str, site: &SiteVrfState) {
 	vppctl_warn(&["ip", "table", "del", &vrf_str]).await;
 
 	info!(peer_ip, vrf = site.if_id, "VPP: per-site VRF torn down");
+}
+
+// -- Customer-mode bypass (Option 1) ------------------------------------------
+//
+// 'customer' sites have addresses that are already unique in our view, so no VPP
+// NAT44 is needed. Decapsulated traffic on xfrm-{hex} is forwarded straight out
+// ens5 (device->backend, after the bnat DNAT) and backend->device is routed
+// `dst=global_ip/32 dev xfrm-{hex}` -- a single kernel forwarding pass per
+// direction. This avoids the VPP hairpin entirely, so the identity-NAT conntrack
+// collision (global_ip == internal_ip) cannot occur. The 6g backend->device SNAT
+// and the backend DNAT (setup_site_bnat) still apply, now single-pass.
+
+async fn setup_site_bypass(
+	peer_ip: &str,
+	if_id:   u32,
+	record:  &NatRecord,
+	state:   &VppState,
+) -> Result<SiteVrfState> {
+	let xfrm_if = xfrm_if_name(if_id);
+
+	// Per-device: route the (already unique) global_ip straight into the tunnel
+	// interface, replacing the /32 blackhole installed by nat::on_child_up (6c).
+	// In customer mode internal_ip == global_ip, so there is nothing to translate.
+	let mut devices = Vec::new();
+	for entry in &record.device_nat {
+		match ip(&["route", "replace", &format!("{}/32", entry.global_ip),
+		          "dev", &xfrm_if]).await {
+			Ok(()) => {
+				info!(peer_ip, global_ip = %entry.global_ip, xfrm = %xfrm_if,
+				      "bypass: global_ip routed into tunnel (no NAT)");
+				devices.push(DeviceVrfEntry {
+					internal_ip: entry.internal_ip.clone(),
+					global_ip:   entry.global_ip.clone(),
+				});
+			}
+			Err(e) => warn!(peer_ip, global_ip = %entry.global_ip,
+			                "bypass: global_ip route failed: {e:#}"),
+		}
+	}
+
+	// Backend DNAT + 6g backend->device SNAT (single-pass in bypass mode).
+	let bnat = setup_site_bnat(
+		peer_ip,
+		if_id,
+		record.backend_nat.as_ref(),
+		&state.backend,
+	).await;
+
+	Ok(SiteVrfState {
+		if_id,
+		fwd_table: 0, ret_table: 0, tap_idx: 0,
+		vpp_tap:         String::new(),
+		inner_if:        String::new(),
+		tap_vpp_ip:      String::new(),
+		tap_kern_prefix: String::new(),
+		ifindex: 0,
+		devices, bnat, bypass: true, child_sa_count: 1,
+	})
+}
+
+async fn teardown_site_bypass(peer_ip: &str, site: &SiteVrfState) {
+	teardown_site_bnat(peer_ip, &site.bnat).await;
+	for d in &site.devices {
+		// Revert to blackhole so nat::on_child_down then deletes it (mirrors the
+		// VRF path's remove_device_nat).
+		ip_warn(&["route", "replace", &format!("{}/32", d.global_ip),
+		          "type", "blackhole"]).await;
+	}
+	info!(peer_ip, vrf = site.if_id, "VPP bypass: customer-mode site torn down");
+}
+
+/// Best-effort route cleanup after a partial setup_site_bypass failure.
+async fn teardown_site_bypass_routes(_if_id: u32, record: &NatRecord) {
+	for entry in &record.device_nat {
+		ip_warn(&["route", "replace", &format!("{}/32", entry.global_ip),
+		          "type", "blackhole"]).await;
+	}
 }
 
 /// Best-effort cleanup after a partial setup_site_vrf failure.
@@ -938,7 +1063,7 @@ async fn get_ifindex(iface: &str) -> Result<u32> {
 // -- Valkey helper ------------------------------------------------------------
 
 async fn get_nat_record(
-	conn:    &mut redis::aio::MultiplexedConnection,
+	conn:    &mut redis::aio::ConnectionManager,
 	peer_ip: &str,
 ) -> Option<NatRecord> {
 	let key = format!("{NAT_PREFIX}{peer_ip}");
