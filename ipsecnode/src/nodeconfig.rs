@@ -19,12 +19,17 @@
 //! real_ip = "172.16.53.6"
 //!
 //! [[backend.access_server.split]]
-//! ports   = [8080]
-//! dnat_to = "172.16.53.7"
+//! ports = [8080]
+//! pool  = "proxy"          # dynamic ECMP pool (fleetipsec:proxy:pool)
 //!
 //! [[backend.access_server.split]]
 //! ports   = [21, 22]
 //! dnat_to = "172.16.48.10"
+//!
+//! [[backend.access_server.split]]
+//! port_from = 20000        # passive-FTP data-port range -> the FTP VIP
+//! port_to   = 49999
+//! dnat_to   = "172.16.48.10"
 //!
 //! [backend.sd_server]
 //! real_ip = "172.16.53.8"
@@ -115,16 +120,35 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SplitRule {
 	/// TCP destination ports to match (tcp dport).
-	/// Mutually exclusive with src_ports.
+	/// Mutually exclusive with src_ports / port_from+port_to.
 	#[serde(default)]
 	pub ports: Vec<u16>,
 	/// TCP source ports to match (tcp sport).
 	/// For non-RFC FTP clients that send passive data from source port 20.
-	/// Mutually exclusive with ports.
+	/// Mutually exclusive with ports / port_from+port_to.
 	#[serde(default)]
 	pub src_ports: Vec<u16>,
-	/// IP address to DNAT matching traffic to.
-	pub dnat_to: String,
+	/// Inclusive lower bound of a contiguous TCP destination-port RANGE
+	/// (tcp dport <from>-<to>). Used for the passive-FTP data-port range
+	/// (20000-49999) which is far too wide to list element-by-element.
+	/// Set together with `port_to`; mutually exclusive with ports / src_ports.
+	#[serde(default)]
+	pub port_from: Option<u16>,
+	/// Inclusive upper bound of the destination-port range (see `port_from`).
+	#[serde(default)]
+	pub port_to: Option<u16>,
+	/// Fixed IP address to DNAT matching traffic to. Mutually exclusive with
+	/// `pool`. Exactly one of `dnat_to` / `pool` must be set.
+	#[serde(default)]
+	pub dnat_to: Option<String>,
+	/// Dynamic ECMP destination pool name (e.g. "proxy"). Matching traffic is
+	/// load-balanced across the pool members published by ipsecscale to
+	/// `fleetipsec:<pool>:pool`, via `dnat to jhash ip saddr mod N map {...}`.
+	/// The membership is applied at runtime by the proxy-pool consumer task,
+	/// so the destination set changes as proxies scale in/out. Mutually
+	/// exclusive with `dnat_to`.
+	#[serde(default)]
+	pub pool: Option<String>,
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────

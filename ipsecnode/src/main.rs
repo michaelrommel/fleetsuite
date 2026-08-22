@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
 	// Creates tap interfaces, enables NAT44, sets VPP default route.
 	// If VPP is not running, continues in degraded mode (no data plane).
 	info!("initialising VPP data plane ...");
+	// Dynamic ECMP pools (e.g. the fleetproxy pool) referenced by svcroute
+	// splits -- captured before cfg.backend is moved into vpp::init.
+	let proxy_pools = vpp::proxy_pool_bindings(&cfg.backend);
 	let vpp_state = match vpp::init(cfg.backend).await {
 		Ok(taps) => taps,
 		Err(e)   => {
@@ -110,6 +113,7 @@ async fn main() -> Result<()> {
 	} else {
 		warn!("VPP data plane unavailable -- 6d NAT/routing will be skipped");
 	}
+	let vpp_ready = vpp_state.is_some();
 
 	// -- Step 3: Connect to VICI (command connection) -----------------------
 	info!(socket = %args.vici_socket, "connecting to VICI (command connection) ...");
@@ -176,9 +180,29 @@ async fn main() -> Result<()> {
 	// Health + metrics HTTP endpoint.
 	let health_handle = tokio::spawn(health::serve(args.health_port));
 
+	// Proxy-pool consumer: keep the svcroute dynamic-pool DNAT chains in sync
+	// with the membership snapshot ipsecscale publishes to Valkey. Only useful
+	// when VPP init created the svcroute table and config declares a pool.
+	let proxy_handle = if vpp_ready && !proxy_pools.is_empty() {
+		info!(pools = proxy_pools.len(), "spawning proxy-pool consumer");
+		Some(tokio::spawn(vpp::proxy_pool_task(valkey_client.clone(), proxy_pools)))
+	} else {
+		if !proxy_pools.is_empty() {
+			warn!("proxy pools configured but VPP unavailable -- svcroute pool left unmanaged");
+		}
+		None
+	};
+
 	info!("all tasks spawned -- ipsecnode running");
 
 	// Wait for any task to exit (they run forever; exit indicates a fault).
+	let proxy_fut = async move {
+		match proxy_handle {
+			Some(h) => { let _ = h.await; }
+			None    => std::future::pending::<()>().await,
+		}
+	};
+	tokio::pin!(proxy_fut);
 	tokio::select! {
 		res = event_handle => {
 			error!("VICI event listener task exited: {:?}", res);
@@ -188,6 +212,9 @@ async fn main() -> Result<()> {
 		}
 		res = health_handle => {
 			error!("health server task exited: {:?}", res);
+		}
+		_ = &mut proxy_fut => {
+			error!("proxy-pool consumer task exited");
 		}
 	}
 

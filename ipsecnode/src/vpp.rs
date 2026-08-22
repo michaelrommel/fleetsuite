@@ -7,10 +7,17 @@
 //! `vrf if_id` so two customers with the same internal_ip coexist without
 //! conflict.  The shared vpp-outer tap handles the NAT outside interface.
 //!
-//! Forward path: xfrm-{hex} -> ipsecnode_bnat PREROUTING (customer_view_ip -> real_ip)
+//! Forward path (backend/VRF mode): xfrm-{hex} -> ipsecnode_bnat PREROUTING (customer_view_ip -> real_ip)
 //!   -> ip rule prio 100 -> fwd_table -> vpp-{hex}
 //!   -> VPP SNAT (internal_ip -> global_ip) in VRF if_id
 //!   -> vpp-outer -> ipsecnode_svcroute PREROUTING (port-based split) -> backend.
+//!
+//! Forward path (customer/bypass mode -- the whole fleet): xfrm-{hex} ->
+//!   ipsecnode_bnat PREROUTING: per-site split chain (access_server
+//!   customer_view + port -> proxy pool / FTP VIP), else customer_view->real_ip
+//!   map -> forwarded straight out ens5 (NO VPP, NO vpp-outer). The svcroute
+//!   table is NOT traversed in bypass mode -- the port splits live in the bnat
+//!   split chain instead (scoped to the access_server view; see AGENTS).
 //! Return path: vpp-outer -> VPP DNAT (global_ip -> internal_ip) -> vpp-{hex}
 //!   -> nftables mark=if_id -> ip rule prio 200 -> ret_table default dev xfrm-{hex}
 //!   -> conntrack reverse SNAT (real_ip -> customer_view_ip)
@@ -30,7 +37,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::nat::{BackendNatRecord, NAT_PREFIX, NatRecord};
 use crate::nodeconfig::{BackendConfig, SplitRule};
@@ -116,13 +123,23 @@ pub type VrfCache = HashMap<String, SiteVrfState>;
 /// Per-site backend DNAT state: one nftables map + one PREROUTING rule.
 /// An empty map_name means no backend NAT was configured for this site.
 pub struct SiteBnatState {
-	/// Per-site map name, e.g. "bnat_3eee6094".  Empty = nothing set up.
+	/// Per-site DNAT map name, e.g. "bnat_3eee6094" (customer_view -> real_ip).
+	/// Empty = nothing set up.
 	pub map_name:          String,
 	/// nftables PREROUTING rule handle; None if the rule was not added.
 	pub rule_handle:       Option<u64>,
-	/// nftables POSTROUTING backend->device SNAT rule handle (Increment 6g);
-	/// None if no access_server role was configured for this site.
-	pub snat_handle:       Option<u64>,
+	/// Per-site SNAT map name, e.g. "bsnat_3eee6094" (sd/em real_ip ->
+	/// customer_view) for the 6g backend->device source-matched SNAT. Empty = not
+	/// set up. The access_server is NOT in this map -- it is the default catch-all.
+	pub snat_map_name:     String,
+	/// nftables POSTROUTING SNAT rule handles (Increment 6g): the sd/em
+	/// source-matched rule and/or the access_server default rule.
+	pub snat_handles:      Vec<u64>,
+	/// Per-site port-split regular chain name (e.g. "split_3eee6094"), holding
+	/// the access_server-scoped port splits; None if no splits were installed.
+	pub split_chain:       Option<String>,
+	/// PREROUTING handle of the `iifname xfrm-{hex} jump split_{hex}` rule.
+	pub split_jump_handle: Option<u64>,
 	/// customer_view_ips installed as map keys (for logging on teardown).
 	pub customer_view_ips: Vec<String>,
 }
@@ -130,7 +147,9 @@ pub struct SiteBnatState {
 impl SiteBnatState {
 	fn empty() -> Self {
 		Self {
-			map_name: String::new(), rule_handle: None, snat_handle: None,
+			map_name: String::new(), rule_handle: None,
+			snat_map_name: String::new(), snat_handles: Vec::new(),
+			split_chain: None, split_jump_handle: None,
 			customer_view_ips: Vec::new(),
 		}
 	}
@@ -179,6 +198,8 @@ fn if_id_from_peer(peer_ip: &str) -> Option<u32> {
 
 fn xfrm_if_name(if_id: u32)  -> String { format!("xfrm-{if_id:08x}") }
 fn bnat_map_name(if_id: u32)  -> String { format!("bnat_{if_id:08x}")  }
+fn bnat_snat_map_name(if_id: u32) -> String { format!("bsnat_{if_id:08x}") }
+fn bnat_split_chain(if_id: u32) -> String { format!("split_{if_id:08x}") }
 fn inner_tap_name(if_id: u32) -> String { format!("vpp-{if_id:08x}")  }
 
 struct TapIps { vpp_ip: String, vpp_prefix: String, kern_ip: String, kern_prefix: String }
@@ -378,7 +399,7 @@ pub async fn init(backend: BackendConfig) -> Result<Option<VppState>> {
 	// XFRM output policy (if_id) fires on the correct tunnel.
 
 	init_nftables_mangle().await?;
-	init_nftables_bnat().await?;
+	init_nftables_bnat(&backend).await?;
 	// Clear any stale conntrack entries (e.g. zone-tagged bindings left by a prior
 	// deployment's ipsecnode_ctzone) so every flow is tracked in the single
 	// default zone. Safe here: init() runs at startup before ipsecnode loads any
@@ -386,9 +407,10 @@ pub async fn init(backend: BackendConfig) -> Result<Option<VppState>> {
 	if let Err(e) = conntrack_flush().await {
 		warn!("conntrack flush at init failed: {e:#} -- stale entries persist until they expire");
 	}
-	if let Err(e) = init_nftables_svcroute(&backend).await {
-		warn!("global service routing init failed: {e:#} -- traffic reaches real_ip directly");
-	}
+	// The port splits (proxy pool + FTP) are installed per-site in the bnat split
+	// chain (setup_site_bnat), scoped to the access_server view. The old global
+	// ipsecnode_svcroute table on vpp-outer is gone (bypass mode never traversed
+	// it); cleanup_stale_state() deletes any leftover copy on upgrade.
 
 	info!(outer_tap, outer_kernel = VPP_OUTER_KERNEL,
 		  "VPP NAT44 initialised (per-site VRF mode)");
@@ -428,7 +450,7 @@ async fn init_nftables_mangle() -> Result<()> {
 	Ok(())
 }
 
-async fn init_nftables_bnat() -> Result<()> {
+async fn init_nftables_bnat(backend: &BackendConfig) -> Result<()> {
 	// POSTROUTING chain registers conntrack nat hooks required for the automatic
 	// reverse SNAT (real_ip -> customer_view_ip) on return packets.
 	// Per-site maps and PREROUTING rules are added per-site on CHILD_SA UP.
@@ -440,6 +462,18 @@ async fn init_nftables_bnat() -> Result<()> {
 		   {{ type nat hook postrouting priority srcnat; policy accept; }}\n"
 	);
 	nft_batch(&rules).await.context("init nftables bnat table")?;
+
+	// Create the (initially empty) dynamic pool chains referenced by the
+	// access_server splits. proxy_pool_task fills them; the per-site split chains
+	// (added in setup_site_bnat, scoped to the access_view) jump to them.
+	for binding in proxy_pool_bindings(backend) {
+		let chain = pool_chain(&binding.name);
+		if let Err(e) = nft_batch(&format!("add chain ip {NFT_BNAT_TABLE} {chain}\n")).await {
+			warn!(pool = %binding.name, "bnat pool chain create failed: {e:#}");
+		} else {
+			info!(pool = %binding.name, %chain, "bnat dynamic pool chain created");
+		}
+	}
 	info!(table = NFT_BNAT_TABLE, "nftables per-site backend DNAT table created");
 	Ok(())
 }
@@ -454,53 +488,208 @@ async fn conntrack_flush() -> Result<()> {
 	Ok(())
 }
 
-async fn init_nftables_svcroute(backend: &BackendConfig) -> Result<()> {
-	// Global port-based service routing applied on vpp-outer after per-customer
-	// VPP SNAT.  POSTROUTING registers conntrack hooks for the reverse SNAT on
-	// return traffic from backend servers.
-	let header = format!(
-		"add table ip {NFT_SVCROUTE_TABLE}\n\
-		 add chain ip {NFT_SVCROUTE_TABLE} prerouting \
-		   {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
-		 add chain ip {NFT_SVCROUTE_TABLE} postrouting \
-		   {{ type nat hook postrouting priority srcnat; policy accept; }}\n"
-	);
-	nft_batch(&header).await.context("init svcroute table")?;
+// NOTE: the old `init_nftables_svcroute` (global port splits on vpp-outer) was
+// removed. The whole fleet is customer/bypass mode, which never traverses
+// vpp-outer, so those rules never fired; the port splits now live in the
+// per-site bnat split chain (access_server-scoped -- see setup_site_bnat and
+// AGENTS "PORT-SPLIT SCOPING CONTRACT"). cleanup_stale_state() still deletes any
+// leftover ipsecnode_svcroute table so an upgraded-in-place node self-heals.
+// TODO(backend-mode): if the VPP-VRF ('backend') path is ever used, it needs its
+// own port splits on vpp-outer scoped by real_ip (the post-SNAT dst), not the
+// old global-by-port rules.
 
-	let mut rule_count = 0u32;
+/// nft port match for a split: an explicit `tcp dport { .. }` / `tcp sport { .. }`
+/// list, or a contiguous `tcp dport <from>-<to>` range (passive-FTP data ports).
+fn port_match(split: &SplitRule) -> Result<String> {
+	if !split.ports.is_empty() {
+		let p: Vec<String> = split.ports.iter().map(|n| n.to_string()).collect();
+		Ok(format!("tcp dport {{ {} }}", p.join(", ")))
+	} else if !split.src_ports.is_empty() {
+		let p: Vec<String> = split.src_ports.iter().map(|n| n.to_string()).collect();
+		Ok(format!("tcp sport {{ {} }}", p.join(", ")))
+	} else if let (Some(f), Some(t)) = (split.port_from, split.port_to) {
+		if f > t {
+			anyhow::bail!("split rule port_from {f} > port_to {t}");
+		}
+		Ok(format!("tcp dport {f}-{t}"))
+	} else {
+		anyhow::bail!("split rule has no ports, src_ports, or port_from/port_to range");
+	}
+}
+
+// -- Dynamic ECMP pools (proxy) ------------------------------------------------
+
+/// nft regular chain that holds a dynamic pool's DNAT rule (in the bnat table).
+fn pool_chain(pool: &str) -> String { format!("pool_{pool}") }
+
+/// Valkey key carrying the membership snapshot for a dynamic pool
+/// (written by ipsecscale on the LVS master).
+fn pool_key(pool: &str) -> String { format!("fleetipsec:{pool}:pool") }
+
+/// Rebuild a dynamic pool's DNAT chain from the current member set. Atomic:
+/// one nft batch flushes then repopulates the chain. An empty set leaves the
+/// chain with no rule, so matching traffic falls through to the role's real_ip.
+/// New connections are ECMP-split by `jhash ip saddr` (source affinity); in-flight
+/// connections stay pinned by conntrack.
+pub async fn apply_proxy_pool(pool: &str, ips: &[String]) -> Result<()> {
+	let chain = pool_chain(pool);
+	let mut batch = format!("flush chain ip {NFT_BNAT_TABLE} {chain}\n");
+	if ips.is_empty() {
+		warn!(pool, %chain, "proxy pool EMPTY -- no DNAT (traffic falls back to real_ip)");
+	} else {
+		let n = ips.len();
+		let elems: Vec<String> = ips.iter().enumerate()
+			.map(|(i, ip)| format!("{i} : {ip}")).collect();
+		batch += &format!(
+			"add rule ip {NFT_BNAT_TABLE} {chain} \
+			 dnat to jhash ip saddr mod {n} map {{ {} }}\n",
+			elems.join(", "),
+		);
+	}
+	nft_batch(&batch).await
+		.with_context(|| format!("apply proxy pool {pool} ({} members)", ips.len()))?;
+	info!(pool, members = ips.len(), "proxy pool DNAT chain updated");
+	Ok(())
+}
+
+/// A dynamic pool declared in config: its name and its Valkey membership key.
+#[derive(Debug, Clone)]
+pub struct PoolBinding {
+	pub name: String,
+	pub key:  String,
+}
+
+/// Distinct dynamic pools referenced by any split in the backend config.
+pub fn proxy_pool_bindings(backend: &BackendConfig) -> Vec<PoolBinding> {
+	let mut seen = std::collections::BTreeSet::new();
+	let mut out  = Vec::new();
 	for role in ["access_server", "sd_server", "em_server"] {
 		if let Some(server) = backend.server_for(role) {
 			for split in &server.split {
-				match add_svcroute_rule(split).await {
-					Ok(())  => rule_count += 1,
-					Err(e)  => warn!(role, "svcroute rule add failed: {e:#}"),
+				if let Some(pool) = &split.pool {
+					if seen.insert(pool.clone()) {
+						out.push(PoolBinding { name: pool.clone(), key: pool_key(pool) });
+					}
 				}
 			}
 		}
 	}
-	info!(table = NFT_SVCROUTE_TABLE, rules = rule_count,
-		  "global service routing table initialised");
-	Ok(())
+	out
 }
 
-async fn add_svcroute_rule(split: &SplitRule) -> Result<()> {
-	let port_match = if !split.ports.is_empty() {
-		let p: Vec<String> = split.ports.iter().map(|n| n.to_string()).collect();
-		format!("tcp dport {{ {} }}", p.join(", "))
-	} else if !split.src_ports.is_empty() {
-		let p: Vec<String> = split.src_ports.iter().map(|n| n.to_string()).collect();
-		format!("tcp sport {{ {} }}", p.join(", "))
-	} else {
-		anyhow::bail!("split rule for {} has no ports or src_ports", split.dnat_to);
+/// Membership snapshot written by ipsecscale to `fleetipsec:<pool>:pool`.
+#[derive(serde::Deserialize)]
+struct ProxyPoolSnapshot {
+	#[serde(default)]
+	gen: i64,
+	#[serde(default)]
+	ips: Vec<String>,
+}
+
+/// Consume proxy-pool membership snapshots from Valkey and keep the local
+/// svcroute DNAT chains in sync. Reacts to keyspace SET/DEL events and
+/// reconciles periodically as a backstop for missed events. Runs forever.
+pub async fn proxy_pool_task(valkey_client: redis::Client, pools: Vec<PoolBinding>) {
+	const RECONCILE_SECS: u64 = 30;
+	let mut conn = match redis::aio::ConnectionManager::new(valkey_client.clone()).await {
+		Ok(c)  => c,
+		Err(e) => { error!("proxy_pool_task: Valkey connect failed: {e} -- exiting"); return; }
 	};
-	let rule = format!(
-		"add rule ip {NFT_SVCROUTE_TABLE} prerouting \
-		 iifname \"{VPP_OUTER_KERNEL}\" {port_match} dnat to {}\n",
-		split.dnat_to,
-	);
-	nft_batch(&rule)
-		.await
-		.with_context(|| format!("add svcroute rule: {port_match} -> {}", split.dnat_to))
+	let mut last: HashMap<String, Vec<String>> = HashMap::new();
+	for p in &pools { reconcile_pool(&mut conn, p, &mut last).await; }
+
+	loop {
+		let pubsub = match valkey_client.get_async_pubsub().await {
+			Ok(ps) => ps,
+			Err(e) => {
+				error!("proxy_pool_task: pubsub open failed: {e} -- retry in 5 s");
+				tokio::time::sleep(Duration::from_secs(5)).await;
+				continue;
+			}
+		};
+		match run_pool_pubsub(&mut conn, pubsub, &pools, &mut last, RECONCILE_SECS).await {
+			Ok(())  => warn!("proxy_pool_task: pubsub stream ended -- reconnect in 5 s"),
+			Err(e)  => error!("proxy_pool_task: pubsub loop error: {e:#} -- reconnect in 5 s"),
+		}
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	}
+}
+
+async fn run_pool_pubsub(
+	conn:    &mut redis::aio::ConnectionManager,
+	mut pubsub: redis::aio::PubSub,
+	pools:   &[PoolBinding],
+	last:    &mut HashMap<String, Vec<String>>,
+	reconcile_secs: u64,
+) -> Result<()> {
+	use futures_util::StreamExt;
+	pubsub.psubscribe("__keyevent@0__:set").await.context("psubscribe set")?;
+	pubsub.psubscribe("__keyevent@0__:del").await.context("psubscribe del")?;
+	info!("proxy pool pubsub active");
+	let mut ticker = tokio::time::interval(Duration::from_secs(reconcile_secs));
+	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut stream = pubsub.on_message();
+	loop {
+		tokio::select! {
+			msg = stream.next() => {
+				let Some(msg) = msg else { return Ok(()); };
+				let key: String = msg.get_payload().unwrap_or_default();
+				if let Some(p) = pools.iter().find(|p| p.key == key) {
+					reconcile_pool(conn, p, last).await;
+				}
+			}
+			_ = ticker.tick() => {
+				for p in pools { reconcile_pool(conn, p, last).await; }
+			}
+		}
+	}
+}
+
+/// GET the pool snapshot, parse+sort it, and (only if changed) apply it.
+async fn reconcile_pool(
+	conn: &mut redis::aio::ConnectionManager,
+	p:    &PoolBinding,
+	last: &mut HashMap<String, Vec<String>>,
+) {
+	let raw: redis::RedisResult<Option<String>> = conn.get(&p.key).await;
+	let ips = match raw {
+		Ok(Some(json)) => match serde_json::from_str::<ProxyPoolSnapshot>(&json) {
+			Ok(s) => {
+				let mut v: Vec<String> = s.ips.into_iter()
+					.filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+					.collect();
+				v.sort_by_key(|ip| ip.parse::<std::net::Ipv4Addr>().map(u32::from).unwrap_or(0));
+				v.dedup();
+				debug!(pool = %p.name, gen = s.gen, members = v.len(), "proxy pool snapshot");
+				v
+			}
+			Err(e) => { warn!(pool = %p.name, "cannot parse proxy pool snapshot: {e}"); return; }
+		},
+		Ok(None) => { debug!(pool = %p.name, "no proxy pool snapshot -- treating as empty"); Vec::new() }
+		Err(e)   => { warn!(pool = %p.name, "Valkey GET {} failed: {e}", p.key); return; }
+	};
+	if last.get(&p.name) == Some(&ips) {
+		return; // no change since last apply
+	}
+	// Detect members that LEFT the pool: their device->proxy conntrack entries
+	// (pinned by the pool_proxy jhash DNAT) still point at the departed proxy and
+	// would black-hole in-flight flows. Flush conntrack on removal so those flows
+	// re-hash to a survivor. NOT on scale-out (pinning keeps device sessions on
+	// their proxy). See AGENTS Open TODO for the surgical (conntrack -D) variant.
+	let had_removal = last.get(&p.name)
+		.map(|prev| prev.iter().any(|ip| !ips.contains(ip)))
+		.unwrap_or(false);
+	if let Err(e) = apply_proxy_pool(&p.name, &ips).await {
+		warn!(pool = %p.name, "apply proxy pool failed: {e:#}");
+		return;
+	}
+	if had_removal {
+		match conntrack_flush().await {
+			Ok(())  => info!(pool = %p.name, "flushed conntrack after proxy removal (stale DNAT bindings)"),
+			Err(e)  => warn!(pool = %p.name, "conntrack flush after proxy removal failed: {e:#}"),
+		}
+	}
+	last.insert(p.name.clone(), ips);
 }
 
 // -- Per-CHILD_SA event handlers ----------------------------------------------
@@ -913,6 +1102,17 @@ async fn setup_site_bnat(
 	// ct state new: only new connections; conntrack handles ESTABLISHED replies
 	// automatically (also required for the 6g backend->device SNAT to work).
 	let xfrm_if = xfrm_if_name(if_id);
+
+	// Per-site port splits, SCOPED to the access_server customer_view (sd/em
+	// traffic is NEVER split -- see AGENTS "PORT-SPLIT SCOPING CONTRACT"). Built
+	// as a regular chain jumped from PREROUTING BEFORE the default
+	// customer_view->real_ip map rule; nf_nat once-only makes the specific split
+	// win. Pool splits jump the shared dynamic pool_proxy chain; fixed splits
+	// (FTP VIP) dnat inline. In bypass mode this is the ONLY place the splits
+	// fire (there is no vpp-outer / svcroute hop).
+	let (split_chain, split_jump_handle) =
+		add_bnat_splits(peer_ip, if_id, &xfrm_if, backend_nat, backend).await;
+
 	let map_ref = format!("@{map_name}");
 	let rule_out = nft_capture(&[
 		"--echo", "--handle",
@@ -930,54 +1130,218 @@ async fn setup_site_bnat(
 		Err(e) => { warn!(peer_ip, "bnat PREROUTING rule add failed: {e:#}"); None }
 	};
 
-	// 6g: backend->device SNAT.  A backend server initiating a NEW connection
-	// to a device produces a packet egressing xfrm-{hex} (after VPP DNAT
-	// global_ip->internal_ip and the per-site return routing).  SNAT its source
-	// to the customer's access_server customer_view_ip so the customer firewall
-	// accepts the connection.  Discriminator: `oifname xfrm-{hex} ct state new`.
-	//   - Device-originated forward NEW connections egress vpp-{hex}, not
-	//     xfrm-{hex}, so oifname excludes them.
-	//   - Device-originated replies to a backend-initiated flow are ct-established
-	//     and reversed by conntrack, so `ct state new` excludes them.
-	let snat_handle = match backend_nat.and_then(|r| r.access_server.as_deref()) {
-		Some(access_view) => {
-			let snat_out = nft_capture(&[
-				"--echo", "--handle",
-				"add", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
-				"oifname", &xfrm_if,
-				"ct", "state", "new",
-				"snat", "ip", "to", access_view,
-			]).await;
-			match snat_out {
-				Ok(out) => match parse_nft_handle(&out) {
-					Ok(h)  => { info!(peer_ip, handle = h, %access_view,
-						"6g backend->device SNAT rule added"); Some(h) }
-					Err(e) => { warn!(peer_ip, "parse 6g SNAT handle: {e:#}"); None }
-				},
-				Err(e) => { warn!(peer_ip, "6g SNAT rule add failed: {e:#}"); None }
+	// 6g: backend->device SNAT.  A backend server initiating a NEW connection to a
+	// device egresses xfrm-{hex}; SNAT its source to that server's customer_view so
+	// the customer firewall accepts it.
+	//   - sd_server / em_server are SINGLE FIXED IPs (ipsecnode.toml real_ip), so
+	//     they are source-matched via a map (real_ip -> customer_view).
+	//   - access_server is the DEFAULT catch-all (no source scoping): its backend
+	//     may present multiple/dynamic source IPs (proxy pool, scaled tasks), so any
+	//     backend->device source that is NOT sd/em is SNAT'd to the access_view.
+	// Rule order: sd/em map rule FIRST, access default AFTER -- nf_nat once-only
+	// makes the specific sd/em match win; everything else falls to the default.
+	// Discriminator `oifname xfrm-{hex} ct state new`: device forward-NEW flows
+	// egress vpp-{hex}/ens5 (not xfrm), and device replies are ct-established.
+	let (snat_map_name, snat_handles) =
+		add_bnat_snat(peer_ip, if_id, &xfrm_if, backend_nat, backend).await;
+
+	SiteBnatState {
+		map_name, rule_handle, snat_map_name, snat_handles,
+		split_chain, split_jump_handle,
+		customer_view_ips: installed,
+	}
+}
+
+/// Build the per-site 6g backend->device SNAT rules. Two rules:
+///
+/// - an `ip saddr` map (sd/em fixed real_ip -> customer_view), matched first;
+/// - a default `snat to <access_view>` catch-all for every other source.
+///
+/// Returns (map_name, rule_handles). map_name empty if no sd/em roles.
+async fn add_bnat_snat(
+	peer_ip:     &str,
+	if_id:       u32,
+	xfrm_if:     &str,
+	backend_nat: Option<&BackendNatRecord>,
+	backend:     &BackendConfig,
+) -> (String, Vec<u64>) {
+	let mut handles: Vec<u64> = Vec::new();
+
+	// -- sd/em source-matched map (fixed IPs) ---------------------------------
+	// (real_ip, customer_view) for every present role EXCEPT access_server.
+	let mut sdem: Vec<(String, String)> = Vec::new();
+	if let Some(rec) = backend_nat {
+		for (role, view) in rec.present_roles() {
+			if role == "access_server" { continue; }
+			if let Some(real) = backend.real_ip_for(role) {
+				sdem.push((real.to_string(), view.to_string()));
 			}
 		}
-		None => None,
-	};
+	}
+	let mut snat_map = String::new();
+	if !sdem.is_empty() {
+		let map = bnat_snat_map_name(if_id);
+		if let Err(e) = nft(&[
+			"add", "map", "ip", NFT_BNAT_TABLE, &map, "{ type ipv4_addr : ipv4_addr; }",
+		]).await {
+			warn!(peer_ip, "bnat SNAT map create failed: {e:#}");
+		} else {
+			for (real_ip, view_ip) in &sdem {
+				let elem = format!("{{ {real_ip} : {view_ip} }}");
+				if let Err(e) = nft(&["add", "element", "ip", NFT_BNAT_TABLE, &map, &elem]).await {
+					warn!(peer_ip, %real_ip, %view_ip, "bnat SNAT element add failed: {e:#}");
+				} else {
+					info!(peer_ip, %real_ip, %view_ip, "6g sd/em SNAT mapping installed");
+				}
+			}
+			let map_ref = format!("@{map}");
+			match nft_capture(&[
+				"--echo", "--handle",
+				"add", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
+				"oifname", xfrm_if, "ct", "state", "new",
+				"snat", "ip", "to", "ip", "saddr", "map", &map_ref,
+			]).await {
+				Ok(o) => match parse_nft_handle(&o) {
+					Ok(h)  => { info!(peer_ip, handle = h, roles = sdem.len(),
+						"6g sd/em source-matched SNAT rule added"); handles.push(h); snat_map = map; }
+					Err(e) => { warn!(peer_ip, "parse sd/em SNAT handle: {e:#}");
+						nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &map]).await; }
+				},
+				Err(e) => { warn!(peer_ip, "sd/em SNAT rule add failed: {e:#}");
+					nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &map]).await; }
+			}
+		}
+	}
 
-	SiteBnatState { map_name, rule_handle, snat_handle, customer_view_ips: installed }
+	// -- access_server default catch-all (no source scoping) ------------------
+	if let Some(access_view) = backend_nat.and_then(|r| r.access_server.as_deref()) {
+		match nft_capture(&[
+			"--echo", "--handle",
+			"add", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
+			"oifname", xfrm_if, "ct", "state", "new",
+			"snat", "ip", "to", access_view,
+		]).await {
+			Ok(o) => match parse_nft_handle(&o) {
+				Ok(h)  => { info!(peer_ip, handle = h, %access_view,
+					"6g access_server default SNAT rule added"); handles.push(h); }
+				Err(e) => warn!(peer_ip, "parse access SNAT handle: {e:#}"),
+			},
+			Err(e) => warn!(peer_ip, "access default SNAT rule add failed: {e:#}"),
+		}
+	}
+
+	(snat_map, handles)
+}
+
+/// Build the per-site access_server-scoped port-split chain and its PREROUTING
+/// jump. Returns (chain_name, jump_handle); both None if there is nothing to
+/// split (no access_server role, or the role has no splits configured).
+///
+/// The split chain is jumped unconditionally for the site's xfrm interface;
+/// each rule inside is scoped to `ip daddr <access_view>` + a port match, so
+/// only the access_server's traffic on the split ports is diverted -- sd/em
+/// customer_view traffic and all other ports fall through to the default
+/// customer_view->real_ip map (added by the caller AFTER this jump).
+async fn add_bnat_splits(
+	peer_ip:     &str,
+	if_id:       u32,
+	xfrm_if:     &str,
+	backend_nat: Option<&BackendNatRecord>,
+	backend:     &BackendConfig,
+) -> (Option<String>, Option<u64>) {
+	let Some(access_view) = backend_nat.and_then(|r| r.access_server.as_deref()) else {
+		return (None, None);
+	};
+	let Some(srv) = backend.access_server.as_ref() else { return (None, None); };
+	if srv.split.is_empty() {
+		return (None, None);
+	}
+
+	let chain = bnat_split_chain(if_id);
+	let mut batch = format!("add chain ip {NFT_BNAT_TABLE} {chain}\n");
+	let mut rule_count = 0u32;
+	for split in &srv.split {
+		let pm = match port_match(split) {
+			Ok(p)  => p,
+			Err(e) => { warn!(peer_ip, "bnat split skipped: {e:#}"); continue; }
+		};
+		let target = if let Some(pool) = &split.pool {
+			format!("jump {}", pool_chain(pool))
+		} else if let Some(dnat_to) = &split.dnat_to {
+			format!("dnat to {dnat_to}")
+		} else {
+			warn!(peer_ip, "bnat split has neither pool nor dnat_to -- skipping");
+			continue;
+		};
+		batch += &format!(
+			"add rule ip {NFT_BNAT_TABLE} {chain} ip daddr {access_view} {pm} {target}\n"
+		);
+		rule_count += 1;
+	}
+	if rule_count == 0 {
+		return (None, None);
+	}
+	if let Err(e) = nft_batch(&batch).await {
+		warn!(peer_ip, "bnat split chain create failed: {e:#}");
+		return (None, None);
+	}
+
+	// Jump to the split chain from PREROUTING (before the default map rule the
+	// caller adds next). Simple rule -> nft_capture argv is fine (no braces).
+	let jump = nft_capture(&[
+		"--echo", "--handle",
+		"add", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
+		"iifname", xfrm_if, "jump", &chain,
+	]).await;
+	match jump {
+		Ok(out) => match parse_nft_handle(&out) {
+			Ok(h)  => {
+				info!(peer_ip, %chain, handle = h, rules = rule_count, %access_view,
+				      "bnat access_server port-split chain installed");
+				(Some(chain), Some(h))
+			}
+			Err(e) => {
+				warn!(peer_ip, "parse bnat split jump handle: {e:#}");
+				nft_warn(&["delete", "chain", "ip", NFT_BNAT_TABLE, &chain]).await;
+				(None, None)
+			}
+		},
+		Err(e) => {
+			warn!(peer_ip, "bnat split jump rule add failed: {e:#}");
+			nft_warn(&["delete", "chain", "ip", NFT_BNAT_TABLE, &chain]).await;
+			(None, None)
+		}
+	}
 }
 
 async fn teardown_site_bnat(peer_ip: &str, bnat: &SiteBnatState) {
 	if bnat.map_name.is_empty() { return; }
 
 	// Delete rules first (releases the map reference), then the map itself.
-	if let Some(h) = bnat.snat_handle {
+	for h in &bnat.snat_handles {
 		let h_str = h.to_string();
 		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "postrouting",
 				   "handle", &h_str]).await;
-		info!(peer_ip, handle = h, "6g backend->device SNAT rule removed");
+		info!(peer_ip, handle = *h, "6g backend->device SNAT rule removed");
+	}
+	if !bnat.snat_map_name.is_empty() {
+		nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &bnat.snat_map_name]).await;
 	}
 	if let Some(h) = bnat.rule_handle {
 		let h_str = h.to_string();
 		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
 				   "handle", &h_str]).await;
 		info!(peer_ip, handle = h, "bnat PREROUTING rule removed");
+	}
+	// Remove the port-split jump (frees the split chain reference) then the chain.
+	if let Some(h) = bnat.split_jump_handle {
+		let h_str = h.to_string();
+		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
+				   "handle", &h_str]).await;
+	}
+	if let Some(chain) = &bnat.split_chain {
+		nft_warn(&["delete", "chain", "ip", NFT_BNAT_TABLE, chain]).await;
+		info!(peer_ip, %chain, "bnat port-split chain removed");
 	}
 	nft_warn(&["delete", "map", "ip", NFT_BNAT_TABLE, &bnat.map_name]).await;
 	info!(peer_ip, map = %bnat.map_name,
