@@ -145,6 +145,12 @@ start_pre() {
 	ip addr add "$ETH1_IP/$ETH1_PREFIX" dev eth1
 	einfo "eth1 up: $ETH1_IP/$ETH1_PREFIX"
 
+	# eth1-specific sysctls must be set HERE, not in /etc/sysctl.d: eth1 does not
+	# exist at boot (attached above by aeroplug), so a per-interface key in the
+	# boot-time sysctl file fails with "No such file or directory" and errors the
+	# sysctl service. Apply them now that /proc/sys/net/ipv4/conf/eth1 exists.
+	sysctl -qw net.ipv4.conf.eth1.log_martians=1 || true
+
 	# Compute eth1 gateway (VPC router = subnet base address + 1).
 	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
 	ETH1_NET="${ETH1_CIDR%/*}"

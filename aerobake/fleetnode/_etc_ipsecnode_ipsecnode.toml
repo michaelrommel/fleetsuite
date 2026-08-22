@@ -23,21 +23,27 @@
 # -- Remote-access / connection-management server -----------------------------
 #
 # Receives all traffic not explicitly split below.
-# Port 8080 (HTTP proxy) is redirected to a dedicated proxy server.
-# Ports 21 and 22 (FTP control + SFTP) are redirected to the aeroftp VIP;
-# passive FTP data connections are tracked automatically by nf_conntrack_ftp.
-# Active FTP data (backend port 20 -> device) travels the backend->device
-# path and is not handled here (Increment 6g scope).
+# Port 8080 (HTTP proxy) is ECMP-load-balanced across the dynamic fleetproxy
+# pool (members published by ipsecscale to Valkey key fleetipsec:proxy:pool;
+# applied locally by ipsecnode's proxy-pool consumer as proxies scale in/out).
+# Ports 21 and 22 (FTP control + SFTP) plus the passive-FTP data-port range
+# 20000-49999 are redirected to the aeroftp VIP (fixed). Passive data ports
+# come from aeroftp's net.ipv4.ip_local_reserved_ports = 20000-49999.
 [backend.access_server]
 real_ip = "172.16.53.6"
 
 [[backend.access_server.split]]
-ports   = [8080]
-dnat_to = "172.16.53.7"     # HTTP proxy server
+ports = [8080]
+pool  = "proxy"             # dynamic ECMP pool (fleetipsec:proxy:pool)
 
 [[backend.access_server.split]]
 ports   = [21, 22]
 dnat_to = "172.16.48.10"    # aeroftp LVS VIP (active AZ)
+
+[[backend.access_server.split]]
+port_from = 20000           # passive-FTP data-port range -> the aeroftp VIP
+port_to   = 49999
+dnat_to   = "172.16.48.10"
 
 # Uncomment if non-RFC-conformant FTP clients use source port 20 for passive
 # data connections (see Open TODOs in AGENTS.md):

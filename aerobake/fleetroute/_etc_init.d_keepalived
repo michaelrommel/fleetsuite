@@ -108,6 +108,12 @@ start_pre() {
 	ip addr add "$ETH1_IP/$ETH1_PREFIX" dev eth1
 	einfo "eth1 up: $ETH1_IP/$ETH1_PREFIX"
 
+	# eth1-specific sysctls must be set HERE, not in /etc/sysctl.d: eth1 does not
+	# exist at boot (attached above by aeroplug), so a per-interface key in the
+	# boot-time sysctl file fails with "No such file or directory" and errors the
+	# sysctl service. Apply now that /proc/sys/net/ipv4/conf/eth1 exists.
+	sysctl -qw net.ipv4.conf.eth1.log_martians=1 || true
+
 	# Compute eth1 gateway (VPC router = subnet base address + 1).
 	local ETH1_NET ETH1_LAST ETH1_BASE ETH1_GW
 	ETH1_NET="${ETH1_CIDR%/*}"
@@ -257,6 +263,17 @@ start_pre() {
 	ip route add "${REMOTE_VPN}" dev ipip-gw
 	einfo "IPIP tunnel: ${BGP_IP} -> ${PEER_BGP_IP}  remote VPN ${REMOTE_VPN} via ipip-gw"
 
+	# -- 8b. Transit routing separation (Increment 6g phase 2) ----------------
+	# FRR installs ALL customer BGP routes (/32 host routes + the near-0/0
+	# covering aggregates) into kernel table 100 (zebra `ip protocol bgp
+	# route-map SET-TRANSIT` -> `set table 100`).  Forwarded backend->device
+	# traffic ingresses eth0 (rtb-backend default -> this node's eth0 ENI); send
+	# it through table 100.  Locally-generated traffic (iif=lo) never matches
+	# this rule, so the Return GW's own egress keeps using main (default via the
+	# VPC gw -> NAT GW) and is not hijacked by the broad aggregates.
+	ip rule add iif eth0 lookup 100 prio 90
+	einfo "Policy routing 100: iif eth0 (backend transit) lookup table 100"
+
 	# -- 9. Give CT entry and peer time to stabilise --------------------------
 	sleep 5
 
@@ -313,6 +330,10 @@ stop_post() {
 		ip addr del dev eth3    2>/dev/null || true
 	fi
 	ip link set eth3 down 2>/dev/null || true
+
+	# Remove the backend-transit policy rule (Increment 6g phase 2).
+	ip rule del iif eth0 lookup 100 prio 90 2>/dev/null || true
+	ip route flush table 100                2>/dev/null || true
 
 	if [ -n "$TOKEN" ] && [ -n "$ROLE" ]; then
 		ebegin "Detaching VPN-subnet ENI (ipsec-gw-vpn=$ROLE)"
