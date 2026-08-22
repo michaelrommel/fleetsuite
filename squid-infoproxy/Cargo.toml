@@ -1,0 +1,21 @@
+[package]
+name        = "squid-infoproxy"
+version     = "0.1.0"
+edition     = "2021"
+description = "Squid external_acl_type helper for Info Proxy destination authorization (Valkey-backed)"
+
+[[bin]]
+name = "squid-infoproxy"
+path = "src/main.rs"
+
+[dependencies]
+# ── TLS client (rediss://) ───────────────────────────────────────────────────
+# ring-only, consistent with the rest of the workspace (no aws_lc_rs). We drive
+# a blocking rustls session ourselves (StreamOwned) -- no async runtime needed
+# for a line-at-a-time Squid helper.
+rustls           = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots     = "0.26"
+
+# ── CIDR / IP range matching ─────────────────────────────────────────────────
+ipnet = "2"

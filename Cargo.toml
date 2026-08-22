@@ -5,10 +5,12 @@ resolver = "2"
 # They must NOT be listed as workspace members here because vendor/aerosuite
 # has its own [workspace] root; nested workspaces are not supported by Cargo.
 members = [
+    "ipseccore",
     "ipsecpulse",
     "ipsecscale",
     "ipsecnode",
     "fleetpulse",
+    "squid-infoproxy",
 ]
 
 # ── Pinned shared dependency versions ─────────────────────────────────────────
