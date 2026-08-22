@@ -8,7 +8,127 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-18):** Identity-NAT breakage ROOT-CAUSED and
+**Last completed session (2026-08-22):** Port-split scoping fix (bypass-mode
+device->backend) -- IN PROGRESS.
+
+THE GAP FOUND: the global service split (`ipsecnode_svcroute`, 8080->proxy pool,
+21/22 + 20000-49999 -> aeroftp VIP) lives on `iifname "vpp-outer"`. But the
+ENTIRE fleet is customer/bypass mode (`is_customer_mode()` true), and
+`setup_site_bypass` forwards decapsulated device traffic straight `xfrm-{hex} ->
+ens5` with NO vpp-outer hop. So `ipsecnode_svcroute` NEVER fires for the fleet:
+device->proxy (8080) traffic hits the per-site `bnat` `customer_view->real_ip`
+DNAT (172.16.53.6, the toml access_server real_ip) as its FINAL destination --
+the dynamic proxy pool is bypassed entirely. `pool_proxy`/`ipsecnode_svcroute`
+are effectively dead code while the fleet is customer-mode (they only serve the
+dormant `backend` mode, of which there are currently zero sites).
+
+THE FIX (per-site, access-view-scoped, single shared pool chain): move the
+splits onto the bypass path -- `ipsecnode_bnat` prerouting on `xfrm-{hex}` --
+and SCOPE them to the site's access_server customer_view:
+```
+table ip ipsecnode_bnat {
+    chain pool_proxy { dnat to jhash ip saddr mod N map {...} }   # ONE shared chain
+    chain prerouting {
+        iifname "xfrm-{hex}" ip daddr <access_view> tcp dport 8080        jump pool_proxy
+        iifname "xfrm-{hex}" ip daddr <access_view> tcp dport { 21, 22 }  dnat to <FTP_VIP>
+        iifname "xfrm-{hex}" ip daddr <access_view> tcp dport 20000-49999 dnat to <FTP_VIP>
+        iifname "xfrm-{hex}" ct state new dnat to ip daddr map @bnat_{hex}   # all roles -> real_ip
+    }
+}
+```
+nf_nat once-only makes the specific split win over the later default map;
+`proxy_pool_task` updates just the one `pool_proxy` chain (now in bnat, not
+svcroute). On proxy REMOVAL it also runs `conntrack -F` on the concentrator
+(mirrors the LVS fix -- device->proxy conntrack pins to a member; a departed
+member black-holes in-flight flows).
+
+>>> PORT-SPLIT SCOPING CONTRACT (discuss with sd_/em_server owners) <<<
+The port-based splits apply ONLY to the **access_server** customer_view. Ports
+**8080** (HTTP proxy) and **21/22 + 20000-49999** (FTP control + passive data
+range) are CLAIMED on the access_server's address and cannot carry any other
+service there. sd_server and em_server customer_view traffic is NOT split -- it
+passes through untouched (`customer_view -> real_ip` only), so those owners keep
+the full port range. The wide 20000-49999 passive-FTP range in particular is
+NOT imposed on sd/em (that was the reason to scope per-site rather than a global
+`xfrm-*` wildcard). If the proxy/FTP split is ever wanted for sd/em too, it must
+be added explicitly and scoped to THEIR customer_view.
+
+BACKEND-MODE NOTE: `ipsecnode_svcroute` (the old global port splits on
+vpp-outer) has been REMOVED -- bypass mode never traversed it, and its
+global-by-port rules had the same sd/em scoping problem. `cleanup_stale_state()`
+deletes any leftover copy on upgrade. If the `backend` VRF mode is ever used, it
+needs its OWN port splits on vpp-outer scoped by real_ip (the post-VPP-SNAT dst),
+not the removed global rules -- a fresh implementation, tracked as a TODO in
+vpp.rs.
+
+----- earlier (2026-08-21) -----
+**Prior session:** Proxy ECMP + ipsecscale reconciler +
+passive-FTP range -- CODE DONE, committed, NOT in any AMI.
+
+WHAT WAS BUILT:
+- fleetproxy dual-homed Squid AMI brought up (curl/IMDS, nftables, tiny-cloud
+  reset, KeyName, root profile). squid-infoproxy helper reworked: `--proxy-type
+  both` (one lookup authorizes both namespaces + returns a Squid `tag=` for
+  intranet-vs-internet routing), SCOPE-TIERED Valkey keys
+  (`infoproxy:<pt>:global` / `:model:<partno>` / `:device:<ip>`; helper resolves
+  the device model via `HGET systems:by-ip:<ip> partno`), and glob wildcard
+  matching (`*.apple.com`, `*suffix`). Portal spooler (fleetshell infoproxy.ts +
+  scripts/spool-infoproxy.mjs) rewritten to emit the tiers. First spool run
+  UNLINKs the legacy flat per-IP keys.
+- **Proxy ECMP membership** (the scaler concept): ipsecscale (LVS master only)
+  now reconciles the proxy pool -- DescribeInstances on `fleetshell-proxy-asg`
+  (running), keeps the eth0 backend-subnet IP (CIDR filter excludes eth1), TCP
+  health-probes :8080, and SETs `fleetipsec:proxy:pool` = `{gen,ips[]}` on
+  change. The scaler NEVER touches VPN-node nft directly -- Valkey is the bus.
+  Each ipsecnode runs a `proxy_pool_task` (vpp.rs): subscribes to the key +
+  periodic 30s reconcile, and rebuilds a jhash-ip-saddr ECMP `dnat` in the
+  `pool_proxy` regular chain of `ipsecnode_svcroute` (conntrack pins in-flight;
+  jhash gives source affinity for warm helper caches). Config: `SplitRule.pool`
+  binds a port to a dynamic pool (8080 -> "proxy"); ipsecnode.toml updated.
+- **VPN-NAT watcher** (ipsecscale, runs on BOTH roles): watches the VPN
+  concentrator ASG membership and, when it changes (e.g. you CYCLE a
+  concentrator), re-renders + hot-reloads THIS LVS node's `ip nat` jhash table
+  (/etc/nftables.d/ipsec-nat.nft) so new customers hash across the current node
+  set. Reads the VIP secondary IP + VPN ASG name from /run/ipsecpulse.state,
+  DescribeInstances the VPN ASG, and reloads atomically (`add table`+`flush
+  table`+reload in one `nft -f`). Unlike the proxy pool, this rule lives ON the
+  LVS node, so ipsecscale renders+reloads it locally (no Valkey) -- and it runs
+  on the BACKUP too (aeroftp pattern) so its local table is always ready for an
+  instant VRRP takeover (keys on the node's OWN secondary IP). When a node
+  LEAVES the pool it also runs `conntrack -F` (scale-in only -- NOT on scale-out,
+  where conntrack pinning must keep tunnels on their node): the LVS DNAT is
+  conntrack-backed, so a per-flow binding (e.g. a customer's UDP-4500 NAT-T flow)
+  otherwise keeps pointing at a departed node and silently vanishes even after
+  the jhash map is corrected (this bit a 2->4->2 cycle: msg1-4 on 500 hit a live
+  node, msg5 on 4500 hit a killed one). The proxy pool
+  stays MASTER-ONLY (shared Valkey key = single writer). The renderer
+  is the NEW shared workspace crate **`ipseccore`** (mirrors aerocore naming) --
+  `ipseccore::render_ipsec_nat` + `JHASH_SEED` -- used by BOTH ipsecpulse (boot)
+  and ipsecscale (runtime) so the jhash seed/format can never drift (that split
+  cost a whole debug session -- Architecture Decision #1). ipsecpulse's
+  render_nft_nat is now a thin wrapper over it. The scale-out/in DECISION
+  (SetDesiredCapacity on tunnel counts) is still NOT implemented -- membership
+  reconcile only.
+- **Passive-FTP range**: `SplitRule.port_from/port_to` added; ipsecnode.toml
+  routes dport 20000-49999 -> aeroftp VIP (`tcp dport 20000-49999`, a RANGE not
+  30k elements). Still OPEN: the fleetshell-gateway must reserve 20000-49999 as
+  ephemeral SOURCE ports (see Open TODOs + fleetshell/AGENTS.md §7 Gateway).
+
+DEPLOY PREREQUISITES / NOT DONE:
+- Rebuild musl + fleetnode AMI (ipsecnode) AND fleetscale AMI (ipsecscale is no
+  longer a stub -- the pkr must bake the new binary) + fleetproxy AMI.
+- **LVS node SG must be allowed inbound 6379 on the MemoryDB cluster** so
+  ipsecscale can write the pool key (run `infrastructure/make_lvs_valkey_access.sh`;
+  mirrors the proxy STEP 3 rule for the LVS SG sg-0406887cfe67d8f15).
+- Run the infoproxy spooler once (portal Save-to-Valkey or spool-infoproxy.mjs)
+  before any `--proxy-type both` Squid serves, so the tiered keys exist.
+- Live-test: scale the proxy ASG and confirm `fleetipsec:proxy:pool` updates and
+  the VPN nodes' `pool_proxy` chain rebuilds (`nft list chain ip
+  ipsecnode_svcroute pool_proxy`), full HTTP through :8080 across >1 proxy, and
+  passive FTP through 20000-49999.
+
+----- earlier (2026-08-18) -----
+**Prior session:** Identity-NAT breakage ROOT-CAUSED and
 FIXED by design (Option 1 -- per-site VPP bypass).  Cross-project work spanning
 fleetsuite (ipsecnode) + ~/software/fleetshell (MDM schema, Valkey spooler,
 portal UI).  Code committed; NOT yet in any AMI (musl + fleetnode rebuild
@@ -563,7 +683,7 @@ The two projects are **separately maintainable** but intentionally aligned.
 ```
 fleetsuite/
   AGENTS.md                   <- this file
-  Cargo.toml                  <- Rust workspace (ipsecpulse, ipsecscale, ipsecnode)
+  Cargo.toml                  <- Rust workspace (ipseccore, ipsecpulse, ipsecscale, ipsecnode, fleetpulse, squid-infoproxy)
   .gitmodules                 <- declares vendor/aerosuite submodule
   vendor/
     aerosuite/                <- git submodule -> git@github.com:michaelrommel/aerosuite.git
@@ -573,11 +693,22 @@ fleetsuite/
   ipsecpulse/                 <- binary: boot-time config generator (LVS nodes) -- IMPLEMENTED
   ipsecscale/                 <- binary: ASG orchestration daemon (LVS nodes)   -- STUB
   ipsecnode/                  <- binary: per-node tunnel lifecycle (VPN nodes)   -- STUB
+  squid-infoproxy/            <- binary: Squid external_acl helper (Info Proxy destination
+                                  authz; Valkey-keyed on the CLIENT source IP). Moved here
+                                  from fleetshell; baked into the fleetproxy AMI. Only tie to
+                                  fleetshell is the Valkey key schema infoproxy:<type>:<src_ip>,
+                                  written by the fleetshell portal Info Proxy spool.
 
   aerobake/
     fleetscale/               <- IPSec LB AMI   (Alpine) -- IMPLEMENTED, TESTED
     fleetnode/               <- VPN concentrator AMI (Debian 12 Bookworm) -- IN PROGRESS
     fleetroute/               <- Return-path GW AMI (Alpine) -- TODO
+    fleetproxy/               <- Dual-homed Squid proxy AMI (Alpine) -- SCAFFOLDED
+                                  eth0 (Backend subnet -> concentrator) Squid :8080; eth1
+                                  (proxy-out subnet -> NAT) created+attached at boot by the
+                                  proxy-net service, source-based policy routing sends Squid's
+                                  OWN egress via NAT (not the tunnel). Authz via squid-infoproxy.
+                                  No NLB: :8080 is ECMP-split in ipsecnode.
   infrastructure/             <- AWS CLI scripts + their output
 ```
 
@@ -646,6 +777,10 @@ IGW:       igw-0599736bc51a9ac5c
 | FleetShell-IPSec-Management | `subnet-02387719b5b2c3352` | 172.16.52.0/24 | eu-west-2a | PRIVATE | rtb-private |
 | FleetShell-IPSec-Backend-a | `subnet-01a513292ea15ae83` | 172.16.53.0/24 | eu-west-2a | PRIVATE | rtb-backend |
 | FleetShell-IPSec-Backend-b | `subnet-08213d03f2940855c` | 172.16.54.0/24 | eu-west-2b | PRIVATE | rtb-backend |
+| FleetShell-proxy-out-a | `subnet-012fbf61edb76044b` | 172.16.59.0/24 | eu-west-2a | PRIVATE | proxy-out-rtb (-> NAT); tag `fleetshell-proxy-out=true` |
+| FleetShell-proxy-out-b | `subnet-010bc8913fb992563` | 172.16.60.0/24 | eu-west-2b | PRIVATE | proxy-out-rtb (-> NAT); tag `fleetshell-proxy-out=true` |
+| FleetShell-db-a | `subnet-0e451606d0b35d3d5` | 172.16.57.0/24 | eu-west-2a | PRIVATE | Aurora PrivateLink (vpce-09f0f22044c26be7b -> vpce-svc-...); sg `fleetshell-db-sg` (5432) |
+| FleetShell-db-b | `subnet-0b79a30f1d81b9141` | 172.16.58.0/24 | eu-west-2b | PRIVATE | Aurora PrivateLink; sg `fleetshell-db-sg` (5432) |
 
 All four mgmt subnets (LVS-mgmt-a/b, ReturnGW-mgmt-a/b) are created and
 associated with rtb-private.
@@ -687,12 +822,15 @@ aws autoscaling describe-auto-scaling-groups \
 | FleetShell-IPSec-sg-management | `sg-053524ea7dcdb64f1` | PostgreSQL from VPN; SSH from CLI_RemoteAccess |
 | FleetShell-IPSec-sg-backend | see `make_sg_backend.sh` | Inbound ICMP + TCP 80 + TCP 8080 from `198.51.100.0/24`; SSH from CLI_RemoteAccess. Attach to all backend server instances/tasks. |
 | FleetShell-IPSec-sg-endpoints | `sg-0438c989d6fe0f276` | TCP 443 inbound from `172.16.53.0/24` + `172.16.54.0/24`. Attached to VPC interface endpoint ENIs only. |
+| fleetshell-proxy-in | TBD (`make_proxy_service.sh` STEP 2) | fleetproxy eth0: inbound TCP 8080 from the tunnel (arbitrary device IP); egress all. |
+| fleetshell-proxy-egress | TBD (`make_proxy_service.sh` STEP 2) | fleetproxy eth1: outbound 80/443 to internet + intranet peer. Discovered by Name tag by the proxy-net service. |
 
 ### Other resources
 
 | Resource | ID | Notes |
 |---|---|---|
 | NAT Gateway | `nat-0fb75bf0679751582` | In LVS-a subnet |
+| Backend VPC endpoints | s3(gw), ecr.api, ecr.dkr, ssm, ssmmessages, ec2messages | On rtb-backend. **Missing: `com.amazonaws.eu-west-2.ec2` (control plane)** -- required by the fleetproxy `proxy-net` service (aws-cli + aeroplug create/attach the egress ENI over eth0 before NAT exists). Added by `make_proxy_service.sh` STEP 0. |
 | RDS PostgreSQL | `fleetshell-ipsec-strongswan` | Engine: PostgreSQL 18.4; Multi-AZ; db.t4g.medium |
 | RDS subnet group | `fleetshell-ipsec-rds` | Management (AZ-a) + ReturnGW-b (AZ-b) |
 
@@ -1311,6 +1449,46 @@ tunnel routing design is complete.
 
 ---
 
+### 18. fleetproxy -- dual-homed Squid HTTP/HTTPS destination (port 8080)
+
+**Goal:** Terminate device HTTP/HTTPS egress at the tunnel exit and authorize
+destinations per-device via the `squid-infoproxy` helper (Valkey allow-lists
+keyed on the device's global source IP). See `aerobake/fleetproxy/README.md` and
+`infrastructure/make_proxy_service.sh`.
+
+**The core problem (why not a plain single-homed proxy / Fargate / NLB):**
+Device replies must return via the concentrator (rtb-backend default -> Return
+GW), but Squid's OWN outbound requests must egress via the NAT gateway. Both
+destinations are arbitrary non-backend IPs (customer address space is not a
+fixed CIDR -- the backend uses an EXCLUDE list `172.16/16, 10.183/16,
+169.254/16` and sends everything else to the concentrator), so the two flows
+CANNOT be separated by destination. Authorization also requires the real device
+IP (no SNAT). Therefore the split is by SOURCE, via two ENIs + policy routing.
+
+**Mechanism:**
+- `eth0` in a Backend subnet (rtb-backend -> concentrator): Squid `http_port
+  :8080`; device replies return here.
+- `eth1` in a proxy-out subnet (-> NAT): Squid `tcp_outgoing_address`. Created +
+  attached AT BOOT by the `proxy-net` OpenRC service (aws-cli + `aeroplug`),
+  per-instance (no slot pool -- unlike aeroftp). `ip rule from <eth1-ip> table
+  200` (default -> NAT) steers every originated connection out the NAT.
+- AWS cannot launch an instance with two ENIs in different subnets, hence the
+  boot-attach workaround (same as the ReturnGW/fleetroute pattern).
+- `proxy-net`'s EC2 API calls run over eth0 BEFORE NAT exists, so a
+  `com.amazonaws.eu-west-2.ec2` interface endpoint on the Backend subnets is a
+  hard prerequisite (STEP 0; `ec2messages` != `ec2`).
+- Intranet vs internet is decided purely by URL (`dstdomain` fast ACL): intranet
+  hosts -> a single downstream `cache_peer`; everything else direct via NAT.
+- No NLB (preserving the arbitrary client IP while returning via the
+  concentrator is incompatible with an NLB return path). HA/scale = ipsecnode
+  VPP ECMP splitting `:8080` across the ASG's eth0 IPs (STEP 9).
+
+**Status:** Scaffolded (AMI files + progressive infra script). NOT yet built or
+deployed. Open: ipsecnode ECMP registration of the eth0 IP set; ENI-leak
+sweeper/lifecycle hook; tighten the IAM ENI policy.
+
+---
+
 ## Binaries
 
 ### Shared from aerosuite -- via git submodule at `vendor/aerosuite`
@@ -1475,6 +1653,26 @@ Not yet implemented.
 ---
 
 ## Packer AMIs
+
+### `aerobake/fleetproxy/` -- Dual-homed Squid HTTP/HTTPS proxy (Alpine) -- SCAFFOLDED
+
+**Status:** AMI files + progressive infra script written; NOT yet built/deployed.
+See Architecture Decision #18 and `aerobake/fleetproxy/README.md`.
+
+**NIC layout:**
+- eth0: device-facing NIC (Backend subnet, rtb-backend -> concentrator). Squid
+  `http_port :8080`; device replies return here.
+- eth1: egress NIC (proxy-out subnet, -> NAT). Squid `tcp_outgoing_address`.
+  Created + attached AT BOOT by the `proxy-net` service (per-instance, aws-cli +
+  `aeroplug`); source-based `ip rule from <eth1-ip> table 200` sends Squid's own
+  egress via NAT instead of the tunnel.
+
+**Files:** `fleetproxy.pkr.hcl` (+ `infrastructure/fleetproxy.pkrvars.hcl`),
+`_etc_init.d_proxy-net` (create/attach eth1 + policy routing + materialise
+squid.conf), `_etc_squid_squid.conf` (helper authz + URL-based intranet
+`cache_peer` split), `_etc_conf.d_proxy-net`, `_etc_conf.d_squid`,
+`_etc_squid_intranet_domains.txt`. Helper binary = `squid-infoproxy` (workspace).
+Infra: `infrastructure/make_proxy_service.sh` (+ `_trust.json` / `_policy.json`).
 
 ### `aerobake/fleetscale/` -- IPSec LB (Alpine) -- IMPLEMENTED, TESTED
 
@@ -2273,6 +2471,19 @@ IKE phase is unaffected: IKE DH is mandatory and was enforced correctly
 
 ## Open TODOs
 
+### Proxy-pool conntrack flush is coarse (`conntrack -F`) (2026-08-22)
+
+When a proxy leaves the `fleetipsec:proxy:pool`, the concentrator's
+`proxy_pool_task` runs a full `conntrack -F` so device->proxy flows pinned (by
+the `pool_proxy` jhash DNAT) to the departed member re-hash to a survivor. That
+is correct but coarse: it momentarily drops the conntrack of EVERY flow on the
+node (they re-create on the next packet, re-hashing to the same member under the
+stable map, so it self-heals with a blip). IMPROVEMENT: delete only the entries
+whose reply-source is a removed member, e.g. `conntrack -D --reply-src
+<removed_proxy_ip>` per departed IP -- surgical, leaves unrelated flows
+untouched. Same coarse-vs-surgical choice exists on the LVS (ipsecscale) for VPN
+node removal. Low priority (scale-in is rare, re-create is cheap).
+
 ### FTP PASV reply IP -- aeroftp Rust code
 
 `nf_nat_ftp` rewrites the IP embedded in PASV responses to the address the
@@ -2295,6 +2506,37 @@ specific rewrite.
 Entry point to look at: aeroftp's FTP proxy / ALG code in
 `~/software/aerosuite/aeroftp/src/` -- search for PASV handling or the
 place where the 227 response is constructed or forwarded.
+
+### Passive-FTP data-port range routing + gateway reserved ports (2026-08-21)
+
+aeroftp serves active AND passive FTP. For passive data connections the backend
+reserves ports 20000-49999 (`net.ipv4.ip_local_reserved_ports = 20000-49999`),
+so a device opens the PASV data channel to a port in that range. The ipsecnode
+global service split currently DNATs ONLY 21/22 to the FTP VIP
+(`ipsecnode_svcroute`: `iifname "vpp-outer" tcp dport { 21, 22 } dnat to <VIP>`),
+so passive data connections on 20000-49999 are NOT steered to the FTP VIP and
+fail. TWO coupled changes, do together:
+
+1. **ipsecnode (fleetsuite): DONE (2026-08-21).** `SplitRule` gained
+   `port_from`/`port_to`; `add_svcroute_rule`/`port_match` emit a nftables port
+   RANGE (`tcp dport 20000-49999`). ipsecnode.toml routes 21/22 AND 20000-49999
+   to the aeroftp VIP. (8080 was moved to the dynamic `proxy` ECMP pool in the
+   same pass.) STILL to verify live: passive FTP through the 20000-49999 range.
+
+2. **fleetshell-gateway (fleetshell):** the gateway container INITIATES
+   connections TO devices; its ephemeral SOURCE-port range must AVOID
+   20000-49999 so a gateway-initiated flow never collides with a passive-FTP
+   data port. Apply `net.ipv4.ip_local_reserved_ports = 20000-49999` (or narrow
+   `ip_local_port_range` below 20000) to the container. NOTE: a Dockerfile
+   cannot set net.ipv4 sysctls at BUILD time (they are per-net-namespace runtime
+   params); it must be applied at RUNTIME -- entrypoint sysctl (needs the cap) or
+   the ECS task `systemControls` / K8s `securityContext.sysctls`. Record the
+   chosen mechanism when implementing. See fleetshell/fleetshell-gateway/Dockerfile
+   and the matching entry in fleetshell/AGENTS.md.
+
+Cross-ref: the FTP PASV reply-IP TODO above is the related but SEPARATE issue
+(PASV embedded-IP rewrite); this one is passive-port RANGE routing + gateway
+reserved source ports.
 
 ### Backend membership + backend->device SNAT is static in ipsecnode.toml (2026-08-12)
 
@@ -2324,27 +2566,33 @@ Three related gaps, to pick up in the coming days:
    (device->backend, `customer_view_ip -> real_ip`) is fine if `real_ip` is a
    STABLE VIP -- aeroftp and fleetshell-proxy already front their fleets with
    an NLB VIP, so keep those in config/Valkey as stable per-role VIPs.
-   The SNAT direction (backend->device) is the real gap: when a container
-   INITIATES to a device the packet carries the container's own task IP (an
-   NLB only rewrites INBOUND/DNAT, never egress-initiated flows), and ALL
-   three roles (access_server / sd_server / em_server) dial devices, each
-   needing a DIFFERENT customer_view source. So the blanket per-site SNAT
-   (`oifname xfrm-{hex} ct state new snat to <access_view>`) must become
-   source-matched: `snat ip to ip saddr map @bnat_snat_{hex}` where the map is
-   `{ member_ip : that_site's_view_for_that_role }` for each role in the
-   site's backend_nat. That requires the live per-role task-IP membership.
-   APPROACH (agreed): a scaler (natural home: `ipsecscale`, master-only
-   singleton) reconciles ECS membership -- trigger via EventBridge "ECS Task
-   State Change" (or container self-register on startup) as a fast path, but
-   the AUTHORITATIVE source is a `DescribeTasks`/Cloud Map query, plus a
-   periodic full reconcile (~30-60 s) to GC ungracefully-dead tasks. Scaler
-   writes `fleetipsec:backend:<role> -> [ips]` (snapshot, keyspace-notified);
-   every `ipsecnode` subscribes (new `BACKEND_PREFIX`), keeps a `role ->
-   set<member_ip>` index and applies incremental `nft add/delete element`
-   deltas to every active site's `bnat_snat_{hex}` map (build from snapshot at
-   site-up). Debounce/coalesce bursts; prefer element deltas over full
-   rewrites (fan-out is O(sites x members)). Do it all in the `VrfCache`-owning
-   task so child-updown / nat-record / membership events are serialized.
+   PARTIALLY DONE (2026-08-22): the SNAT direction (backend->device) is now
+   source-matched in `setup_site_bnat`/`add_bnat_snat`:
+     - sd_server / em_server are SINGLE FIXED IPs (toml real_ip) -> a per-site
+       map `bsnat_{hex}` `{ real_ip : customer_view }`, rule `oifname xfrm-{hex}
+       ct state new snat ip to ip saddr map @bsnat_{hex}` (matched FIRST).
+     - access_server is the DEFAULT catch-all (rule AFTER the map): `oifname
+       xfrm-{hex} ct state new snat to <access_view>`. It is NOT source-scoped,
+       because its backend may present multiple/dynamic source IPs (proxy pool,
+       scaled tasks) -- anything that is not sd/em is SNAT'd to the access_view.
+   REMAINING gap: this assumes sd/em are single fixed IPs. If sd/em ever scale
+   to task IPs that INITIATE to devices, OR a non-access/non-sd/em backend needs
+   its own view, the map needs LIVE per-role task-IP membership (the design
+   below). The access catch-all already absorbs access-fleet scaling, so the
+   live-membership work is now lower priority.
+   APPROACH (agreed) for the live-membership case: a scaler (natural home:
+   `ipsecscale`, master-only singleton) reconciles ECS membership -- trigger via
+   EventBridge "ECS Task State Change" (or container self-register on startup)
+   as a fast path, but the AUTHORITATIVE source is a `DescribeTasks`/Cloud Map
+   query, plus a periodic full reconcile (~30-60 s) to GC ungracefully-dead
+   tasks. Scaler writes `fleetipsec:backend:<role> -> [ips]` (snapshot,
+   keyspace-notified); every `ipsecnode` subscribes (new `BACKEND_PREFIX`),
+   keeps a `role -> set<member_ip>` index and applies incremental `nft
+   add/delete element` deltas to every active site's `bsnat_{hex}` map (build
+   from snapshot at site-up). Debounce/coalesce bursts; prefer element deltas
+   over full rewrites (fan-out is O(sites x members)). Do it all in the
+   `VrfCache`-owning task so child-updown / nat-record / membership events are
+   serialized.
 
 3. **Derive `local_ts` / `remote_ts` from the nat record instead of hand
    entry.** The portal that spools to Valkey has no `local_ts` field yet;

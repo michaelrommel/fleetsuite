@@ -23,8 +23,8 @@ set -euo pipefail
 #   CONFIRM=yes bash cycle_lvs_instances.sh      # actually terminates, backup then master
 
 REGION="eu-west-2"
-# Backup FIRST, master LAST, so the VIP is only ever on one healthy node.
-ASGS="fleetipsec-lvs-backup fleetipsec-lvs-master"
+# Backup LAST, master FIRST, so the VIP is only ever on one healthy node.
+ASGS="fleetipsec-lvs-master fleetipsec-lvs-backup"
 WAIT_TIMEOUT=300   # seconds to wait for a replacement to become InService+Healthy
 
 # Print the InService instance IDs of an ASG.
