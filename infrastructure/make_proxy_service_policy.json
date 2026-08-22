@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeForBootstrap",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeInstances"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageEgressEni",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*",
+      "_comment": "Scope down later, e.g. condition on aws:ResourceTag/Name=fleetproxy-egress and the proxy-out subnets; CreateTags can be limited to ec2:CreateAction=CreateNetworkInterface."
+    }
+  ]
+}

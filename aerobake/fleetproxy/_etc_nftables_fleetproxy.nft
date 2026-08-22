@@ -1,0 +1,51 @@
+#!/usr/sbin/nft -f
+#
+# nftables ruleset for fleetproxy dual-homed Squid nodes.
+#
+# eth0  device-facing / primary (Backend subnet, rtb-backend -> concentrator).
+#       Squid :8080 listener; device traffic arrives here; SSH management.
+# eth1  egress (proxy-out subnet -> NAT), created + attached at boot by the
+#       proxy-net service. Squid's ORIGINATED connections egress here; their
+#       replies return as ct state established,related (accepted below), so eth1
+#       needs no inbound service rule of its own.
+#
+# Loaded at boot by the nftables OpenRC service (/etc/nftables.nft). This file
+# owns the entire ruleset; there is no data-plane table to include (unlike the
+# LVS nodes). OUTPUT is intentionally unrestricted (Squid egress, EC2 API/IMDS,
+# Valkey, DNS all originate from the host).
+
+flush ruleset
+
+table inet filter {
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		# Loopback + replies to locally-originated connections (Squid egress on
+		# eth1, EC2 API / IMDS, Valkey, DNS). ICMP PMTU/errors tied to a tracked
+		# connection arrive as 'related' and are accepted here too.
+		iifname "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+
+		# ICMP echo from within the VPC (reachability probes).
+		ip saddr 172.16.0.0/16 icmp type echo-request accept
+
+		# SSH management from within the VPC (bastion / VPN / Return GW nodes).
+		# The AWS security group further restricts the source to CLI_RemoteAccess.
+		ip saddr 172.16.0.0/16 tcp dport 22 accept
+
+		# Prometheus node-exporter scrape from within the VPC.
+		ip saddr 172.16.0.0/16 tcp dport 9100 accept
+
+		# Squid proxy listener on the device-facing NIC. The client is the
+		# arbitrary device global IP (no fixed CIDR), delivered by ipsecnode VPP
+		# ECMP via the concentrator; the squid-infoproxy helper is the real gate.
+		iifname "eth0" tcp dport 8080 accept
+	}
+
+	# The proxy terminates and re-originates connections; it never forwards.
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}

@@ -1,0 +1,5 @@
+# /etc/conf.d/squid -- ensure Squid starts only after proxy-net has attached
+# eth1 and written /etc/squid/conf.d/egress.conf (tcp_outgoing_address) and the
+# intranet peer substitution into squid.conf.
+rc_need="proxy-net"
+rc_after="proxy-net"

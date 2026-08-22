@@ -1,0 +1,8 @@
+alias ll='ls -la'
+alias vim=vi
+alias less='less -R'
+alias nl='nload -m -a 9 -t 1000 -u h eth0 eth1'
+alias sqa='tail -f /var/log/squid/access.log'
+alias sqc='tail -f /var/log/squid/cache.log'
+alias pn='rc-service proxy-net status'
+export ENV="$HOME/.ashrc"

@@ -1,0 +1,136 @@
+#!/sbin/openrc-run
+
+description="Create+attach the egress ENI (eth1) and set up source-based policy routing for Squid"
+
+# Load defaults, then allow /etc/conf.d/proxy-net to override them.
+: ${REGION:="eu-west-2"}
+: ${PROXY_OUT_SUBNET_TAG_KEY:="fleetshell-proxy-out"}
+: ${PROXY_OUT_SUBNET_TAG_VALUE:="true"}
+: ${EGRESS_SG_NAME:="fleetshell-proxy-egress"}
+: ${EGRESS_TABLE:="200"}
+: ${EGRESS_RULE_PRIO:="100"}
+: ${INTRANET_PROXY_IP:="10.183.0.10"}
+: ${INTRANET_PROXY_PORT:="3128"}
+: ${AEROPLUG_BINARY:="/usr/local/bin/aeroplug"}
+: ${VALKEY_URL:="rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379"}
+
+run_dir="/var/run/fleetproxy"
+eni_file="${run_dir}/eni_id"
+ip_file="${run_dir}/eth1_ip"
+
+depend() {
+	need net
+	after nftables
+	before squid
+}
+
+# --- IMDSv2 helpers ---------------------------------------------------------
+imds() {
+	# $1 = metadata path (e.g. placement/availability-zone)
+	# Use curl, NOT BusyBox wget: BusyBox wget has no --method=PUT, so the
+	# IMDSv2 token PUT fails (401) and every metadata read comes back empty.
+	TOKEN=$(curl -sf -X PUT \
+		-H "X-aws-ec2-metadata-token-ttl-seconds: 300" \
+		http://169.254.169.254/latest/api/token)
+	curl -sf -H "X-aws-ec2-metadata-token: ${TOKEN}" \
+		"http://169.254.169.254/latest/meta-data/$1"
+}
+
+start() {
+	ebegin "Setting up fleetproxy egress ENI + policy routing"
+	checkpath --directory --owner root:root --mode 0750 "${run_dir}"
+	mkdir -p /etc/squid/conf.d
+
+	AZ=$(imds placement/availability-zone)
+	einfo "Availability zone: ${AZ}"
+
+	# --- 1. Discover the AZ-matching egress subnet ----------------------
+	SUBNET_ID=$(aws ec2 describe-subnets --region "${REGION}" \
+		--filters "Name=tag:${PROXY_OUT_SUBNET_TAG_KEY},Values=${PROXY_OUT_SUBNET_TAG_VALUE}" \
+		          "Name=availability-zone,Values=${AZ}" \
+		--query 'Subnets[0].SubnetId' --output text)
+	SUBNET_CIDR=$(aws ec2 describe-subnets --region "${REGION}" \
+		--subnet-ids "${SUBNET_ID}" \
+		--query 'Subnets[0].CidrBlock' --output text)
+	if [ -z "${SUBNET_ID}" ] || [ "${SUBNET_ID}" = "None" ]; then
+		eerror "No egress subnet tagged ${PROXY_OUT_SUBNET_TAG_KEY}=${PROXY_OUT_SUBNET_TAG_VALUE} in ${AZ}"
+		eend 1; return 1
+	fi
+	PLEN=${SUBNET_CIDR#*/}
+	# VPC router (default gateway) is the subnet base + 1.
+	NET_BASE=${SUBNET_CIDR%/*}
+	GW1=$(echo "${NET_BASE}" | awk -F. '{printf "%s.%s.%s.%d", $1,$2,$3,$4+1}')
+	einfo "Egress subnet ${SUBNET_ID} (${SUBNET_CIDR}), gw ${GW1}"
+
+	# --- 2. Discover the egress security group --------------------------
+	EGRESS_SG=$(aws ec2 describe-security-groups --region "${REGION}" \
+		--filters "Name=tag:Name,Values=${EGRESS_SG_NAME}" \
+		--query 'SecurityGroups[0].GroupId' --output text)
+	einfo "Egress SG ${EGRESS_SG}"
+
+	# --- 3. Create the egress ENI (per-instance, no pool) ---------------
+	INSTANCE_ID=$(imds instance-id)
+	ENI_ID=$(aws ec2 create-network-interface --region "${REGION}" \
+		--subnet-id "${SUBNET_ID}" --groups "${EGRESS_SG}" \
+		--description "fleetproxy egress ${INSTANCE_ID}" \
+		--tag-specifications "ResourceType=network-interface,Tags=[{Key=Name,Value=fleetproxy-egress},{Key=fleetproxy-instance,Value=${INSTANCE_ID}}]" \
+		--query 'NetworkInterface.NetworkInterfaceId' --output text)
+	ENI_IP=$(aws ec2 describe-network-interfaces --region "${REGION}" \
+		--network-interface-ids "${ENI_ID}" \
+		--query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+	printf '%s\n' "${ENI_ID}" > "${eni_file}"
+	printf '%s\n' "${ENI_IP}" > "${ip_file}"
+	einfo "Created egress ENI ${ENI_ID} (${ENI_IP})"
+
+	# --- 4. Attach as eth1 (device index 1) via aeroplug ----------------
+	${AEROPLUG_BINARY} eni --eni-id "${ENI_ID}" --attach --device-index 1
+	i=0
+	while [ ! -d /sys/class/net/eth1 ]; do
+		i=$((i + 1)); [ "$i" -ge 30 ] && { eerror "eth1 did not appear"; eend 1; return 1; }
+		sleep 1
+	done
+
+	# --- 5. Bring up eth1 + source-based policy routing -----------------
+	# AWS disables the source/dest check implicitly for our own traffic; the
+	# eth1 subnet route table defaults to the NAT gateway, so anything sourced
+	# from ENI_IP and steered into table ${EGRESS_TABLE} egresses via NAT.
+	ip addr add "${ENI_IP}/${PLEN}" dev eth1 2>/dev/null || true
+	ip link set eth1 up
+	ip route replace default via "${GW1}" dev eth1 table "${EGRESS_TABLE}"
+	ip rule del from "${ENI_IP}" table "${EGRESS_TABLE}" 2>/dev/null || true
+	ip rule add from "${ENI_IP}" table "${EGRESS_TABLE}" priority "${EGRESS_RULE_PRIO}"
+
+	# --- 6. Materialise Squid egress binding + intranet peer ------------
+	# Every ORIGINATED connection (direct fetch AND cache_peer) is sourced from
+	# eth1 -> hits the `from ENI_IP` rule -> table ${EGRESS_TABLE} -> NAT.
+	printf 'tcp_outgoing_address %s\n' "${ENI_IP}" > /etc/squid/conf.d/egress.conf
+	sed -i "s|@INTRANET_PROXY@|${INTRANET_PROXY_IP}|g; s|@INTRANET_PORT@|${INTRANET_PROXY_PORT}|g; s|@VALKEY_URL@|${VALKEY_URL}|g" \
+		/etc/squid/squid.conf
+
+	eend $?
+}
+
+stop() {
+	ebegin "Tearing down fleetproxy egress ENI + policy routing"
+	[ -f "${ip_file}" ] && ENI_IP=$(cat "${ip_file}")
+	[ -f "${eni_file}" ] && ENI_ID=$(cat "${eni_file}")
+
+	if [ -n "${ENI_IP:-}" ]; then
+		ip rule del from "${ENI_IP}" table "${EGRESS_TABLE}" 2>/dev/null || true
+	fi
+	ip route flush table "${EGRESS_TABLE}" 2>/dev/null || true
+
+	if [ -n "${ENI_ID:-}" ]; then
+		${AEROPLUG_BINARY} eni --eni-id "${ENI_ID}" --detach 2>/dev/null || true
+		i=0; while [ -d /sys/class/net/eth1 ]; do
+			i=$((i + 1)); [ "$i" -ge 30 ] && break; sleep 1
+		done
+		# Best-effort delete so we do not leak ENIs; a terminating lifecycle
+		# hook / sweeper is the backstop for abrupt (SIGKILL) termination.
+		aws ec2 delete-network-interface --region "${REGION}" \
+			--network-interface-id "${ENI_ID}" 2>/dev/null || \
+			ewarn "Could not delete ${ENI_ID} -- leave for the sweeper"
+	fi
+	rm -f "${eni_file}" "${ip_file}"
+	eend 0
+}

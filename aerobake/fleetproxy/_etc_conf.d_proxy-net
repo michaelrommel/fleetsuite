@@ -1,0 +1,36 @@
+# Configuration for the fleetproxy `proxy-net` service.
+#
+# proxy-net creates + attaches the egress (eth1) ENI at boot, sets up
+# source-based policy routing so Squid's ORIGINATED traffic egresses via the
+# NAT gateway (eth1) while device replies return via the concentrator (eth0),
+# and materialises the Squid egress binding + intranet peer config.
+
+export REGION="eu-west-2"
+
+# Valkey / MemoryDB endpoint the squid-infoproxy helper reads the Info Proxy
+# allow-lists from. Substituted into squid.conf (--valkey-url) at boot.
+export VALKEY_URL="rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379"
+
+# How proxy-net locates the AZ-matching egress subnet: a subnet tagged
+# `fleetshell-proxy-out=true` in this instance's Availability Zone.
+export PROXY_OUT_SUBNET_TAG_KEY="fleetshell-proxy-out"
+export PROXY_OUT_SUBNET_TAG_VALUE="true"
+
+# How proxy-net locates the security group for the created egress ENI
+# (matched by Name tag).
+export EGRESS_SG_NAME="fleetshell-proxy-egress"
+
+# Policy-routing table id + rule priority for the eth1 egress table.
+export EGRESS_TABLE="200"
+export EGRESS_RULE_PRIO="100"
+
+# The single downstream "dumb" intranet proxy (reachable via eth1 -> egress).
+# Intranet vs internet is decided per-device by the squid-infoproxy helper
+# (--proxy-type both), which tags a request `intranet` when the destination is
+# in that device's infoproxy:intranet:<ip> allow-list; squid.conf forwards
+# intranet-tagged requests to this peer and sends everything else direct.
+export INTRANET_PROXY_IP="10.183.0.10"
+export INTRANET_PROXY_PORT="3128"
+
+# Path to the aeroplug binary (attach the created ENI as eth1).
+export AEROPLUG_BINARY="/usr/local/bin/aeroplug"
