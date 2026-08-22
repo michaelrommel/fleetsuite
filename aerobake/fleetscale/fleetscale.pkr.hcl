@@ -228,13 +228,18 @@ build {
     ]
   }
 
-  # ── 9. Binaries — ipsecpulse and aeroplug ───────────────────────────────────
-  # Both are statically linked musl binaries.  Build with:
+  # ── 9. Binaries — ipsecpulse, ipsecscale and aeroplug ───────────────────────
+  # All statically linked musl binaries.  Build with:
   #   cd vendor/aerosuite && cargo build --release --target x86_64-unknown-linux-musl -p aeroplug
   #   cargo build --release --target x86_64-unknown-linux-musl -p ipsecpulse
+  #   cargo build --release --target x86_64-unknown-linux-musl -p ipsecscale
   provisioner "file" {
     source      = "../../target/x86_64-unknown-linux-musl/release/ipsecpulse"
     destination = "/tmp/ipsecpulse"
+  }
+  provisioner "file" {
+    source      = "../../target/x86_64-unknown-linux-musl/release/ipsecscale"
+    destination = "/tmp/ipsecscale"
   }
   provisioner "file" {
     source      = "../../vendor/aerosuite/target/x86_64-unknown-linux-musl/release/aeroplug"
@@ -244,9 +249,10 @@ build {
     inline = [
       "sudo mkdir -p /usr/local/bin",
       "sudo mv /tmp/ipsecpulse /usr/local/bin/ipsecpulse",
+      "sudo mv /tmp/ipsecscale /usr/local/bin/ipsecscale",
       "sudo mv /tmp/aeroplug   /usr/local/bin/aeroplug",
-      "sudo chown root:root /usr/local/bin/ipsecpulse /usr/local/bin/aeroplug",
-      "sudo chmod +x       /usr/local/bin/ipsecpulse /usr/local/bin/aeroplug",
+      "sudo chown root:root /usr/local/bin/ipsecpulse /usr/local/bin/ipsecscale /usr/local/bin/aeroplug",
+      "sudo chmod +x       /usr/local/bin/ipsecpulse /usr/local/bin/ipsecscale /usr/local/bin/aeroplug",
     ]
   }
 

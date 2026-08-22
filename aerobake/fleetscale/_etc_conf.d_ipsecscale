@@ -1,6 +1,23 @@
 # Configuration for /etc/init.d/ipsecscale
-# Populated when ipsecscale is implemented.
+#
+# ipsecscale runs on both LVS nodes; only the VRRP master acts (role read from
+# /run/ipsec-role). This increment reconciles the fleetproxy ECMP pool: it
+# discovers ready proxies and publishes fleetipsec:<PROXY_POOL_NAME>:pool to
+# Valkey, which each VPN node's ipsecnode consumes to steer :8080 traffic.
 
 : ${REGION:="eu-west-2"}
 : ${RUST_LOG:="info"}
 : ${LOGFILE:="/var/log/ipsecscale.log"}
+
+# Valkey/MemoryDB endpoint ipsecscale writes the proxy pool snapshot to.
+# NOTE: the LVS node SG must be allowed inbound on the MemoryDB cluster (6379).
+: ${VALKEY_URL:="rediss://clustercfg.dev-valkey-aeroftp.ak121m.memorydb.eu-west-2.amazonaws.com:6379"}
+
+# Proxy fleet discovery.
+: ${PROXY_ASG:="fleetshell-proxy-asg"}
+: ${PROXY_PORT:="8080"}
+# Backend subnet CIDRs that carry the proxy eth0 (DNAT-target) IPs; excludes the
+# eth1 proxy-out egress IPs.
+: ${PROXY_BACKEND_CIDRS:="172.16.53.0/24,172.16.54.0/24"}
+: ${PROXY_POOL_NAME:="proxy"}
+: ${RECONCILE_INTERVAL_SECS:="15"}

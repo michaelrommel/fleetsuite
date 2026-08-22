@@ -34,6 +34,12 @@ start() {
 		--respawn-delay  5                       \
 		--respawn-period 60                      \
 		--env "RUST_LOG=${RUST_LOG}"             \
+		--env "VALKEY_URL=${VALKEY_URL}"         \
+		--env "PROXY_ASG=${PROXY_ASG}"           \
+		--env "PROXY_PORT=${PROXY_PORT}"         \
+		--env "PROXY_BACKEND_CIDRS=${PROXY_BACKEND_CIDRS}" \
+		--env "PROXY_POOL_NAME=${PROXY_POOL_NAME}"         \
+		--env "RECONCILE_INTERVAL_SECS=${RECONCILE_INTERVAL_SECS}" \
 		-- "${IPSECSCALE_BINARY}"                \
 			--region "${REGION}"
 	eend $?

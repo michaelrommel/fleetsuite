@@ -1,0 +1,12 @@
+[package]
+name        = "ipseccore"
+version     = "0.1.0"
+edition     = "2021"
+publish     = false
+
+[lib]
+name = "ipseccore"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { workspace = true }

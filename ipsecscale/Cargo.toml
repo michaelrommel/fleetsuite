@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 # Shared crates from the aerosuite submodule
 aerocore         = { path = "../vendor/aerosuite/aerocore" }
+ipseccore        = { path = "../ipseccore" }
 
 anyhow           = { workspace = true }
 clap             = { workspace = true }
@@ -22,3 +23,4 @@ serde            = { workspace = true }
 serde_json       = { workspace = true }
 redis            = { workspace = true }
 reqwest          = { workspace = true }
+futures-util     = { workspace = true }
