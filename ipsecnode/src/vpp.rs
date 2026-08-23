@@ -58,6 +58,11 @@ const NFT_VPP_MAP:        &str = "vpp_mark";
 const NFT_BNAT_TABLE:     &str = "ipsecnode_bnat";
 /// nftables table for global port-based service routing on vpp-outer.
 const NFT_SVCROUTE_TABLE: &str = "ipsecnode_svcroute";
+/// nftables ct-helper object (kernel `ftp` ALG) for the FTP control-connection
+/// PASV/227 rewrite (see setup_site_bnat / add_bnat_ftp_helper).
+const NFT_BNAT_HELPER:       &str = "ftp_ctrl";
+/// Raw-priority prerouting chain holding the per-site `ct helper set` rules.
+const NFT_BNAT_HELPER_CHAIN: &str = "helperpre";
 /// TCP MSS clamped to this value to fit inner payload within
 /// 1500-byte internet MTU after AES-256-GCM + UDP-NAT-T overhead (~100 bytes).
 const TCP_MSS_CLAMP:   u32  = 1380;
@@ -140,6 +145,9 @@ pub struct SiteBnatState {
 	pub split_chain:       Option<String>,
 	/// PREROUTING handle of the `iifname xfrm-{hex} jump split_{hex}` rule.
 	pub split_jump_handle: Option<u64>,
+	/// Handle of the per-site `ct helper set "ftp_ctrl"` rule in the mangle-priority
+	/// helperpre chain (FTP control-connection PASV rewrite); None if not added.
+	pub helper_handle:     Option<u64>,
 	/// customer_view_ips installed as map keys (for logging on teardown).
 	pub customer_view_ips: Vec<String>,
 }
@@ -150,6 +158,7 @@ impl SiteBnatState {
 			map_name: String::new(), rule_handle: None,
 			snat_map_name: String::new(), snat_handles: Vec::new(),
 			split_chain: None, split_jump_handle: None,
+			helper_handle: None,
 			customer_view_ips: Vec::new(),
 		}
 	}
@@ -463,6 +472,37 @@ async fn init_nftables_bnat(backend: &BackendConfig) -> Result<()> {
 	);
 	nft_batch(&rules).await.context("init nftables bnat table")?;
 
+	// FTP control-connection ALG. Assign the kernel `ftp` conntrack helper to
+	// port-21 control flows (per-site rules added in setup_site_bnat, scoped to
+	// the access_view) so nf_nat_ftp rewrites the PASV/227 embedded IP from the
+	// aeroftp VIP -- already normalised there by the LVM's ip_vs_ftp -- to the
+	// per-site access_server customer_view. Works in BOTH bypass and VPP-VRF
+	// modes because the customer_view->VIP DNAT lives on xfrm-{hex} in both; the
+	// helper keys off that dest DNAT, never the (VPP) source SNAT.
+	//
+	// The helperpre chain is `mangle` priority (-150) -- NOT raw. nftables
+	// `ct helper set` (unlike the iptables raw CT --helper target) does NOT
+	// allocate a template conntrack; it assigns the helper to the EXISTING ct
+	// (`nf_ct_get(skb)`), so it must run AFTER the conntrack hook (-200) or it is
+	// a silent no-op. mangle (-150) runs after conntrack yet BEFORE dstnat (-100),
+	// so the ct exists (helper attaches) and `ip daddr` is still the pre-DNAT
+	// customer_view (the per-site rule matches). Modules are best-effort loaded
+	// here (also in modules-load.d); the ct helper object needs nf_conntrack_ftp.
+	let _ = modprobe("nf_conntrack_ftp").await;
+	let _ = modprobe("nf_nat_ftp").await;
+	let helper = format!(
+		"add ct helper ip {NFT_BNAT_TABLE} {NFT_BNAT_HELPER} \
+		   {{ type \"ftp\" protocol tcp; }}\n\
+		 add chain ip {NFT_BNAT_TABLE} {NFT_BNAT_HELPER_CHAIN} \
+		   {{ type filter hook prerouting priority mangle; policy accept; }}\n"
+	);
+	if let Err(e) = nft_batch(&helper).await {
+		warn!("bnat ftp ct-helper setup failed (FTP PASV rewrite disabled): {e:#}");
+	} else {
+		info!(table = NFT_BNAT_TABLE, helper = NFT_BNAT_HELPER,
+		      "nftables FTP ct-helper ready (PASV/227 rewrite)");
+	}
+
 	// Create the (initially empty) dynamic pool chains referenced by the
 	// access_server splits. proxy_pool_task fills them; the per-site split chains
 	// (added in setup_site_bnat, scoped to the access_view) jump to them.
@@ -484,6 +524,18 @@ async fn conntrack_flush() -> Result<()> {
 		.output().await.context("spawn conntrack -F")?;
 	if !out.status.success() {
 		anyhow::bail!("conntrack -F failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+	}
+	Ok(())
+}
+
+/// Best-effort `modprobe <module>`. Returns Err on failure so callers can decide
+/// whether it is fatal; used non-fatally for the FTP conntrack/NAT helpers.
+async fn modprobe(module: &str) -> Result<()> {
+	let out = tokio::process::Command::new("modprobe")
+		.arg(module)
+		.output().await.with_context(|| format!("spawn modprobe {module}"))?;
+	if !out.status.success() {
+		anyhow::bail!("modprobe {module}: {}", String::from_utf8_lossy(&out.stderr).trim());
 	}
 	Ok(())
 }
@@ -1145,9 +1197,15 @@ async fn setup_site_bnat(
 	let (snat_map_name, snat_handles) =
 		add_bnat_snat(peer_ip, if_id, &xfrm_if, backend_nat, backend).await;
 
+	// FTP control-connection ALG: assign the `ftp` ct helper to port-21 flows to
+	// the access_server view so nf_nat_ftp rewrites the PASV/227 IP to the
+	// customer_view (the LVM already normalised it to the aeroftp VIP).
+	let helper_handle = add_bnat_ftp_helper(peer_ip, &xfrm_if, backend_nat).await;
+
 	SiteBnatState {
 		map_name, rule_handle, snat_map_name, snat_handles,
 		split_chain, split_jump_handle,
+		helper_handle,
 		customer_view_ips: installed,
 	}
 }
@@ -1242,6 +1300,42 @@ async fn add_bnat_snat(
 /// only the access_server's traffic on the split ports is diverted -- sd/em
 /// customer_view traffic and all other ports fall through to the default
 /// customer_view->real_ip map (added by the caller AFTER this jump).
+/// Assign the kernel `ftp` conntrack helper to this site's FTP control channel
+/// (tcp dport 21 to the access_server customer_view) in the mangle-priority
+/// helperpre chain. This makes nf_nat_ftp rewrite the PASV/227 embedded IP --
+/// already normalised to the aeroftp VIP by the LVM's ip_vs_ftp -- to the
+/// per-site access_view, and installs the data-channel expectation. Scoped to
+/// the access_view + port 21 per the PORT-SPLIT SCOPING CONTRACT (sd/em are
+/// never touched). Returns the rule handle, or None if there is no access_view
+/// or the assignment failed (non-fatal: FTP just keeps the wrong PASV IP).
+async fn add_bnat_ftp_helper(
+	peer_ip:     &str,
+	xfrm_if:     &str,
+	backend_nat: Option<&BackendNatRecord>,
+) -> Option<u64> {
+	let access_view = backend_nat.and_then(|r| r.access_server.as_deref())?;
+
+	let out = nft_capture(&[
+		"--echo", "--handle",
+		"add", "rule", "ip", NFT_BNAT_TABLE, NFT_BNAT_HELPER_CHAIN,
+		"iifname", xfrm_if,
+		"ip", "daddr", access_view,
+		"tcp", "dport", "21",
+		"ct", "helper", "set", NFT_BNAT_HELPER,
+	]).await;
+	match out {
+		Ok(o) => match parse_nft_handle(&o) {
+			Ok(h) => {
+				info!(peer_ip, %access_view, handle = h,
+				      "FTP ct-helper assigned to port-21 control channel (PASV rewrite)");
+				Some(h)
+			}
+			Err(e) => { warn!(peer_ip, "parse ftp helper rule handle: {e:#}"); None }
+		},
+		Err(e) => { warn!(peer_ip, "ftp ct-helper assign failed: {e:#}"); None }
+	}
+}
+
 async fn add_bnat_splits(
 	peer_ip:     &str,
 	if_id:       u32,
@@ -1332,6 +1426,13 @@ async fn teardown_site_bnat(peer_ip: &str, bnat: &SiteBnatState) {
 		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, "prerouting",
 				   "handle", &h_str]).await;
 		info!(peer_ip, handle = h, "bnat PREROUTING rule removed");
+	}
+	// Remove the FTP ct-helper assign rule (mangle-priority helperpre chain).
+	if let Some(h) = bnat.helper_handle {
+		let h_str = h.to_string();
+		nft_warn(&["delete", "rule", "ip", NFT_BNAT_TABLE, NFT_BNAT_HELPER_CHAIN,
+				   "handle", &h_str]).await;
+		info!(peer_ip, handle = h, "FTP ct-helper rule removed");
 	}
 	// Remove the port-split jump (frees the split chain reference) then the chain.
 	if let Some(h) = bnat.split_jump_handle {

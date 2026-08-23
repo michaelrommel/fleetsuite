@@ -8,7 +8,70 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-22):** Port-split scoping fix (bypass-mode
+**Last completed session (2026-08-23):** aeroftp FTP backend integration into the
+IPSec concept -- three things, all COMMITTED and being baked.
+
+1. **FTP PASV/227 rewrite -- DONE, VALIDATED LIVE.** A device reaches the FTP
+   service at its per-site access_server customer_view (e.g. 194.138.39.18);
+   ipsecnode DNATs that to the aeroftp LVS VIP (172.16.54.10). The backend
+   answered PASV with its slot IP, the aeroftp LVM's `ip_vs_ftp` normalised that
+   to the VIP, but the concentrator's reverse-DNAT only fixed the L3 source --
+   so the 227 payload still carried the VIP and picky clients aborted. FIX: run
+   the kernel `ftp` conntrack helper + `nf_nat_ftp` ON THE CONCENTRATOR (see the
+   "FTP PASV reply IP -- SOLVED" section under Open TODOs for the full design +
+   the CRITICAL `priority mangle` note). It composes with the LVM helper
+   (LVM: backend->VIP; concentrator: VIP->customer_view) and needs zero
+   hardcoding -- the rewrite target is `ct ORIGINAL.dst` per conntrack. Works in
+   both bypass and (reasoned, not yet live-tested) VPP-VRF mode because the
+   customer_view->VIP DNAT lives on xfrm-{hex} in both.
+   THE ONE GOTCHA (cost a debug session): the `helperpre` `ct helper set` chain
+   MUST be `priority mangle` (-150), not `raw` (-300). nftables `ct helper set`
+   assigns to the EXISTING ct, which does not exist until the conntrack hook
+   (-200); at raw it is a silent no-op (no `helper=ftp`, no expectation, 227 not
+   rewritten). Diagnostic: `conntrack -L -p tcp | grep dport=21` must show
+   `helper=ftp`.
+
+2. **aeroftp ingress migration into Backend-b -- DONE (script + run 2026-08-23).**
+   `infrastructure/migrate_aeroftp_ingress_azb.sh` relaunched the two aeroftp
+   LVS ASGs (`aeroftp-loadbalancer-primary`/`-backup`, LT `lt-07d1af574cc3973af`)
+   with eth0 in Backend-b (`subnet-08213d03f2940855c`, 172.16.54.0/24, AZ-b, on
+   rtb-backend -> Return GW) and the outside VIP moved to 172.16.54.10 (was the
+   internet-facing 172.16.29.100 -- the concentrator path REPLACES it). STEP 1
+   opened the aeroftp SG for FTP 21/22/20000-49999 from GLOBAL_IP_CIDR (default
+   0.0.0.0/0 -- field devices span almost the whole IPv4 space; routing excludes
+   only 10.183/16, 172.16/16 + one more). Only eth0 moved; eth1/eth2
+   (inside/HA-sync, 172.16.32.64/26) stayed. ipsecnode.toml FTP `dnat_to` ->
+   172.16.54.10. The aeroscale AMI (item 3) was rebaked first so the do_snat VIP
+   was correct before the cycle.
+
+3. **aeroscale LVS return-path SNAT auto-adapt -- DONE in ~/software/aerosuite_main.**
+   The aeroscale AMI baked `chain do_snat { snat to 172.16.29.100 }` (the OLD
+   outside VIP) statically in `_etc_nftables_aeroscaler.nft` -- with the VIP now
+   172.16.54.10 that stale SNAT makes every FTP reply unroutable. FIX: aeropulse
+   now renders `/etc/nftables.d/aeroscale-vip.nft` (`define vip_outside = <tag>`)
+   from the `aeroftp-vip-outside` IMDS tag; the ruleset `include`s it and uses
+   `snat to $vip_outside`; a baked placeholder keeps the include resolvable at
+   first boot; the keepalived init reloads nftables after aeropulse. REBAKE the
+   aeroscale AMI, then point `migrate_aeroftp_ingress_azb.sh` at it via NEW_AMI.
+
+STILL OPEN (parked, no action taken -- decide when convenient):
+- **autoscaling reachability from Backend-b.** aeroscale's runtime ASG calls
+  (`autoscaling.<region>.amazonaws.com` -- scaling + stale-lease cleanup) have
+  NO interface endpoint and Backend-b has NO NAT/IGW egress (rtb-backend default
+  -> Return GW only). aeroplug ENI-attach at boot uses only the EC2 endpoint
+  (present, SG allows /16) so boot is fine, but runtime autoscaling degrades.
+  Cheapest fix: add a `com.amazonaws.eu-west-2.autoscaling` interface endpoint
+  on the same SG (sg-0438c989d6fe0f276) + Backend-a/b subnets.
+- **endpoint SGs' broad `172.16.0.0/16` allow.** Both endpoint SGs
+  (sg-0438c989d6fe0f276 ec2/ecr/ssm; sg-096b2f00f8de6901a logs/secrets) currently
+  allow the whole VPC on 443, which is why the boot ENI-attach self-heals in any
+  subnet. If ever tightened to explicit CIDRs, KEEP at least 172.16.32.64/26
+  (aeroftp backend + LB inside/sync) and 172.16.54.0/24 (Backend-b).
+- **backend-mode FTP** path is reasoned-correct but NOT live-tested (fleet is
+  100% bypass today).
+
+----- earlier (2026-08-22) -----
+**Prior session:** Port-split scoping fix (bypass-mode
 device->backend) -- IN PROGRESS.
 
 THE GAP FOUND: the global service split (`ipsecnode_svcroute`, 8080->proxy pool,
@@ -2484,28 +2547,81 @@ whose reply-source is a removed member, e.g. `conntrack -D --reply-src
 untouched. Same coarse-vs-surgical choice exists on the LVS (ipsecscale) for VPN
 node removal. Low priority (scale-in is rare, re-create is cheap).
 
-### FTP PASV reply IP -- aeroftp Rust code
+### FTP PASV reply IP -- SOLVED (2026-08-23): nf_nat_ftp on the concentrator
 
-`nf_nat_ftp` rewrites the IP embedded in PASV responses to the address the
-kernel NAT layer sees as the post-SNAT source.  In our pipeline that is
-`global_ip` (after VPP SNAT), not `customer_view_ip`.  A device that
-strictly follows the PASV reply IP (rather than reusing the control-
-connection address as most modern clients do) will therefore try to open
-the FTP data connection to `global_ip:passive_port` instead of
-`customer_view_ip:passive_port` -- which may be blocked by the customer
-firewall.
+**Problem (three-hop PASV-IP chain):** a device reaches the FTP service at its
+per-site access_server `customer_view_ip` (e.g. 194.138.39.18). ipsecnode's
+per-site `bnat` DNATs that to the aeroftp LVS VIP (172.16.54.10). The aeroftp
+backend (unftp, `PassiveHost::FromConnection`) answers PASV with its slot IP
+(172.16.32.29); the aeroftp LVM (kernel `ip_vs_ftp` loaded) rewrites that to the
+VIP (172.16.54.10). At the concentrator the reverse-DNAT only fixes the L3
+packet source (VIP -> customer_view), NOT the 227 payload -- so the device saw a
+PASV IP (VIP) that mismatched its control-connection IP (customer_view) and
+aborted.
 
-**TODO:** Investigate whether the aeroftp load-balancer (sister project
-`~/software/aerosuite`) exposes a Rust-level hook to override the IP
-address written into PASV replies.  If it does, ipsecnode could supply
-`customer_view_ip` (looked up from the Valkey backend_nat record for the
-current site) to aeroftp so the PASV response carries the correct address
-from the device's perspective, making `nf_nat_ftp` unnecessary for this
-specific rewrite.
+**Fix (implemented in ipsecnode vpp.rs):** run the kernel `ftp` conntrack helper
++ `nf_nat_ftp` ON THE CONCENTRATOR, assigned to the port-21 control channel.
+Because the aeroftp LVM already normalised the embedded IP to the VIP (= the
+concentrator's reply-direction source for that conntrack), `nf_nat_ftp` accepts
+the 227 and rewrites the embedded IP to `ct ORIGINAL.dst` = the per-site
+`customer_view`, and installs the data-channel expectation. Zero hardcoding --
+the rewrite target is derived per-conntrack from the bnat DNAT ipsecnode already
+installs, so it is automatically correct for every customer's distinct
+access_server view.
 
-Entry point to look at: aeroftp's FTP proxy / ALG code in
-`~/software/aerosuite/aeroftp/src/` -- search for PASV handling or the
-place where the 227 response is constructed or forwarded.
+Key correctness points:
+- Works in BOTH `customer`/bypass AND `backend`/VPP-VRF modes, because the
+  `customer_view -> VIP` DNAT (`setup_site_bnat`) lives on `iifname xfrm-{hex}`
+  in both (called from `setup_site_bypass` AND `setup_site_vrf`). The helper
+  keys off that DEST DNAT, never the (VPP) source SNAT. The old worry below --
+  that the rewrite would land on `global_ip` -- only happens if the helper is
+  attached to the OUTSIDE/SNAT conntrack (vpp-outer/ens5); scoping it to the
+  xfrm ingress avoids it. (Backend mode is the double-kernel-pass hairpin;
+  scoping to `xfrm-{hex}` keeps the helper on the inside conntrack only. Not yet
+  live-tested in backend mode -- the fleet is 100% bypass today.)
+- The static `21/22 + 20000-49999 -> aeroftp VIP` splits are STILL REQUIRED and
+  unchanged: they IDENTIFY/steer which decapsulated packets go to the aeroftp
+  VIP (vs the default `customer_view -> real_ip` map / other backends). The
+  passive DATA SYN has dport in 20000-49999 (not 21), so without that split it
+  would fall through to the wrong backend. `nf_nat_ftp` does the orthogonal job
+  of rewriting the 227 payload IP; the two are complementary, not redundant.
+- FTPS is NOT used (encrypted control would defeat any ALG); SFTP (22) is
+  separate (SSH, no PASV) and gets no helper. Only port 21 is assigned.
+
+Implementation:
+- `_etc_modules-load.d_fleetnode.conf`: `nf_conntrack_ftp` + `nf_nat_ftp`
+  (already present; `vpp::init_nftables_bnat` also modprobes them best-effort).
+- `vpp::init_nftables_bnat`: declares the `ct helper` object `ftp_ctrl`
+  (`type "ftp" protocol tcp`) and the `helperpre` prerouting chain at
+  **`priority mangle` (-150)** -- see the CRITICAL priority note below.
+- `vpp::add_bnat_ftp_helper` (called from `setup_site_bnat`): per-site rule
+  `iifname xfrm-{hex} ip daddr <access_view> tcp dport 21 ct helper set ftp_ctrl`
+  (scoped per the PORT-SPLIT SCOPING CONTRACT -- sd/em never touched); handle
+  stored in `SiteBnatState.helper_handle`, removed in `teardown_site_bnat`.
+
+>>> CRITICAL: helper chain MUST be `priority mangle` (-150), NOT `raw` <<<
+First attempt used `priority raw` (-300) -- WRONG, and it cost a live debug
+session. Unlike the iptables `raw` `CT --helper` target (which allocates a
+TEMPLATE conntrack), nftables `ct helper set` assigns the helper to the
+ALREADY-EXISTING conntrack (`ct = nf_ct_get(skb); if (!ct) return;`). At `raw`
+(-300) -- before the conntrack hook (-200) -- there is no ct yet, so the
+statement is a SILENT NO-OP: `conntrack -L ... dport=21` shows NO `helper=ftp`,
+no `conntrack -L expect` entry, and the 227 is never rewritten (even though the
+reverse-DNAT of the L3 source still works, which is the misleading part). The
+chain must run AFTER conntrack creation (-200) but BEFORE dstnat (-100) so that
+(a) the ct exists and the helper actually attaches, and (b) `ip daddr` is still
+the pre-DNAT customer_view for the per-site match. `mangle` (-150) is the only
+named priority in that window. Prerouting order:
+  raw -300 | conntrack -200 | mangle -150 (helperpre) | dstnat -100 (split) | filter 0.
+DIAGNOSTIC that nailed it: `conntrack -L -p tcp | grep dport=21` had no
+`helper=ftp`; with `priority mangle` it appears and the 227 carries the
+customer_view. VALIDATED LIVE 2026-08-23.
+
+RELATED (separate, still open): the passive-FTP PASV-reply-IP concern only
+mattered when a client STRICTLY follows the PASV IP; that is exactly the case
+this fix addresses at the network layer, so the previously-proposed aeroftp
+Rust-level PassiveHost override is NO LONGER NEEDED and has been dropped.
+
 
 ### Passive-FTP data-port range routing + gateway reserved ports (2026-08-21)
 
@@ -2534,9 +2650,9 @@ fail. TWO coupled changes, do together:
    chosen mechanism when implementing. See fleetshell/fleetshell-gateway/Dockerfile
    and the matching entry in fleetshell/AGENTS.md.
 
-Cross-ref: the FTP PASV reply-IP TODO above is the related but SEPARATE issue
-(PASV embedded-IP rewrite); this one is passive-port RANGE routing + gateway
-reserved source ports.
+Cross-ref: the FTP PASV reply-IP item above (now SOLVED via nf_nat_ftp on the
+concentrator) is the related but SEPARATE concern (PASV embedded-IP rewrite);
+this one is passive-port RANGE routing + gateway reserved source ports.
 
 ### Backend membership + backend->device SNAT is static in ipsecnode.toml (2026-08-12)
 

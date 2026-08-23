@@ -29,6 +29,10 @@
 # Ports 21 and 22 (FTP control + SFTP) plus the passive-FTP data-port range
 # 20000-49999 are redirected to the aeroftp VIP (fixed). Passive data ports
 # come from aeroftp's net.ipv4.ip_local_reserved_ports = 20000-49999.
+#
+# The aeroftp ingress VIP lives in Backend-b (172.16.54.0/24, AZ-b) on
+# rtb-backend, so its replies to the device global_ip return via the Return
+# GW -- migrated by infrastructure/migrate_aeroftp_ingress_azb.sh.
 [backend.access_server]
 real_ip = "172.16.53.6"
 
@@ -38,18 +42,18 @@ pool  = "proxy"             # dynamic ECMP pool (fleetipsec:proxy:pool)
 
 [[backend.access_server.split]]
 ports   = [21, 22]
-dnat_to = "172.16.48.10"    # aeroftp LVS VIP (active AZ)
+dnat_to = "172.16.54.10"    # aeroftp LVS VIP (Backend-b, AZ-b)
 
 [[backend.access_server.split]]
 port_from = 20000           # passive-FTP data-port range -> the aeroftp VIP
 port_to   = 49999
-dnat_to   = "172.16.48.10"
+dnat_to   = "172.16.54.10"
 
 # Uncomment if non-RFC-conformant FTP clients use source port 20 for passive
 # data connections (see Open TODOs in AGENTS.md):
 # [[backend.access_server.split]]
 # src_ports = [20]
-# dnat_to   = "172.16.48.10"
+# dnat_to   = "172.16.54.10"
 
 # -- Software-distribution server ---------------------------------------------
 [backend.sd_server]
