@@ -385,7 +385,7 @@ pub struct ChildUpdownEvent {
 /// `_keep_alive` is the VICI event Client.  It MUST be kept in scope here --
 /// dropping it aborts the internal Listener task and the stream ends.
 pub async fn event_listener_task(
-	_keep_alive:   Client,
+	mut keep_alive: Client,
 	stream:        impl futures_util::Stream<Item = Result<ViciRawValue, rsvici::Error>>,
 	valkey_client: redis::Client,
 	vpp_state:     Option<crate::vpp::VppState>,
@@ -406,6 +406,43 @@ pub async fn event_listener_task(
 	let mut route_cache = crate::nat::RouteCache::new();
 	let mut vpp_cache   = crate::vpp::VrfCache::new();
 	let mut vrf_alloc   = crate::vpp::VrfAllocator::new();
+
+	// ── Startup reconciliation (Increment 6g phase 2b) ──────────────────────
+	// vpp::init()'s cleanup_stale_state() tears down ALL per-site data plane at
+	// startup (deletes every VPP tap, the ipsecnode/bnat nft tables, the prio
+	// 100/200 rules), so right now every tunnel that survived the restart has NO
+	// data plane -- and child-updown only fires on TRANSITIONS, so no UP event
+	// comes to rebuild it. We therefore REBUILD it from charon's live SA list by
+	// replaying the full on_child_up (nat + vpp) for each live CHILD_SA. This is
+	// mode-independent (customer/bypass AND backend/VPP) and safe PRECISELY
+	// because cleanup already removed the prior state: setup_site_bypass/
+	// setup_site_vrf recreate from scratch and cannot corrupt a live data plane
+	// (there is none). It also upgrades the blackhole /32 that nat::on_child_up
+	// installs into the real dev route -- otherwise live tunnels are left
+	// blackholed (device->/backend-> traffic dropped).
+	//
+	// Then GC any NAT-level /32 route (blackhole or dev) with no live tunnel
+	// (left by an earlier up->restart->down whose DOWN cleanup was lost), and
+	// reconcile active_globals to exactly the live set in one atomic transaction.
+	// Remaining TODO (both modes): a data-plane GC for orphaned VPP taps/VRFs and
+	// bnat elements -- inert while a site is down, cleared on re-establish/boot.
+	let established = crate::vici::list_established_peers(&mut keep_alive).await;
+	if established.is_empty() {
+		info!("startup reconcile: no live CHILD_SAs");
+	} else {
+		info!(child_sas = established.len(),
+		      "startup reconcile: rebuilding per-site state from live SAs");
+		for peer in &established {
+			crate::nat::on_child_up(&mut valkey_conn, peer, &mut route_cache).await;
+			if let Some(state) = vpp_state.as_ref() {
+				crate::vpp::on_child_up(&mut valkey_conn, peer, state, &mut vpp_cache, &mut vrf_alloc).await;
+			}
+		}
+	}
+	let live = crate::nat::cached_global_ips(&route_cache);
+	crate::nat::gc_stale_routes(&live).await;
+	crate::ondemand::replace_active_globals(&live).await;
+
 
 	pin_mut!(stream);
 
@@ -573,6 +610,34 @@ pub async fn initiate_child(client: &mut Client, child: &str, timeout_ms: u32) -
 		.context("VICI initiate request failed")?;
 
 	res.into_result("initiate")
+}
+
+/// Enumerate the peers of currently-established CHILD_SAs via `list-sas`.
+/// Returns one peer_ip per INSTALLED child SA (repeats for multi-child sites),
+/// so a startup reconcile can rebuild per-site refcounts to match charon.
+pub async fn list_established_peers(client: &mut Client) -> Vec<String> {
+	let empty: HashMap<String, String> = HashMap::new();
+	let stream = client.stream_request::<_, ViciRawValue>("list-sas", "list-sa", empty);
+	pin_mut!(stream);
+	let mut peers = Vec::new();
+	loop {
+		match stream.try_next().await {
+			Ok(Some(raw)) => {
+				let Some(ike) = find_ike_section(&raw) else { continue };
+				let Some(peer) = ike.get("remote-host").and_then(|h| h.as_str()) else { continue };
+				if let Some(ViciRawValue::Section(children)) = ike.get("child-sas") {
+					for child in children.values() {
+						if child.get("state").and_then(|s| s.as_str()) == Some("INSTALLED") {
+							peers.push(peer.to_string());
+						}
+					}
+				}
+			}
+			Ok(None) => break,
+			Err(e)   => { warn!("VICI list-sas stream error: {e}"); break; }
+		}
+	}
+	peers
 }
 
 // ── load-conn types ───────────────────────────────────────────────────────────

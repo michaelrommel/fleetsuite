@@ -119,6 +119,54 @@ pub struct PeerRouteState {
 /// Owned by `event_listener_task`; not shared across threads.
 pub type RouteCache = HashMap<String, PeerRouteState>;
 
+/// All global_ips currently tracked as UP across every peer in the cache.
+/// Used at startup to reconcile the on-demand `active_globals` set to exactly
+/// the live tunnels (Increment 6g phase 2b).
+pub fn cached_global_ips(cache: &RouteCache) -> std::collections::HashSet<String> {
+	cache.values().flat_map(|s| s.global_ips.iter().cloned()).collect()
+}
+
+/// Remove NAT-managed /32 routes (blackhole placeholders, or `dev xfrm-*` /
+/// `dev vpp-outer` device routes) whose global_ip is NOT in `live`.  Cleans
+/// routes left by a prior process for tunnels that are now down -- e.g. an
+/// up->restart->down where the DOWN cleanup was lost (Increment 6g phase 2b
+/// startup GC).  Conservative: matches only the ipsecnode route shapes and only
+/// host (/32) routes, so it never touches default/connected/management routes.
+pub async fn gc_stale_routes(live: &std::collections::HashSet<String>) {
+	let out = match tokio::process::Command::new("ip").args(["-o", "route", "show"]).output().await {
+		Ok(o) if o.status.success() => o.stdout,
+		Ok(o)  => { warn!("route GC: `ip route show` failed: {}", String::from_utf8_lossy(&o.stderr).trim()); return; }
+		Err(e) => { warn!("route GC: spawn `ip route show` failed: {e}"); return; }
+	};
+	let text = String::from_utf8_lossy(&out);
+	for line in text.lines() {
+		let toks: Vec<&str> = line.split_whitespace().collect();
+		// The dest of an ipsecnode-managed /32: `blackhole <ip>` OR `<ip> dev
+		// (xfrm-*|vpp-outer)`.  Per-site taps (dev vpp-<hex>) and `local` entries
+		// are intentionally NOT matched.
+		let dest = if toks.first() == Some(&"blackhole") {
+			toks.get(1).copied()
+		} else {
+			match toks.iter().position(|t| *t == "dev").and_then(|i| toks.get(i + 1)).copied() {
+				Some(d) if d.starts_with("xfrm-") || d == "vpp-outer" => toks.first().copied(),
+				_ => None,
+			}
+		};
+		let Some(dest) = dest else { continue };
+		// Host routes print bare; reject anything with a non-/32 prefix (connected).
+		let ip = match dest.split_once('/') {
+			None            => dest,
+			Some((a, "32")) => a,
+			Some(_)         => continue,
+		};
+		if ip.parse::<std::net::Ipv4Addr>().is_err() || live.contains(ip) { continue; }
+		match route_del(ip).await {
+			Ok(())  => info!(global_ip = ip, "route GC: removed stale /32 (no live tunnel)"),
+			Err(e)  => warn!(global_ip = ip, "route GC: remove failed: {e:#}"),
+		}
+	}
+}
+
 // ── Valkey helper ─────────────────────────────────────────────────────────────
 
 /// Fetch and deserialize the NAT record for `peer_ip` from Valkey.

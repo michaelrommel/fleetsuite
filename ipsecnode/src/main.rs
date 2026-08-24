@@ -198,11 +198,16 @@ async fn main() -> Result<()> {
 	// initiates CHILD_SAs for backend-initiated flows to down tunnels.
 	if ondemand_ready {
 		let owner = ondemand::OwnerMode::from_env();
-		info!(?owner, "spawning on-demand bring-up task");
+		let my_ip = aws::local_ipv4().await;
+		if matches!(owner, ondemand::OwnerMode::Jhash) && my_ip.is_none() {
+			warn!("on-demand jhash mode but local IP unknown (IMDS) -- degrading to any-node initiate");
+		}
+		info!(?owner, my_ip = ?my_ip, "spawning on-demand bring-up task");
 		tokio::spawn(ondemand::ondemand_task(
 			args.vici_socket.clone(),
 			valkey_client.clone(),
 			owner,
+			my_ip,
 		));
 	}
 

@@ -44,6 +44,14 @@ pub async fn fetch_vip_public_ip(region: &str, name_tag: &str) -> Option<String>
 	extract_scalar(&xml, "publicIp").map(str::to_string)
 }
 
+/// This node's primary private IPv4 (IMDS local-ipv4) -- its identity in the LVS
+/// jhash pool (the DNAT target the LVS map holds for this node).  Used by the
+/// on-demand owner selection (Increment 6g phase 2b) to decide "am I the owner?".
+pub async fn local_ipv4() -> Option<String> {
+	let token = fetch_imds_token().await.ok()?;
+	fetch_imds_path(&token, "local-ipv4").await.ok().map(|s| s.trim().to_string())
+}
+
 /// Discover the eth0 ENI ID from IMDS and disable its src/dest check.
 /// Returns the ENI ID on success for logging.
 pub async fn disable_src_dest_check(region: &str) -> Result<String> {

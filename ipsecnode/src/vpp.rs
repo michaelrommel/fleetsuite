@@ -541,11 +541,13 @@ async fn modprobe(module: &str) -> Result<()> {
 }
 
 // NOTE: the old `init_nftables_svcroute` (global port splits on vpp-outer) was
-// removed. The whole fleet is customer/bypass mode, which never traverses
-// vpp-outer, so those rules never fired; the port splits now live in the
-// per-site bnat split chain (access_server-scoped -- see setup_site_bnat and
-// AGENTS "PORT-SPLIT SCOPING CONTRACT"). cleanup_stale_state() still deletes any
-// leftover ipsecnode_svcroute table so an upgraded-in-place node self-heals.
+// removed. Bypass mode (customer NAT) forwards decapsulated traffic straight out
+// ens5 and never traverses vpp-outer, so those global rules only ever applied to
+// backend/VPP-VRF-mode traffic -- and even there they were global-by-port with
+// the sd/em scoping problem. The port splits now live in the per-site bnat split
+// chain (access_server-scoped -- see setup_site_bnat and AGENTS "PORT-SPLIT
+// SCOPING CONTRACT"). cleanup_stale_state() still deletes any leftover
+// ipsecnode_svcroute table so an upgraded-in-place node self-heals.
 // TODO(backend-mode): if the VPP-VRF ('backend') path is ever used, it needs its
 // own port splits on vpp-outer scoped by real_ip (the post-SNAT dst), not the
 // old global-by-port rules.
@@ -858,7 +860,12 @@ async fn setup_site_vrf(
 	let xfrm_if = xfrm_if_name(if_id);
 
 	// 1. VPP fib table for this site.
-	vppctl(&["ip", "table", "add", &vrf_str]).await.context("VPP ip table add")?;
+	// `ip table add` is idempotent here: on an in-place restart the VPP fib table
+	// can outlive cleanup_stale_state (which deletes taps, not tables), so tolerate
+	// "already exists" -- a genuinely-down VPP surfaces on the next vppctl call.
+	if let Err(e) = vppctl(&["ip", "table", "add", &vrf_str]).await {
+		debug!(vrf = %vrf_str, "VPP ip table add tolerated (may already exist): {e:#}");
+	}
 
 	// 2. Per-site inside tap in the site VRF.
 	//    VRF assignment must precede NAT interface assignment.
@@ -938,6 +945,8 @@ async fn setup_site_vrf(
 	//     The more-specific internal_ip/32 route (installed above by
 	//     install_device_nat) still wins for the forward o2i direction, so
 	//     device-initiated traffic is unaffected.
+	//     del-then-add for the same fib-survives-cleanup reason as above.
+	let _ = vppctl(&["ip", "route", "del", "0.0.0.0/0", "table", &vrf_str]).await;
 	if let Err(e) = vppctl(&["ip", "route", "add", "0.0.0.0/0", "table", &vrf_str,
 	                        "via", "lookup", "in", "table", "0"]).await {
 		warn!(peer_ip, vrf = if_id,
@@ -1072,8 +1081,7 @@ async fn teardown_site_bypass(peer_ip: &str, site: &SiteVrfState) {
 	for d in &site.devices {
 		// Revert to blackhole so nat::on_child_down then deletes it (mirrors the
 		// VRF path's remove_device_nat).
-		ip_warn(&["route", "replace", &format!("{}/32", d.global_ip),
-		          "type", "blackhole"]).await;
+		ip_warn(&["route", "replace", "blackhole", &format!("{}/32", d.global_ip)]).await;
 	}
 	info!(peer_ip, vrf = site.if_id, "VPP bypass: customer-mode site torn down");
 }
@@ -1081,8 +1089,7 @@ async fn teardown_site_bypass(peer_ip: &str, site: &SiteVrfState) {
 /// Best-effort route cleanup after a partial setup_site_bypass failure.
 async fn teardown_site_bypass_routes(_if_id: u32, record: &NatRecord) {
 	for entry in &record.device_nat {
-		ip_warn(&["route", "replace", &format!("{}/32", entry.global_ip),
-		          "type", "blackhole"]).await;
+		ip_warn(&["route", "replace", "blackhole", &format!("{}/32", entry.global_ip)]).await;
 	}
 }
 
@@ -1467,8 +1474,14 @@ async fn install_device_nat(
 	]).await.context("VPP nat44 add static mapping")?;
 
 	// Explicit FIB route so VPP can forward the DNAT'd return packet
-	// (dst=internal_ip) to the kernel via the per-site tap.
-	// Without this VPP has no route for internal_ip in the VRF and drops it.
+	// (dst=internal_ip) to the kernel via the per-site tap.  del-then-add: the
+	// VPP fib table OUTLIVES cleanup_stale_state (which deletes taps + nat state
+	// but NOT fib tables), so a route left by a prior process can survive here,
+	// and a bare `ip route add` would APPEND a second, UNRESOLVED ECMP path (via
+	// the deleted old tap, sometimes even another site's tap IP), turning the
+	// route into a dpo-drop.  Deleting first keeps exactly one clean, resolvable
+	// path.  Without this VPP has no usable route for internal_ip and drops it.
+	let _ = vppctl(&["ip", "route", "del", &format!("{internal_ip}/32"), "table", vrf_str]).await;
 	vppctl(&[
 		"ip", "route", "add",
 		&format!("{internal_ip}/32"),
@@ -1484,7 +1497,7 @@ async fn install_device_nat(
 
 async fn remove_device_nat(vrf_str: &str, internal_ip: &str, global_ip: &str) {
 	// Revert to blackhole; nat::on_child_down will then delete it.
-	ip_warn(&["route", "replace", &format!("{global_ip}/32"), "type", "blackhole"]).await;
+	ip_warn(&["route", "replace", "blackhole", &format!("{global_ip}/32")]).await;
 	// Remove explicit FIB route for internal_ip.
 	if let Err(e) = vppctl(&[
 		"ip", "route", "del",
