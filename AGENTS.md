@@ -8,7 +8,194 @@ authoritative reference for a new agent session picking up this work.
 
 ## Next Session Starting Point  <<<  READ THIS FIRST
 
-**Last completed session (2026-08-23):** aeroftp FTP backend integration into the
+>>> CROSS-CUTTING DIRECTIVE (supersedes older phrasing): ALWAYS consider BOTH
+data paths -- `customer`/bypass (customer does the NAT; unique global_ip off the
+tunnel; no VPP) AND `backend`/VPP-nat44 (per-site VPP VRF/tap). Do NOT assume the
+fleet is 100% bypass. Where a fix differs per mode, handle and describe both. Any
+older "the whole fleet is customer/bypass" statements below are historical
+context, not a licence to skip the backend path. <<<
+
+**Last completed session (2026-08-24):** Increment 6g PHASE 2 -- on-demand
+backend->device tunnel bring-up -- BUILT end-to-end (approach a + b), plus five
+fixes found during the live break-test. All COMMITTED, NOT in any AMI yet.
+Binaries rebuilt: musl `ipsecnode` + `ipsecscale`; new shared code in `ipseccore`.
+
+ARCHITECTURE (mechanism b from the phase-2 plan, both owner modes shipped behind
+a toggle so we can A/B in place):
+
+1. **STAGE 1 -- attraction (P1) + infra egress protection. Config only, VALIDATED
+   LIVE.** Customer global_ips are scattered across almost the whole IPv4 space
+   (legacy allocation), so instead of enumerating them we advertise the
+   COMPLEMENT of our protected nets: everything EXCEPT 172.16.0.0/16 (this VPC),
+   10.183.0.0/16 (future AWS base) and 169.254.0.0/16 (link-local: IMDS + Amazon
+   Time Sync). That collapses to a fixed **39 aggregate prefixes** (compute with
+   `python3 ipaddress.address_exclude`). Advertised from EVERY concentrator so
+   the Return GW ECMPs a DOWN-tunnel global_ip to some concentrator; the UP
+   tunnel's more-specific /32 still wins.
+   - `aerobake/fleetnode/_etc_frr_frr.conf`: originate via `no bgp network
+     import-check` + `network <cidr>` (39) with **NO `Null0`** -- so the
+     concentrator never installs a covering drop in its OWN FIB and its own
+     EC2-API/egress is never blackholed. `EXPORT-CUSTOMER permit 20` +
+     `CUSTOMER-AGGREGATES` prefix-list pass them outbound. 198.51.100.0/24 kept
+     at seq 5 as the dev/test range.
+   - `aerobake/fleetroute/_etc_frr_frr.conf`: `ACCEPT-CUSTOMER permit 20` +
+     `CUSTOMER-AGGREGATES` (accept the 39), `maximum-paths 16` (ECMP the shared
+     aggregate across the pool; /32s are per-owner and unaffected).
+   - SELF/TRANSIT EGRESS SEPARATION on the Return GW (CRITICAL, blast radius):
+     a near-0/0 aggregate in `main` would hijack the Return GW's OWN outbound
+     internet (fleetpulse's EC2 API call on VRRP failover, via the NAT GW). FIRST
+     TRY was a zebra `ip protocol bgp route-map SET-TRANSIT { set table 100 }` +
+     `ip rule iif eth0 lookup 100` -- **this FRR build IGNORES `set table`** (all
+     BGP routes stayed in `main`; `ip route get 52.94.1.1` went out eth3 to a
+     concentrator). FALLBACK (shipped): keep the aggregates in `main` (they
+     forward transit) and push the Return GW's OWN locally-generated traffic to a
+     clean table via `iif lo`. In `aerobake/fleetroute/_etc_init.d_keepalived`
+     step 8b: table 250 = `169.254.0.0/16 dev eth0 scope link` + `default via
+     <eth0-gw> dev eth0`, and `ip rule add iif lo lookup 250 prio 105`. BGP/VRRP/
+     ipip self-traffic is to 172.16.x (excluded) and already pinned by the
+     existing source rules 201/202, so untouched. VALIDATED: `ip route get
+     52.94.1.1` -> NAT GW; `ip route get <gip> iif eth0 from <backend>` ->
+     concentrator. Apply on BOTH LVMs (both hold the aggregates).
+
+2. **STAGE 2a -- NFQUEUE on-demand initiate (approach a = any node).** New
+   `ipsecnode/src/ondemand.rs` + `nfq` crate (pure-Rust, clean musl static).
+   nft table `ipsecnode_ondemand` (created at runtime in `ondemand::init_nftables`,
+   NOT the static AMI file): mangle-prerouting rule `iifname "ens5" ip daddr !=
+   {172.16/16,10.183/16,169.254/16} ip daddr != @active_globals ct state new
+   queue num 0 bypass`. A blocking nfq reader thread DROPs the packet and hands
+   the dst to an async task: reverse-map global_ip->peer_ip, dedup (30s), VICI
+   **initiate the CHILD** `site-<peer>` (not just the IKE -- else no child-updown,
+   no data plane). Reverse map = `HGET systems:by-ip:<global_ip> gw` (reuses the
+   fleetshell device hash; the spooler must emit a `gw` field = customer gateway
+   public IP; SEED MANUALLY until it ships). `active_globals` set is maintained
+   on child up/down (mode-independent, in nat.rs).
+   BREAK-TEST PROVEN (N=2, LVM map `{0:172.16.49.73, 1:172.16.50.8}`): approach a
+   builds the tunnel on the ECMP-caught node (often the NON-owner); it survives
+   ONLY while LVS conntrack pins the customer to that node. After `conntrack -F`
+   on the LVM + VRRP failover + tearing down the SA, the device's re-init HANGS
+   half-open (a stale LVS conntrack tuple -- concentrator-initiated reply
+   `cust:500<->VIP:500` == customer-initiated orig -- hijacks it to the dead
+   node), and once conntrack is fully cleared the fresh jhash lands it on the
+   TRUE owner (a DIFFERENT node). This is exactly why (b) is needed.
+
+3. **STAGE 2b -- jhash owner selection (the fix).** Initiate from the
+   jhash(customer_ip) owner so conntrack and jhash never diverge.
+   - `ipseccore`: `jhash_ipv4` (kernel-exact Jenkins lookup3 over the 4 IPv4
+     bytes, seed `JHASH_SEED_U32 = 0xA5A5_A5A5`), `owner_index`, `owner_of`,
+     `LvsRing{seed,nodes}`, `LVSRING_KEY = "fleetipsec:lvsring"`.
+   - >>> CRITICAL nftables gotcha (cost a debug round): `jhash ... mod N` is NOT
+     `hash % N`. The kernel (`nft_jhash_eval`) reduces with
+     `reciprocal_scale(hash, N) = (hash * N) >> 32`. For N=2 that is the TOP BIT
+     of the hash. Using `% N` disagrees with the LVS. VALIDATED empirically: all
+     four test sites (62.238.96.148, 62.238.110.152, 185.174.105.25,
+     185.17.205.91) have jhash < 2^31 -> top bit 0 -> index 0 -> 172.16.49.73
+     (matches the observed landings). Unit test `jhash_matches_kernel_lvs` locks
+     this in. <<<
+   - `ipsecscale`: publishes `fleetipsec:lvsring = {seed, nodes:[sorted ips]}`
+     when the VPN pool changes (`publish_lvsring`, in `reconcile_vpn_nat`'s
+     caller). ZERO extra ASG queries -- reuses the describe it already does every
+     RECONCILE_INTERVAL_SECS (default 15s) on BOTH LVMs; JSON is deterministic so
+     both writing it is idempotent (no master-only gating). This is also MORE
+     correct than ipsecnode self-describing: it matches what the LVS map actually
+     installed, so the initiate target == the LVS routing target.
+   - `ipsecnode` (`OwnerMode::Jhash`): reads the ring (initial GET + 30s refresh,
+     no AWS), reads its own pool IP once via `aws::local_ipv4()` (IMDS), computes
+     owner. Self -> initiate; not self -> `PUBLISH fleetipsec:initiate {owner,
+     peer}` and every node subscribes + initiates when addressed. Degrades to
+     local-initiate if ring absent / IP unknown / peer unparseable.
+   - TOGGLE: `IPSECNODE_ONDEMAND_OWNER=jhash` (default `any` = approach a);
+     `IPSECNODE_ONDEMAND=0` disables the whole feature. A/B without rebuild.
+   - DEBUG TOOL: `ipseccore/examples/jhash` (static musl binary at
+     `target/x86_64-unknown-linux-musl/release/examples/jhash`): prints jhash,
+     the nft-probe MARK (= jhash-1), reciprocal_scale index, and owner. Kernel
+     cross-check via a throwaway nft rule: `meta mark set jhash ip daddr mod
+     4294967295 seed 0xa5a5a5a5 log flags all` then ping the IP -> `MARK = jhash
+     - 1` (reciprocal_scale over 2^32-1). Hash `ip daddr` + ping (you can't spoof
+     saddr on the box; jhash is over the 4 bytes either way).
+
+4. **STARTUP RECONCILE <-> cleanup_stale_state (CRITICAL relationship).**
+   `vpp::init()`'s `cleanup_stale_state()` tears down ALL per-site data plane at
+   EVERY ipsecnode restart (deletes every VPP tap, the ipsecnode/bnat nft tables,
+   the prio-100/200 ip rules). child-updown fires only on TRANSITIONS, so a
+   tunnel that survived the restart gets NO UP event -> its data plane is gone
+   and unrebuilt, AND its later DOWN can't clean up (empty caches) -> stale
+   blackhole/xfrm routes + stale active_globals that SUPPRESS on-demand.
+   FIX (in `vici::event_listener_task`, before the event loop): enumerate live
+   SAs via `vici::list_established_peers` (VICI `list-sas`, one entry per
+   INSTALLED child) and REPLAY THE FULL `on_child_up` (nat + vpp) for each --
+   BOTH modes. This upgrades the `blackhole /32` that `nat::on_child_up` installs
+   into the real `dev` route and rebuilds taps/bnat. It is safe PRECISELY because
+   cleanup already removed the prior state (nothing live to corrupt) -- so
+   `setup_site_vrf` recreates from scratch (`ip table add` made idempotent for
+   the case where the VPP fib table outlives cleanup).
+   >>> LESSON (a regression I shipped and reverted): a NAT-ONLY reconcile that
+   runs `nat::on_child_up` (blackhole) but SKIPS the mode-specific
+   setup_site_bypass/vrf DOWNGRADES live routes to blackhole (device/backend
+   traffic dropped). The blackhole is only ever a placeholder; the mode setup
+   MUST run to replace it. <<<
+   Also added: `nat::gc_stale_routes(live)` -- startup GC that removes
+   NAT-managed /32 routes (blackhole, or `dev xfrm-*`/`vpp-outer`) with no live
+   tunnel (host-routes only, conservative); and `ondemand::replace_active_globals`
+   -- atomic `flush set; add {live}` in ONE `nft -f` transaction (never empties
+   the set, so active clients are undisturbed) reconciling active_globals to
+   exactly the live tunnels.
+
+5. **`interfaces_use = ens5` in charon (`aerobake/fleetnode/_etc_strongswan.d_charon.conf`).**
+   When a backend/VPP-mode site is UP (its per-site tap `vpp-<hex>`, e.g.
+   10.127.0.2, exists) and the node INITIATES IKE to ANOTHER site, strongswan's
+   `%any` source selection can bind a VPP TAP IP as the IKE source -> the packet
+   egresses ens5 with a bogus src, never reaches the LVS, field gateway sees
+   nothing (symptom: `swanctl --initiate` retransmits `from 10.127.0.2[500]`).
+   `ip route get <customer>` is CORRECT (.73); it's strongswan choosing a tap
+   address from its candidate list. FIX: restrict charon to the outer NIC. XFRM
+   state/policy is if_id-based and unaffected; IKE always arrives on ens5 via the
+   LVS, so the responder path is fine. This is a backend+initiate COEXISTENCE bug
+   -- invisible in the earlier bypass-only P2 tests.
+
+DEPLOY (all committed, NOT in any AMI):
+- CONFIG (no rebuild): `aerobake/fleetnode/_etc_frr_frr.conf`,
+  `aerobake/fleetroute/_etc_frr_frr.conf`,
+  `aerobake/fleetroute/_etc_init.d_keepalived` (table 250),
+  `aerobake/fleetnode/_etc_strongswan.d_charon.conf` (interfaces_use). Apply on
+  BOTH concentrators and BOTH Return GWs; bake into fleetnode/fleetroute AMIs.
+- BINARIES (musl): `ipsecnode` (fleetnode), `ipsecscale` (fleetscale). `ipseccore`
+  is a lib pulled into both.
+- VALKEY: `HSET systems:by-ip:<global_ip> gw <peer_ip>` per device (spooler TODO).
+- LVS SG must already allow 6379 to MemoryDB for ipsecscale to write the ring
+  (same as the proxy pool key -- make_lvs_valkey_access.sh).
+
+STILL OPEN / FOLLOW-UPS (parked):
+- **VPP per-site FIB routes survive `cleanup_stale_state`** (which deletes taps +
+  nat state but NOT VPP `ip table`s), so across an in-place restart a stale
+  `internal_ip/32` route lingers in the site VRF; a bare `ip route add` then
+  APPENDS a second UNRESOLVED ECMP path (via the deleted old tap, sometimes
+  another site's tap IP) -> the route becomes `dpo-drop` and backend->device
+  silently dies (translation still shows in `nat44 sessions`; nothing egresses
+  the tap). FIXED in `install_device_nat` + step 9b via del-then-add (one clean
+  path). Diagnose with `vppctl show ip fib table <u32(peer)> <internal_ip>/32`
+  (want ONE resolved path via the kern tap IP). STILL a GC target: a DOWN
+  backend site's stale fib route/table is not cleaned until re-setup.
+- **Data-plane GC** for orphaned VPP taps/VRFs/fib-routes + bnat elements after an
+  in-place restart (the reconcile GCs routes + active_globals; taps/bnat/VPP-fib
+  are inert while a site is down and self-heal on re-establish, but a proper GC
+  pass should drop artifacts with no matching live SA). Both modes.
+- **SNAT tuple-collision** conntrack flush on direction change: with (b) the
+  routing is correct (same node) so it's benign, but a single-initiator discipline
+  + targeted LVS conntrack flush is the robustness follow-up.
+- **fleetshell spooler** must emit `systems:by-ip:<gip>.gw` (customer gateway
+  public IP). Manual seed for now.
+- **Production complement**: replace the 39-prefix complement with the reduced
+  real customer global_ip ranges (est. 50-100 CIDRs) once known; KEEP the 3
+  protected exclusions. Infra protection is by ROUTING SEPARATION (concentrator
+  no-import-check; Return GW iif-lo table 250), NOT by advertised carve-outs, so
+  the block breadth is decoupled from self-egress -- do not add AWS-range carve-outs.
+- **Live-validate jhash** before trusting `=jhash` on a new pool: run the probe /
+  the `jhash` example; the unit test enforces the reciprocal_scale reduction.
+- The increment-list "6g phase 2 -- IN PROGRESS" entry (Build Order step 6) is
+  SUPERSEDED by this block.
+
+----- earlier (2026-08-23) -----
+**Prior session:** aeroftp FTP backend integration into the
 IPSec concept -- three things, all COMMITTED and being baked.
 
 1. **FTP PASV/227 rewrite -- DONE, VALIDATED LIVE.** A device reaches the FTP
