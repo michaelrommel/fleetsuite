@@ -324,6 +324,19 @@ async fn reconcile_vpn_nat(
 	Ok(Some(vpn_ips))
 }
 
+/// Publish the concentrator jhash ring (Increment 6g phase 2b) to Valkey so
+/// ipsecnode can pick the on-demand initiate owner that matches the LVS map.
+/// The value is deterministic (sorted `nodes` + fixed seed), so both LVMs
+/// writing it is idempotent -- no master-only gating needed.
+async fn publish_lvsring(conn: &mut redis::aio::ConnectionManager, nodes: &[String]) -> Result<()> {
+	let ring = ipseccore::LvsRing::new(nodes.to_vec());
+	let json = serde_json::to_string(&ring).context("serialize LvsRing")?;
+	let _: () = conn.set(ipseccore::LVSRING_KEY, &json).await
+		.with_context(|| format!("SET {}", ipseccore::LVSRING_KEY))?;
+	info!(key = ipseccore::LVSRING_KEY, nodes = nodes.len(), "lvsring published");
+	Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -381,7 +394,16 @@ async fn main() -> Result<()> {
 				// exactly what the EIP targets once this node is promoted.
 				if !args.no_vpn_nat {
 					match reconcile_vpn_nat(&args, &last_vpn, &creds).await {
-						Ok(Some(set)) => last_vpn = Some(set),
+						Ok(Some(set)) => {
+							// Publish the ring (same sorted vpn_ips that produced the
+							// LVS map) so ipsecnode picks the on-demand initiate owner
+							// that matches this node's routing. Idempotent + deterministic,
+							// so both LVMs writing identical JSON is harmless.
+							if let Err(e) = publish_lvsring(&mut conn, &set).await {
+								warn!("lvsring publish failed: {e:#}");
+							}
+							last_vpn = Some(set);
+						}
 						Ok(None)      => {}
 						Err(e)        => warn!("VPN-NAT reconcile failed: {e:#}"),
 					}
