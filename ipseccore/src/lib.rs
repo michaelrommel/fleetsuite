@@ -11,9 +11,22 @@
 //! splits across nodes (Architecture Decision #1) -- the renderer lives here,
 //! in one place both depend on. Do NOT duplicate it.
 
+use std::net::Ipv4Addr;
+
+use serde::{Deserialize, Serialize};
+
 /// Fixed jhash seed shared by all three PREROUTING rules. Changing this splits
 /// every in-flight tunnel across nodes at the next rehash; never vary it per rule.
 pub const JHASH_SEED: &str = "0xa5a5a5a5";
+
+/// Numeric form of JHASH_SEED, for computing the jhash owner in Rust (Increment
+/// 6g phase 2b).  MUST equal the value in the JHASH_SEED nft string above.
+pub const JHASH_SEED_U32: u32 = 0xA5A5_A5A5;
+
+/// Valkey key holding the current LVS jhash ring: produced by ipsecscale when
+/// the VPN pool changes, consumed by ipsecnode to pick the on-demand initiate
+/// owner so it matches the node the LVS map routes that customer to.
+pub const LVSRING_KEY: &str = "fleetipsec:lvsring";
 
 /// VPN concentrator subnets whose return traffic is SNAT'd out eth0.
 pub const VPN_SUBNETS: &str = "172.16.49.0/24, 172.16.50.0/24";
@@ -77,4 +90,106 @@ pub fn render_ipsec_nat(instance_id: &str, secondary_ip: &str, vpn_ips: &[String
 	out.push_str("}\n");
 
 	out
+}
+
+// ── LVS jhash ring (Increment 6g phase 2b) ──────────────────────────────────────
+
+/// The concentrator pool ring exactly as installed in the LVS `ip nat` map:
+/// `nodes[i]` is the DNAT target for jhash index `i`.  Serialised to LVSRING_KEY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LvsRing {
+	/// jhash seed in the nft string form (documentation / cross-check).
+	pub seed:  String,
+	/// Numerically-sorted concentrator IPs; index == jhash map key.
+	pub nodes: Vec<String>,
+}
+
+impl LvsRing {
+	pub fn new(nodes: Vec<String>) -> Self {
+		LvsRing { seed: JHASH_SEED.to_string(), nodes }
+	}
+}
+
+// ── Kernel-exact jhash for `jhash ip saddr mod N seed <initval>` ────────────────
+//
+// Bit-exact reimplementation of the Linux jhash used by nftables' `jhash`
+// expression, so ipsecnode can compute the SAME node the LVS map routes a
+// customer to.  See include/linux/jhash.h (Bob Jenkins lookup3).
+
+const JHASH_INITVAL: u32 = 0xdead_beef;
+
+#[inline]
+fn jhash_final(mut a: u32, mut b: u32, mut c: u32) -> u32 {
+	c ^= b; c = c.wrapping_sub(b.rotate_left(14));
+	a ^= c; a = a.wrapping_sub(c.rotate_left(11));
+	b ^= a; b = b.wrapping_sub(a.rotate_left(25));
+	c ^= b; c = c.wrapping_sub(b.rotate_left(16));
+	a ^= c; a = a.wrapping_sub(c.rotate_left(4));
+	b ^= a; b = b.wrapping_sub(a.rotate_left(14));
+	c ^= b; c = c.wrapping_sub(b.rotate_left(24));
+	c
+}
+
+/// `jhash(key, 4, initval)` for a 4-byte IPv4 address in network byte order --
+/// exactly what nftables computes for `jhash ip saddr ... seed <initval>`.
+/// Length is 4, so only `a` accumulates the tail bytes (jhash.h switch fallthrough).
+pub fn jhash_ipv4(ip: Ipv4Addr, initval: u32) -> u32 {
+	let k = ip.octets(); // network order: k[0] = first octet
+	let init = JHASH_INITVAL.wrapping_add(4).wrapping_add(initval);
+	let (mut a, b, c) = (init, init, init);
+	a = a.wrapping_add((k[3] as u32) << 24);
+	a = a.wrapping_add((k[2] as u32) << 16);
+	a = a.wrapping_add((k[1] as u32) << 8);
+	a = a.wrapping_add(k[0] as u32);
+	jhash_final(a, b, c)
+}
+
+/// jhash map index for `ip` across `n` nodes (n > 0), using the fixed fleet seed.
+/// Matches `jhash ip saddr mod n seed JHASH_SEED` in the LVS PREROUTING rules.
+///
+/// IMPORTANT: nftables' `mod n` is NOT arithmetic modulo -- the kernel
+/// (nft_jhash_eval) reduces with `reciprocal_scale(hash, n) = (hash * n) >> 32`.
+/// For n = 2 that is simply the top bit of the hash.  Using `% n` here would
+/// disagree with the LVS map (validated empirically -- see tests).
+pub fn owner_index(ip: Ipv4Addr, n: usize) -> usize {
+	debug_assert!(n > 0);
+	let h = jhash_ipv4(ip, JHASH_SEED_U32) as u64;
+	((h * n as u64) >> 32) as usize
+}
+
+/// The concentrator that owns `ip` given the sorted ring, or None if empty.
+pub fn owner_of<'a>(ip: Ipv4Addr, nodes: &'a [String]) -> Option<&'a str> {
+	if nodes.is_empty() { return None; }
+	Some(nodes[owner_index(ip, nodes.len())].as_str())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn jhash_deterministic_and_in_range() {
+		let ip = Ipv4Addr::new(203, 0, 113, 7);
+		assert_eq!(jhash_ipv4(ip, JHASH_SEED_U32), jhash_ipv4(ip, JHASH_SEED_U32));
+		for n in 1..=8usize {
+			assert!(owner_index(ip, n) < n);
+		}
+	}
+
+	// EMPIRICAL cross-check against the live LVS (Increment 6g phase 2b).
+	// LVS rule: jhash ip saddr mod 2 seed 0xa5a5a5a5
+	//           map { 0 : 172.16.49.73, 1 : 172.16.50.8 }
+	// All four observed test sites landed on index 0 (172.16.49.73) because
+	// reciprocal_scale(hash, 2) is the hash's top bit and every one of these
+	// jhash values is < 2^31.  This is what proves both the jhash AND the
+	// reciprocal_scale reduction (plain `% 2` would give {1,0,0,1} -- wrong).
+	#[test]
+	fn jhash_matches_kernel_lvs() {
+		let nodes: Vec<String> = ["172.16.49.73", "172.16.50.8"]
+			.iter().map(|s| s.to_string()).collect();
+		for cust in ["62.238.96.148", "62.238.110.152", "185.174.105.25", "185.17.205.91"] {
+			let ip: Ipv4Addr = cust.parse().unwrap();
+			assert_eq!(owner_of(ip, &nodes), Some("172.16.49.73"), "site {cust}");
+		}
+	}
 }
