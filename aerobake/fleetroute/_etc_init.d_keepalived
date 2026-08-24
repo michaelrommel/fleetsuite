@@ -263,16 +263,29 @@ start_pre() {
 	ip route add "${REMOTE_VPN}" dev ipip-gw
 	einfo "IPIP tunnel: ${BGP_IP} -> ${PEER_BGP_IP}  remote VPN ${REMOTE_VPN} via ipip-gw"
 
-	# -- 8b. Transit routing separation (Increment 6g phase 2) ----------------
-	# FRR installs ALL customer BGP routes (/32 host routes + the near-0/0
-	# covering aggregates) into kernel table 100 (zebra `ip protocol bgp
-	# route-map SET-TRANSIT` -> `set table 100`).  Forwarded backend->device
-	# traffic ingresses eth0 (rtb-backend default -> this node's eth0 ENI); send
-	# it through table 100.  Locally-generated traffic (iif=lo) never matches
-	# this rule, so the Return GW's own egress keeps using main (default via the
-	# VPC gw -> NAT GW) and is not hijacked by the broad aggregates.
-	ip rule add iif eth0 lookup 100 prio 90
-	einfo "Policy routing 100: iif eth0 (backend transit) lookup table 100"
+	# -- 8b. Self/transit routing separation (Increment 6g phase 2) -----------
+	# The concentrators advertise a near-0.0.0.0/0 covering aggregate for
+	# on-demand tunnel attraction.  Those routes live in the MAIN table and are
+	# what forwards backend->device transit (iif=eth0) to a concentrator.  But
+	# if THIS node's own egress used them too, its outbound internet (e.g.
+	# fleetpulse's EC2 API call on VRRP failover, via the NAT GW) would be
+	# hijacked toward a concentrator.  So send all LOCALLY-GENERATED traffic
+	# (iif=lo) to a clean table 250 that only knows the NAT-GW default plus
+	# link-local; FORWARDED transit (real iif) keeps using main + the aggregates.
+	# BGP/VRRP/ipip self-traffic is already pinned by the higher-priority source
+	# rules 201/202 above, so it is unaffected.
+	# (A zebra `set table` on FRR's `ip protocol bgp` hook was tried first but
+	# this FRR build ignores it -- BGP routes stayed in main.)
+	local ETH0_GW
+	ETH0_GW=$(ip -4 route show default dev eth0 | awk '/via/ { print $3; exit }')
+	if [ -z "$ETH0_GW" ]; then
+		eerror "Could not determine eth0 default gateway for clean table 250"
+		return 1
+	fi
+	ip route add 169.254.0.0/16 dev eth0 scope link table 250
+	ip route add default via "$ETH0_GW" dev eth0    table 250
+	ip rule  add iif lo lookup 250 prio 105
+	einfo "Policy routing 250: iif lo (self traffic) -> clean default via $ETH0_GW dev eth0"
 
 	# -- 9. Give CT entry and peer time to stabilise --------------------------
 	sleep 5
@@ -331,9 +344,9 @@ stop_post() {
 	fi
 	ip link set eth3 down 2>/dev/null || true
 
-	# Remove the backend-transit policy rule (Increment 6g phase 2).
-	ip rule del iif eth0 lookup 100 prio 90 2>/dev/null || true
-	ip route flush table 100                2>/dev/null || true
+	# Remove the self-traffic policy routing (Increment 6g phase 2).
+	ip rule  del iif lo lookup 250 prio 105 2>/dev/null || true
+	ip route flush table 250                2>/dev/null || true
 
 	if [ -n "$TOKEN" ] && [ -n "$ROLE" ]; then
 		ebegin "Detaching VPN-subnet ENI (ipsec-gw-vpn=$ROLE)"
