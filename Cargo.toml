@@ -38,6 +38,7 @@ rsvici             = "0.1"
 futures-util       = "0.3"
 serde_bytes        = "0.11"
 toml               = "0.8"
+nfq                = "0.2"
 
 # ── Release profile ────────────────────────────────────────────────────────────
 [profile.release]

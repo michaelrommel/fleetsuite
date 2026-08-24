@@ -539,6 +539,42 @@ pub fn conn_id(site_ip: &str) -> String {
 	format!("site-{site_ip}")
 }
 
+// ── initiate (on-demand CHILD_SA bring-up, Increment 6g phase 2) ───────────────
+
+/// VICI request message for the `initiate` command.
+///
+/// `child`   -- the CHILD SA config name to raise (here == conn_id == the child
+///              name, since load_conn inserts the child under the conn name).
+///              Raising the CHILD (not just the IKE) is REQUIRED so charon fires
+///              a child-updown UP event and ipsecnode installs the data plane.
+/// `timeout` -- milliseconds as a string; positive bounds the call, so the
+///              request returns even if the peer never answers.
+#[derive(Serialize)]
+struct InitiateReq {
+	child:   String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	timeout: Option<String>,
+}
+
+/// Initiate a CHILD_SA on demand (backend-initiated bring-up).
+///
+/// Direction-agnostic downstream: once the CHILD comes up, the normal
+/// child-updown UP handler installs the VRF/bypass/route data plane exactly as
+/// for a site-initiated tunnel.  `timeout_ms` bounds the blocking VICI call.
+pub async fn initiate_child(client: &mut Client, child: &str, timeout_ms: u32) -> Result<()> {
+	let req = InitiateReq {
+		child:   child.to_string(),
+		timeout: Some(timeout_ms.to_string()),
+	};
+
+	let res: ViciResult = client
+		.request("initiate", req)
+		.await
+		.context("VICI initiate request failed")?;
+
+	res.into_result("initiate")
+}
+
 // ── load-conn types ───────────────────────────────────────────────────────────
 
 /// Top-level load-conn message: { "<conn_name>": { <IKE SA config> } }

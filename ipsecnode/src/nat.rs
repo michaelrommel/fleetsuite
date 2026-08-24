@@ -234,6 +234,7 @@ pub async fn on_child_up(
 					"installed /32 blackhole route (FRR will advertise via BGP)"
 				);
 				installed.push(entry.global_ip.clone());
+				crate::ondemand::add_active_global(&entry.global_ip).await;
 			}
 			Err(e) => {
 				warn!(peer_ip, global_ip = %entry.global_ip, "failed to add /32 route: {e:#}");
@@ -275,6 +276,7 @@ pub async fn on_child_down(peer_ip: &str, cache: &mut RouteCache) {
 	// Count reached zero -- remove routes and clear the cache entry.
 	let global_ips = cache.remove(peer_ip).unwrap().global_ips;
 	for global_ip in &global_ips {
+		crate::ondemand::remove_active_global(global_ip).await;
 		match route_del(global_ip).await {
 			Ok(()) => info!(peer_ip, %global_ip, "removed /32 blackhole route"),
 			Err(e) => warn!(peer_ip, %global_ip, "failed to remove /32 route: {e:#}"),

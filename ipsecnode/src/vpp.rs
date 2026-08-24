@@ -260,7 +260,7 @@ async fn ip_warn(args: &[&str]) {
 	if let Err(e) = ip(args).await { warn!("ip {} (non-fatal): {e:#}", args.join(" ")); }
 }
 
-async fn nft(args: &[&str]) -> Result<()> {
+pub(crate) async fn nft(args: &[&str]) -> Result<()> {
 	let out = tokio::process::Command::new("nft").args(args).output().await
 		.with_context(|| format!("spawn nft {}", args.join(" ")))?;
 	if !out.status.success() {
@@ -298,7 +298,7 @@ fn parse_nft_handle(output: &str) -> Result<u64> {
 		.context("parse nft rule handle")
 }
 
-async fn nft_batch(rules: &str) -> Result<()> {
+pub(crate) async fn nft_batch(rules: &str) -> Result<()> {
 	use tokio::io::AsyncWriteExt;
 	let mut child = tokio::process::Command::new("nft")
 		.arg("-f").arg("-")

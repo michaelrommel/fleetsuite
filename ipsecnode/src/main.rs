@@ -22,6 +22,7 @@ mod credentials;
 mod health;
 mod nat;
 mod nodeconfig;
+mod ondemand;
 mod proposals;
 mod vici;
 mod vpp;
@@ -115,6 +116,19 @@ async fn main() -> Result<()> {
 	}
 	let vpp_ready = vpp_state.is_some();
 
+	// -- Step 2b: On-demand tunnel bring-up NFQUEUE (Increment 6g phase 2) ---
+	// Independent of VPP: installs the ipsecnode_ondemand attraction rule so a
+	// backend packet to a DOWN-tunnel global_ip triggers a CHILD_SA initiate.
+	let ondemand_ready = if ondemand::is_enabled() {
+		match ondemand::init_nftables().await {
+			Ok(())  => true,
+			Err(e)  => { warn!("on-demand init failed (bring-up disabled): {e:#}"); false }
+		}
+	} else {
+		info!("on-demand bring-up disabled (IPSECNODE_ONDEMAND=0)");
+		false
+	};
+
 	// -- Step 3: Connect to VICI (command connection) -----------------------
 	info!(socket = %args.vici_socket, "connecting to VICI (command connection) ...");
 	let mut cmd_client = vici::connect_with_retry(&args.vici_socket, 30).await
@@ -179,6 +193,18 @@ async fn main() -> Result<()> {
 
 	// Health + metrics HTTP endpoint.
 	let health_handle = tokio::spawn(health::serve(args.health_port));
+
+	// On-demand bring-up consumer (Increment 6g phase 2): drains the NFQUEUE and
+	// initiates CHILD_SAs for backend-initiated flows to down tunnels.
+	if ondemand_ready {
+		let owner = ondemand::OwnerMode::from_env();
+		info!(?owner, "spawning on-demand bring-up task");
+		tokio::spawn(ondemand::ondemand_task(
+			args.vici_socket.clone(),
+			valkey_client.clone(),
+			owner,
+		));
+	}
 
 	// Proxy-pool consumer: keep the svcroute dynamic-pool DNAT chains in sync
 	// with the membership snapshot ipsecscale publishes to Valkey. Only useful
