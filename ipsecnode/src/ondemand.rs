@@ -120,11 +120,17 @@ enum Decision {
 /// not in @active_globals), and it is a new flow.  `bypass` = if this task is
 /// not listening the packet is accepted, never blackholed at the queue.
 pub async fn init_nftables() -> Result<()> {
+	// `add table/set/chain` are idempotent (kept if already present across an
+	// in-place restart -- cleanup_stale_state does NOT drop ipsecnode_ondemand,
+	// so the active_globals set survives to be reconciled by
+	// replace_active_globals). `flush chain` BEFORE the `add rule` clears any
+	// prior copy of the queue rule so restarts never accumulate duplicates.
 	let rules = format!(
 		"add table ip {NFT_TABLE}\n\
 		 add set ip {NFT_TABLE} {NFT_ACTIVE_SET} {{ type ipv4_addr; }}\n\
 		 add chain ip {NFT_TABLE} prerouting \
 		   {{ type filter hook prerouting priority mangle; policy accept; }}\n\
+		 flush chain ip {NFT_TABLE} prerouting\n\
 		 add rule ip {NFT_TABLE} prerouting \
 		   iifname \"{OUTER_IF}\" \
 		   ip daddr != {{ {PROTECTED_NETS} }} \
